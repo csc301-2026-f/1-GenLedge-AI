@@ -1,1 +1,0 @@
-"""Sources Connectors capability package."""

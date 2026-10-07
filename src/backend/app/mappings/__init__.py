@@ -1,1 +1,0 @@
-"""Mappings capability package."""

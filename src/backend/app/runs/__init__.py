@@ -1,1 +1,0 @@
-"""Runs capability package."""
