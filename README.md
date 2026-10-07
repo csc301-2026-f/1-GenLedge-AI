@@ -1,108 +1,86 @@
 # GenLedge Connector
 
-GenLedge Connector is a full-stack prototype for data and operations analysts who need to turn ERP records into analytics-ready datasets. It combines a React workflow for source discovery and human-reviewed mappings with a Flask modular backend designed for future pipeline execution. The project demonstrates how AI-assisted data preparation can reduce manual data-engineering work while keeping approval in the user’s hands.
+## Partner Intro
 
-## Tech Stack And Why Chosen
+GenLedge is an AI-powered ERP platform that automates business operations such as invoice processing, delivery tracking, and payments. Our team is building an independent data pipeline from scratch. The partner provides project direction, requirements, priorities, and feedback. Daniel is our team's primary liaison; partner contact names and emails are to be added.
 
-- **React, Vite, and TypeScript:** React supports the workflow UI, Vite provides fast local development and production builds, and TypeScript keeps screen and API contracts explicit.
-- **Flask and Python:** Flask matches the team’s Python experience and keeps the backend modular without introducing unnecessary service boundaries.
-- **PostgreSQL:** Planned control-plane storage for organizations, source metadata, schema snapshots, mapping versions, pipeline configuration, and run history.
-- **LangGraph:** Planned orchestration for structured AI routing and mapping proposals that users review before approval.
-- **Python worker and optional AWS Glue:** The MVP execution boundary is a Python worker; AWS Glue remains a future option for larger processing workloads.
+## Description about the project
+
+GenLedge Connector helps data and operations analysts prepare ERP data for reporting with less manual work. An AI agent proposes data mappings and transformations, which users review and approve before loading data into a separate reporting database. This helps teams answer questions about vendor performance, deliveries, and payments.
 
 ## Key Features
 
-The current frontend prototype demonstrates these planned MVP workflows:
+The current frontend prototype demonstrates the planned MVP workflow:
 
-1. Secure sign-in.
-2. File uploads or database connections for source data.
-3. Source schema discovery.
-4. AI routing and source-to-target mapping proposals.
-5. Human review and mapping edits.
-6. Transform and load run progress.
+1. Secure sign-in to access organizational data.
+2. File uploads or database connections to import source data.
+3. Automatic discovery of source tables and fields.
+4. AI-generated routing and source-to-target mappings.
+5. Human review and editing of mappings before approval.
+6. Pipeline transform-and-load progress.
 7. Pipeline scheduling and run monitoring.
 
-The frontend currently uses mocked data and interactions. The Flask app is an app-factory scaffold and is not connected to the frontend yet.
+The prototype currently uses mocked data and interactions. The Flask backend is a scaffold and is not connected to the frontend yet.
 
-## Development Setup
+## Instructions
 
-### Prerequisites
+The current prototype can be run locally by installing the frontend and backend dependencies, then starting both services.
 
-- Node.js and pnpm
-- Python 3
+1. Install Node.js and pnpm, and install Python 3.
+2. Install frontend dependencies:
 
-Install frontend dependencies:
+   ```bash
+   cd src/frontend
+   pnpm install
+   ```
 
-```bash
-cd src/frontend
-pnpm install
-```
+3. Install backend dependencies:
 
-Install backend dependencies:
+   ```bash
+   cd ../backend
+   python -m pip install -r requirements-dev.txt
+   ```
 
-```bash
-cd src/backend
-python -m pip install -r requirements-dev.txt
-```
+   On Windows, use `py -3` instead of `python` when needed.
 
-On Windows, use `py -3` instead of `python` when needed.
+4. From the repository root, start both services:
 
-### Start the application
+   ```bash
+   # macOS, Linux, WSL, or Git Bash
+   ./src/start-app.sh
+   ```
 
-From the repository root:
+   ```bat
+   :: Windows Command Prompt or PowerShell
+   src\start-app.bat
+   ```
 
-```bash
-# macOS, Linux, WSL, or Git Bash
-./src/start-app.sh
-```
+5. Open the frontend at `http://127.0.0.1:5173`. The Flask placeholder runs at `http://127.0.0.1:5000`.
 
-```bat
-:: Windows Command Prompt or PowerShell
-src\start-app.bat
-```
+To build the frontend, run `pnpm build` from `src/frontend/`. Vite writes the browser-ready output to the ignored `compiled/` directory. To run the backend smoke test, run `python -m pytest tests` from `src/backend/`.
 
-The frontend runs at `http://127.0.0.1:5173`. The Flask placeholder runs at `http://127.0.0.1:5000`.
+Account provisioning, supported production file formats, deployment access, and production credentials will be confirmed during implementation.
 
-### Build the frontend
+## Development requirements
 
-```bash
-cd src/frontend
-pnpm build
-```
+The frontend uses React, Vite, and TypeScript. The backend uses a Flask modular-monolith structure in Python. PostgreSQL is planned for control-plane data, LangGraph is planned for AI-assisted mapping, and a Python worker is planned for pipeline execution. AWS Glue remains a possible future execution option for larger workloads.
 
-Vite writes browser-ready output to `compiled/`. The build command has no required flags; Vite’s defaults are defined in `src/frontend/vite.config.ts`.
+## Deployment and Github Workflow
 
-### Run backend tests
+The team uses a private GitHub repository with branches, commits, and pull requests. Development work is organized into focused branches, reviewed by teammates, and merged into `main` after the relevant frontend build and backend test checks pass. The `src/start-app` scripts provide a repeatable local workflow; hosting and production release steps remain to be determined.
 
-```bash
-cd src/backend
-python -m pytest tests
-```
+## Coding Standards and Guidelines
 
-## Repository Structure
+Use consistent formatting, descriptive names, validated inputs, and clearly scoped functions. Keep credentials outside source control and review changes through pull requests.
 
-- `src/frontend/` — React/Vite frontend and mocked Figma-derived workflow.
-- `src/backend/` — Flask modular-monolith scaffold and backend tests.
-- `doc/` — Backend architecture, frontend adaptation, and startup specifications.
-- `deliverables/` — Course deliverables and planning records.
-- `compiled/` — Ignored frontend build output generated by `pnpm build`.
+## Licenses
 
-## Intended User Workflow
+The selected planning option allows the team to reference the work in resumes and interviews. The team will not share the code or software unless the partner agrees. The team will use its own schemas, test data, and implementation.
 
-1. Sign in and upload a file or connect a source database.
-2. Review discovered source fields and target data requirements.
-3. Generate AI mapping proposals and review or edit them.
-4. Approve and run the pipeline.
-5. Monitor run results and future schedules.
+## Deployed URL / Access Instructions
 
-## GitHub Workflow
+Deployment URL and account access details are not available yet. The [Figma demo](https://www.figma.com/make/5FBkZzoaCpGV83S88IPkY1/--------CSC301-D1-Demo?p=f&t=dNeXPEpMKdHMtUZw-0) provides the current design reference.
 
-Development uses branches and pull requests. Changes should be focused, reviewed by a teammate, and merged into `main` after the relevant frontend build or backend test checks pass.
+## D3 Improvement Highlight
 
-## License And Data
-
-The project follows the D1 decision that the team may reference its work in resumes and interviews but will not share the code or software unless the partner agrees. Development uses team-created mock data and schemas; no partner production data or implementation materials are included.
-
-## Design Reference
-
-The [Figma demo](https://www.figma.com/make/5FBkZzoaCpGV83S88IPkY1/--------CSC301-D1-Demo?p=f&t=dNeXPEpMKdHMtUZw-0) is the visual reference for the current frontend prototype.
+Since D1, the project has been organized around a React/Vite frontend and a Flask modular backend. The frontend screens were split into feature folders, the backend capability packages and app entrypoint were scaffolded, and cross-platform `start-app` scripts were added for local development. Detailed architecture and startup notes are in `doc/`.
