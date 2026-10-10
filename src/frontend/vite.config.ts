@@ -4,6 +4,9 @@ import tailwindcss from '@tailwindcss/vite'
 import { defineConfig } from 'vite'
 
 export default defineConfig({
+  server: {
+    proxy: { '/api': 'http://127.0.0.1:5000' },
+  },
   build: {
     outDir: path.resolve(__dirname, '../../compiled'),
     emptyOutDir: true,

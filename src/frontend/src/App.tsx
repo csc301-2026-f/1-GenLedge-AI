@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { getCurrentUser, logout, type AuthUser } from './features/auth/api'
 import type { Screen, Nav } from './app/types'
 import { TopBar, Sidebar } from './shared'
 import { LoginScreen } from './features/auth/LoginScreen'
@@ -13,7 +14,30 @@ import { AppearanceSettings } from './features/settings/AppearanceSettings'
 // ─── Root ─────────────────────────────────────────────────────────────────────
 export default function App() {
   const [screen, setScreen] = useState<Screen>('login')
-  const [user, setUser] = useState<{ email: string; role: string } | null>(null)
+  const [user, setUser] = useState<AuthUser | null>(null)
+  const [restoring, setRestoring] = useState(true)
+  const [authError, setAuthError] = useState('')
+  const [loggingOut, setLoggingOut] = useState(false)
+  useEffect(() => {
+    let active = true
+    getCurrentUser().then(u => {
+      if (active) { setUser(u); if (u) setScreen('sources') }
+    }).catch(error => {
+      if (active) setAuthError(error instanceof Error ? error.message : 'Unable to restore session.')
+    }).finally(() => { if (active) setRestoring(false) })
+    return () => { active = false }
+  }, [])
+  const signOut = async () => {
+    if (loggingOut) return
+    setLoggingOut(true)
+    setAuthError('')
+    try {
+      await logout()
+      setUser(null); setCompletedThrough(-1); setScreen('login')
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Unable to sign out. Please retry.')
+    } finally { setLoggingOut(false) }
+  }
   const [completedThrough, setCompletedThrough] = useState(-1)
   const workflow: Screen[] = ['sources', 'discover', 'route', 'mapping', 'run']
   const navigateWorkflow: Nav = next => {
@@ -31,14 +55,16 @@ export default function App() {
     setCompletedThrough(done => Math.min(done, stepIndex))
   }
 
+  if (restoring) return <div role="status">Restoring session…</div>
   if (screen === 'login' || !user) {
-    return <><LoginScreen onLogin={u => { setUser(u); setCompletedThrough(-1); setScreen('sources') }} /><AppearanceSettings /></>
+    return <>{authError && <div role="alert">{authError}</div>}<LoginScreen onLogin={u => { setAuthError(''); setUser(u); setCompletedThrough(-1); setScreen('sources') }} /><AppearanceSettings /></>
   }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
       <AppearanceSettings />
-      <TopBar user={user} onLogout={() => { setUser(null); setCompletedThrough(-1); setScreen('login') }} />
+      <TopBar user={user} onLogout={() => { void signOut() }} />
+      {authError && <div role="alert">{authError}</div>}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <Sidebar current={screen} onNav={navigateWorkflow} completedThrough={completedThrough} />
         <main style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
