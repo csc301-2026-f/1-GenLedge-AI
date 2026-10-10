@@ -134,7 +134,134 @@ for cmd in git curl wget nano htop openssl; do command -v "$cmd" || exit 1; done
 | D-04 | Network, DNS, SSH | route/DNS work, TCP 22 reachable, SSH login succeeds | PASS — owner confirmed |
 | D-05 | Package update and utilities | Update/install commands succeed; binaries available | PASS — owner confirmed |
 
-## 8. Not in scope yet
+## 8. Docker Environment Setup
+
+### 8.1 Objective
+
+Install and verify Docker Engine and Docker Compose on the Raspberry Pi 5 to support containerized PostgreSQL deployment.
+
+### 8.2 Environment
+
+- Operating System: Ubuntu Server 24.04 LTS
+- Architecture: ARM64
+- Administrator: `piadmin`
+- Installation method: Official Docker APT repository
+- Initial state: Docker not installed
+
+### 8.3 Installation
+
+**Step 1 — Install prerequisites**
+
+```bash
+sudo apt update
+sudo apt install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+```
+
+**Step 2 — Configure Docker's GPG signing key**
+
+```bash
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  -o /etc/apt/keyrings/docker.asc
+
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+```
+
+**Step 3 — Add the official Docker repository**
+
+```bash
+sudo tee /etc/apt/sources.list.d/docker.sources > /dev/null <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+```
+
+**Step 4 — Install Docker Engine and Compose**
+
+```bash
+sudo apt update
+
+sudo apt install -y \
+  docker-ce \
+  docker-ce-cli \
+  containerd.io \
+  docker-buildx-plugin \
+  docker-compose-plugin
+```
+
+### 8.4 Verification
+
+**Verify Docker Engine**
+
+```bash
+sudo docker --version
+```
+
+Expected: A valid Docker Engine version is displayed.
+
+Result: **PASS — Owner confirmed.**
+
+**Verify Docker Compose**
+
+```bash
+sudo docker compose version
+```
+
+Expected: A valid Docker Compose v2 version is displayed.
+
+Result: **PASS — Owner confirmed.**
+
+**Verify Docker service**
+
+```bash
+sudo systemctl is-active docker
+sudo systemctl is-enabled docker
+```
+
+Expected:
+
+```text
+active
+enabled
+```
+
+Result: **PASS — Owner confirmed.**
+
+**Verify image pulling and container execution**
+
+```bash
+sudo docker run --rm hello-world
+```
+
+Expected output contains:
+
+```text
+Hello from Docker!
+```
+
+Result: **PASS — Owner confirmed.**
+
+### 8.5 Deployment Status
+
+- [x] Official Docker repository configured
+- [x] Docker Engine installed
+- [x] Docker Compose plugin installed
+- [x] Docker service active
+- [x] Docker service enabled at startup
+- [x] Docker Hub image pull successful
+- [x] Hello-world container executed successfully
+
+### 8.6 Next Phase
+
+Deploy PostgreSQL using Docker Compose with a persistent data volume, environment-based credentials, health checks, and local-only network access.
+
+Team remote access remains disabled until database permissions and network restrictions are independently verified.
+
+## 9. Not in scope yet
 
 - Docker Engine / Compose installation and Docker Hub pull test.
 - PostgreSQL image, persistent volume, health check and restart policy.

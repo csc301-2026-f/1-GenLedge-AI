@@ -226,7 +226,89 @@ sudo ufw status verbose
 - Git tracks only non-sensitive deployment configuration, templates, verification methods and sanitized results.
 - `.gitignore` does not remove secrets already committed to Git history; any exposed credentials must be rotated.
 
-## 8. Host security verification summary
+## 8. Docker Security
+
+### 8.1 Security Objectives
+
+Docker is managed exclusively by the server administrator.
+
+Team members must not receive Docker management privileges, host administrator access, or access to personal files.
+
+### 8.2 Docker Access Control
+
+Docker commands are executed with administrator privileges:
+
+```bash
+sudo docker ps
+sudo docker compose version
+```
+
+The administrator must not add team members to the `docker` group, because Docker management access can effectively grant privileged access to the host.
+
+### 8.3 Verification
+
+**Verify Docker group membership**
+
+```bash
+getent group docker
+```
+
+Expected: No unauthorized users belong to the Docker group.
+
+Result: **PASS — Owner confirmed.**
+
+**Verify firewall configuration**
+
+```bash
+sudo ufw status verbose
+```
+
+Expected:
+
+```text
+Status: active
+Default: deny (incoming), allow (outgoing)
+```
+
+SSH TCP 22 must remain allowed.
+
+Result: **PASS — Owner confirmed.**
+
+**Verify running containers and published ports**
+
+```bash
+sudo docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+```
+
+Expected: No unintended containers or publicly published project service ports.
+
+This check should be performed again after PostgreSQL deployment.
+
+### 8.4 Docker Networking Considerations
+
+Docker-published ports may bypass normal UFW filtering rules.
+
+PostgreSQL must initially use a local-only port binding, such as:
+
+```text
+127.0.0.1:5432:5432
+```
+
+The database port must not be publicly exposed without an explicitly reviewed access-control design.
+
+### 8.5 Verification Status
+
+- [x] Docker management remains administrator-controlled
+- [x] Docker group membership checked
+- [x] UFW remains active after Docker installation
+- [x] No project ports intentionally published during installation
+- [ ] PostgreSQL local-only port binding verified
+- [ ] Database role permissions verified
+- [ ] Restricted remote database access verified
+
+The pending checks will be completed during later database deployment phases.
+
+## 9. Host security verification summary
 
 | ID | Check | Expected result | Status |
 |---|---|---|---|
