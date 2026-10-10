@@ -134,8 +134,8 @@ sudo apt install -y \
 
 ## 6. Next Steps
 
-- [ ] Review SSH access restrictions
-- [ ] Configure and verify host firewall rules
+- [x] Review SSH access restrictions
+- [x] Configure and verify host firewall rules
 - [ ] Install Docker Engine and Docker Compose
 - [ ] Verify Docker Hub image pulling
 - [ ] Deploy PostgreSQL with persistent storage
