@@ -219,7 +219,135 @@ flowchart LR
 
 Conditional routing must be explicit in code: the model cannot direct itself to `approved`. The graph should keep a clear terminal state for failed discovery, invalid output after retries, cancelled review, and approved output. Repeated tool requests, cycles with no material improvement, and repeated critic findings consume budgets and eventually surface to the reviewer or fail with an actionable reason. The separate execution worker never reads an unapproved graph draft.
 
-## 5. Safety, later execution, and change handling
+## 5. Ordered implementation sequence and team handoffs
+
+The harness should be built in eight ordered parts. Each part has a clear dependency on the previous part, a concrete handoff artifact, and an acceptance gate. A different person can own each part, but the next owner starts from the latest integrated branch after the previous part's change is reviewed and merged. Investigation and design discussions can happen in parallel; implementation should follow this order so that later work builds on real, tested contracts rather than assumptions.
+
+Every part must finish with four things: a working change or demonstrable spike, focused tests or a repeatable demo, documentation of the behavior and interfaces, and a short handoff that records decisions, known limitations, and the exact artifacts the next part consumes. No part should silently redefine an earlier contract. If a contract must change, update its version and document the migration before the next part starts.
+
+### Part 1 — Harness foundation and contracts
+
+**Purpose:** establish the stable boundaries that every later part uses.
+
+Define the graph state, job lifecycle, proposal and revision identifiers, connector capability interface, tool request/result envelopes, structured LLM output contracts, and persistence references. Build a small LangGraph spike with a fake connector that demonstrates one model tool request, authorized tool execution, a typed tool result, a structured model response, and a checkpoint that can be resumed.
+
+**Consumes:** project configuration and the harness architecture in this document.
+
+**Produces:** versioned contract definitions, a minimal graph runner, fake source fixtures, and a decision record for budgets, statuses, and error envelopes.
+
+**Acceptance gate:** a test can start a job, complete a tool call, persist the result, resume from a checkpoint, and end with a schema-valid structured output without connecting to a real source or LLM provider.
+
+**Handoff to Part 2:** connector and tool contracts are stable enough for real discovery implementations; later parts must use the source/resource/field identifiers defined here.
+
+### Part 2 — Source discovery and profiling
+
+**Purpose:** turn connected sources into bounded, versioned evidence that the agent can inspect.
+
+Implement connector-backed resource listing, resource descriptions, bounded sampling, profiling, candidate-key checks, and candidate-field comparison. Preserve connector capabilities and unsupported operations explicitly. Test the same discovery flow with at least two source classes, such as a file source and a relational database, while keeping the agent-facing tool names and result shapes identical.
+
+**Consumes:** Part 1 connector/tool contracts and source fixture conventions.
+
+**Produces:** source snapshots, profile reports, redaction and access checks, connector contract tests, and a source inventory that the graph can reference without embedding raw datasets in state.
+
+**Acceptance gate:** a source can be snapshotted, profiled, and sampled through the common interface; results are bounded, tenant-scoped, reproducible enough for review, and explicit about unavailable metadata.
+
+**Handoff to Part 3:** the schema agent receives stable source snapshot IDs, resource/field references, profile evidence, and discovery tools regardless of connector type.
+
+### Part 3 — Warehouse schema proposal
+
+**Purpose:** generate the first analytical model when the warehouse has no predefined schema.
+
+Implement the schema-design prompt and graph node. The agent must propose a broad reusable model without receiving a business question or target catalogue. It must describe table grain, entities/events/reference data, attributes, keys, relationships, source evidence, confidence, and uncertainty. It must give every discovered source field an explicit disposition: represented in the model, retained raw-only, intentionally excluded with a reason, sensitive/restricted, or unresolved.
+
+**Consumes:** Part 2 source snapshots, profiles, inventory, and read-only discovery tools.
+
+**Produces:** a versioned `WarehouseModelProposal` with stable target IDs, evidence references, grain, relationship candidates, and source coverage.
+
+**Acceptance gate:** the output validates against its structured contract, contains no invented source fields, preserves source grain where possible, and has no silent source-field omissions.
+
+**Handoff to Part 4:** the mapping stage can address target tables and attributes by stable IDs and can trace every proposal decision to source evidence.
+
+### Part 4 — Relationship, mapping, and transformation plans
+
+**Purpose:** explain how source data will populate the draft model.
+
+Implement relationship inference and mapping proposal generation against the frozen source snapshot and the Part 3 model. Use declared keys, value overlap, uniqueness, cardinality, nested structure, names, descriptions, and profile evidence; matching names alone are insufficient for a join. Describe transformations as typed declarative operations from an allowed vocabulary such as cast, normalize, parse date, deduplicate, join, flatten, and derive. Include null/default behavior, merge keys, source coverage, ambiguous mappings, and lineage references. Do not execute model-generated SQL or Python.
+
+**Consumes:** Part 2 evidence and Part 3 `WarehouseModelProposal`.
+
+**Produces:** a complete schema-and-mapping proposal package containing mappings, join paths, transformation plans, unresolved fields, and source-to-target lineage references.
+
+**Acceptance gate:** every target attribute has a mapping, derivation, or explicit unresolved disposition; every mapping points to real source fields; transformations have typed inputs/outputs; and high-risk joins are flagged.
+
+**Handoff to Part 5:** the quality system receives one package it can validate as a whole, rather than separate untraceable schema and mapping drafts.
+
+### Part 5 — Automated quality and bounded revision loop
+
+**Purpose:** find structural and semantic problems before human review while preventing an unbounded agent loop.
+
+Run deterministic checks first: output shape, names and identifiers, references, types, keys, relationships, transformation compatibility, mapping coverage, source dispositions, join-cardinality risk, and profile-based null, uniqueness, range, and overlap warnings. Then run a separate structured LLM critique for semantic issues such as incoherent table grain, conflated concepts, implausible relationships, confusing names, and information loss.
+
+Feed both finding sets back to the proposal agent for a bounded number of revisions, initially three rounds, with tool-call, token, and elapsed-time budgets. Persist every revision and finding. Stop early when blockers are gone and no material semantic finding remains. At the limit, produce a reviewable package with explicit unresolved issues; never claim that the package passed. Structural blockers remain approval-blocking.
+
+**Consumes:** Part 4 proposal package and its evidence references.
+
+**Produces:** deterministic validation results, semantic critique findings, revised proposal versions, and a clear distinction between blockers, warnings, and unresolved decisions.
+
+**Acceptance gate:** the same input is checked repeatably, revisions cannot bypass deterministic validation, loops terminate at their budgets, and no invalid package is marked ready for approval.
+
+**Handoff to Part 6:** the review UI has all evidence needed to show why each schema and mapping decision exists and what still needs attention.
+
+### Part 6 — Combined human review and approval
+
+**Purpose:** let a human review and edit the schema and mappings together as one coherent package.
+
+Build one review surface showing tables, attributes, grain, keys, relationships, source fields, transformations, evidence, confidence, coverage, warnings, blockers, and unresolved decisions side by side. A reviewer can add, rename, change, or delete schema elements and mappings. Each edit creates a new draft revision, invalidates dependent mappings where necessary, reruns the affected mapping work and all cross-package deterministic checks, and reruns semantic review before the package can be approved. Human edits become constraints and must not be overwritten by a fresh agent proposal.
+
+Approval records the reviewer, timestamp, organization, proposal revision, source snapshot IDs, and validation result. It creates one immutable model-and-mapping version. There is no separate schema-only approval followed by another mapping approval; the UI reviews the combined package once.
+
+**Consumes:** Part 5 reviewable proposal and findings.
+
+**Produces:** a draft-edit API/UI and an immutable approved version, or a visible blocked state with actionable findings.
+
+**Acceptance gate:** edits rerun the correct dependent work, approval is impossible with structural blockers, approved versions cannot be mutated, and later drafts do not change historical approvals.
+
+**Handoff to Part 7:** execution can accept exactly one approved version ID and use it as the authority for schema creation, transformations, quality rules, and lineage.
+
+### Part 7 — Governed execution
+
+**Purpose:** safely turn an approved proposal into warehouse structures and loaded data.
+
+Compile only the approved declarative transformation vocabulary into trusted execution code. Use raw/landing data, staging tables, safe merge or upsert behavior, idempotent run IDs, permission boundaries, and quality checks before publishing. The model cannot issue DDL, arbitrary SQL, or direct writes. A failed load must remain failed and must not be reported as successful or leave an untracked partial publication.
+
+**Consumes:** the immutable approved version from Part 6 and its referenced source snapshots.
+
+**Produces:** target table definitions, staged and published data, run status/counts/errors, rejected-record handling, and execution lineage.
+
+**Acceptance gate:** only approved versions execute; reruns do not duplicate data; staging and publication behavior is safe; and the run records the exact approved version and source evidence it used.
+
+**Handoff to Part 8:** operations has durable run state, errors, counts, and version references to monitor and recover.
+
+### Part 8 — Operations, lineage, drift, and recovery
+
+**Purpose:** keep approved pipelines understandable and reliable after the first successful load.
+
+Add run monitoring, checkpoints, bounded retries and backoff, resumable failure handling, quarantine/error records, alerts, source schema-drift comparison, and end-to-end lineage from source resource/field through profile, proposal, mapping, transformation, approval, run, and target column. Compatible drift can create a new draft; missing fields, changed types/meanings, and relationship changes require review. The active approved version remains stable until a replacement is approved.
+
+**Consumes:** Part 7 run records and all prior version/evidence references.
+
+**Produces:** operational dashboards/status APIs, retry and recovery behavior, drift events, impact reports, and lineage queries.
+
+**Acceptance gate:** operators can identify run state and actionable errors, recover only eligible failures, trace a target value back to source evidence, and see source changes before they alter approved behavior.
+
+### Cross-cutting rules for every part
+
+- Keep connector interfaces, prompts, proposal structures, validators, and tests source-agnostic from Part 1 onward; do not hardcode one ERP's tables or workflow.
+- Carry stable version, evidence, and lineage references through every artifact instead of adding lineage at the end.
+- Preserve a source-serving raw/landing representation and record a disposition for every discovered field.
+- Keep credentials and unrestricted source data out of prompts, graph state, logs, and the control database.
+- Treat model output as an untrusted proposal. Only deterministic validation and an explicit human approval can make a version eligible for execution.
+
+## 6. Safety, later execution, and change handling
 
 - **Source agnosticism:** Connector-specific parsing and access stay behind the standard contract. Prompts, graph nodes, model types, and validators use resource/field references, not hardcoded ERP tables or vendor workflows. Contract tests should use at least a file, relational database, and API-style fixture.
 - **Information preservation:** Store or retain a source-preserving raw copy/reference; record every discovered field's disposition. Proposed canonical tables should preserve identifiable records and relationships wherever practical. Flag lossy casts, deduplication, flattening, and aggregation for review.
@@ -229,7 +357,7 @@ Conditional routing must be explicit in code: the model cannot direct itself to 
 - **Drift:** New source snapshots are compared with those referenced by the approved package. Compatible changes may generate a new draft; missing fields, changed meanings/types, and relationship changes require review. The active approved version remains stable until a replacement is approved.
 - **Failure and recovery:** Connector outages, unsafe or missing permissions, model errors, invalid structured output, and validation blockers are explicit job states. Retry transient failures within limits and resume from checkpoints; never label an incomplete or failed run successful.
 
-## Walkthrough: a new ERP source
+## 7. Walkthrough: a new ERP source
 
 1. An operator connects an ERP database. The connector lists `orders`, `order_lines`, and `customers`; discovery saves a snapshot of their fields, key metadata, bounded samples, and profiles.
 2. The design agent receives the inventory and tools. It inspects detailed profiles and candidate joins, then proposes `orders`, `order_lines`, and `customers` tables with grain, keys, attributes, and relationships. It keeps source-only operational fields in the raw layer and explains their disposition.
