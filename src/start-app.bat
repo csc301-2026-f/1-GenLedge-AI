@@ -37,10 +37,10 @@ if errorlevel 1 (
   exit /b 1
 )
 
-start "GenLedge Frontend" /D "%FRONTEND_DIR%" cmd /k "pnpm dev --host 127.0.0.1"
+start "GenLedge Frontend" /D "%FRONTEND_DIR%" cmd /k "pnpm dev --host 127.0.0.1 --port 5173 --strictPort"
 start "GenLedge Backend" /D "%BACKEND_DIR%" cmd /k "%PYTHON% main.py"
 
-echo Frontend and backend started in separate windows.
+echo Connected frontend and Flask backend started in separate windows.
 echo Frontend: http://127.0.0.1:5173
 echo Backend:  http://127.0.0.1:5000
 pause

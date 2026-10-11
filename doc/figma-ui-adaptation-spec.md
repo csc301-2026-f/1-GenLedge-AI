@@ -4,7 +4,7 @@
 
 This specification records how the current Figma Make prototype is organized in the React application and how its screens fit the agreed Flask modular-monolith architecture. It is a guide for connecting the prototype to real backend behavior later.
 
-The current UI remains a prototype: workflow data is mocked and the frontend does not call Flask. Preserve the visual design and user-visible flow when replacing the mock behavior.
+The working frontend now calls Flask for demo authentication (login, session restore and logout). Workflow data remains mocked. The original prototype is preserved unchanged in `src/Frontend Demo`; the working application remains in `src/frontend`. Preserve the visual design and user-visible flow when replacing other mock behavior.
 
 ## Frontend organization
 
@@ -48,7 +48,7 @@ The sidebar may mark earlier workflow steps complete and keep later steps locked
 
 ## Prototype behavior to replace
 
-- Sign-in currently accepts any non-empty email after a short delay. Password, remember-me, and role are presentation-only; there is no authentication session.
+- Authentication is implemented using the local-demo Flask API documented in `doc/auth-api.md`. Any non-empty username/password is accepted; this does not verify identity. The Email Address field is sent as username without email-format validation. Remember me controls the backend cookie lifetime. Session restore distinguishes 401 from connection failures; failed logout retains local user state and offers retry. Credentials and sessions are never stored in browser storage.
 - Source rows and source counts are fixed fixtures. The connection form and upload dialog do not create a source or transfer a file.
 - Discovery fields and sample values are fixed fixtures. Resampling only shows a temporary loading state.
 - Routing proposals are static. Accept/reject decisions are local component state and are not saved.
@@ -76,3 +76,11 @@ When implementing backend integration, replace fixture reads and simulated actio
 - Shared controls stay visually consistent across all feature screens. Feature-specific content and mock fixtures remain in their feature folders.
 - Before replacing a mock action, verify both its successful state and its pending/error state. Backend integration is accepted when each screen reflects persisted state returned by Flask and manual/scheduled runs converge on the same run-history view.
 - Verify the complete path from sign-in through source selection, discovery, routing, mapping approval, run completion, and monitoring, along with direct navigation locking and display preferences.
+
+## Authentication handoff and smoke verification
+
+`src/frontend/src/features/auth/client.ts` uses relative `/api/auth` URLs and `credentials: include`. Plan 3 must configure the Vite `/api` proxy and reconcile `src/start-app.sh` and `src/start-app.bat`. Until then, browser checks may mock the API. Use pnpm in `src/frontend`; install with `pnpm install --frozen-lockfile`, then run `pnpm exec tsc --noEmit` and `pnpm build`.
+
+Verify blank fields, API validation errors, service outages, keyboard submission and repeated submission prevention; login with Remember me; reload to restore a session; sign out and reload; fail a logout and retry; fail session restoration and retry. Verify unexpected/non-JSON responses show safe fallback messages. Navigate the unchanged source/discovery/routing/mapping/run/monitor screens and display settings. Final browser-to-Flask cookie/proxy verification belongs to Plan 3.
+
+The repeatable mocked-browser smoke test is `src/frontend/tests/auth-smoke.cjs`. With Playwright available on the Node module path and a Chromium installation, run `node tests/auth-smoke.cjs` from `src/frontend`. Optionally set `CHROME_BIN` to an installed Chrome executable. The test starts a temporary Vite server, intercepts only auth API calls, and closes the server/browser afterward; it does not verify the final Flask proxy.
