@@ -1,6 +1,7 @@
 from flask import Flask
 
 from .config import Config
+from .auth.routes import bp as auth_bp
 
 
 def create_app(config_object: object | None = None) -> Flask:
@@ -9,6 +10,5 @@ def create_app(config_object: object | None = None) -> Flask:
     app.config.from_object(Config())
     if config_object is not None:
         app.config.from_object(config_object)
-    from .auth import init_auth
-    init_auth(app)
+    app.register_blueprint(auth_bp)
     return app
