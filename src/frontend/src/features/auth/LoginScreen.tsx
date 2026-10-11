@@ -14,13 +14,11 @@ export function LoginScreen({ onLogin, connectionError, onRetry }: { onLogin: (u
   const submit = async () => {
     if (submitting.current) return
     if (!email.trim()) { setError('Email is required.'); return }
-    if (!password) { setError('Password is required.'); return }
+    if (!password.trim()) { setError('Password is required.'); return }
     submitting.current = true
     setLoading(true); setError('')
     try {
-      const user = await login(email.trim(), password, rememberMe)
-      setPassword('')
-      onLogin(user)
+      onLogin(await login(email.trim(), password, rememberMe))
     } catch (error) {
       setError(error instanceof Error ? error.message : 'Unable to sign in. Please try again.')
     } finally {
@@ -42,7 +40,7 @@ export function LoginScreen({ onLogin, connectionError, onRetry }: { onLogin: (u
           <div style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 3, overflow: 'hidden' }}>
             <div style={{ background: T.tableHead, borderBottom: `1px solid ${T.border}`, padding: '16px 24px' }}>
               <h1 style={{ fontSize: `calc(${15}px * var(--font-scale, 1))`, fontWeight: 600, color: T.text }}>Sign In</h1>
-              <p style={{ fontSize: `calc(${12}px * var(--font-scale, 1))`, color: T.textMid, marginTop: 3 }}>Use your organization credentials to access GenLedge.</p>
+              <p style={{ fontSize: `calc(${12}px * var(--font-scale, 1))`, color: T.textMid, marginTop: 3 }}>Local demo: enter any non-empty username and password.</p>
             </div>
             <form noValidate onSubmit={event => { event.preventDefault(); void submit() }} style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 16 }}>
               <TextInput label="Email Address" type="email" value={email} onChange={setEmail} placeholder="name@company.com" />

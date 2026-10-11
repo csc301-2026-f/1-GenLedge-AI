@@ -1,13 +1,13 @@
 export type AuthUser = {
-  id: string
+  id: 'demo-user'
+  username: string
   email: string
-  role: string
-  organizationId: string
+  role: 'Administrator'
 }
 
+const signedOut = Symbol('signed-out')
 const connectionMessage = 'Unable to connect to the authentication service. Please try again.'
 const responseMessage = 'Unexpected authentication response. Please try again.'
-const signedOut = Symbol('signed-out')
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -22,15 +22,17 @@ async function request(path: string, method = 'GET', body?: unknown): Promise<un
       credentials: 'include',
       signal: controller.signal,
       ...(body === undefined ? {} : {
-        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': await csrfToken() },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       }),
     })
     if (path === 'me' && response.status === 401) return signedOut
-    const data: unknown = response.status === 204 ? null : await response.json().catch(() => null)
+    const data: unknown = await response.json().catch(() => null)
     if (!response.ok) {
-      const error = isObject(data) ? data.error : null
-      if (typeof error === 'string') throw new Error(error)
+      const error = isObject(data) && isObject(data.error) ? data.error : null
+      if (error && (error.code === 'invalid_request' || error.code === 'unauthorized') && typeof error.message === 'string') {
+        throw new Error(error.message)
+      }
       throw new Error(responseMessage)
     }
     return data
@@ -44,30 +46,26 @@ async function request(path: string, method = 'GET', body?: unknown): Promise<un
   }
 }
 
-async function csrfToken(): Promise<string> {
-  const data = await request('csrf')
-  if (!isObject(data) || typeof data.csrfToken !== 'string') throw new Error(responseMessage)
-  return data.csrfToken
-}
-
 function readUser(data: unknown): AuthUser {
   const user = isObject(data) ? data.user : null
-  if (!isObject(user) || typeof user.id !== 'string' || typeof user.email !== 'string' ||
-      typeof user.role !== 'string' || typeof user.organizationId !== 'string') {
+  if (!isObject(user) || user.id !== 'demo-user' || user.role !== 'Administrator' ||
+      typeof user.username !== 'string' || !user.username.trim() || user.email !== user.username) {
     throw new Error(responseMessage)
   }
-  return { id: user.id, email: user.email, role: user.role, organizationId: user.organizationId }
+  return { id: user.id, username: user.username, email: user.username, role: user.role }
 }
 
-export async function login(email: string, password: string, rememberMe: boolean): Promise<AuthUser> {
-  return readUser(await request('login', 'POST', { email, password, rememberMe }))
+export async function login(username: string, password: string, remember_me: boolean): Promise<AuthUser> {
+  return readUser(await request('login', 'POST', { username, password, remember_me }))
 }
 
 export async function currentUser(): Promise<AuthUser | null> {
   const data = await request('me')
+  // Only HTTP 401 is signed out; even a successful JSON null is invalid.
   return data === signedOut ? null : readUser(data)
 }
 
 export async function logout(): Promise<void> {
-  await request('logout', 'POST', {})
+  const data = await request('logout', 'POST')
+  if (!isObject(data) || data.success !== true) throw new Error(responseMessage)
 }

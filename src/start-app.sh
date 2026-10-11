@@ -31,8 +31,8 @@ else
   exit 1
 fi
 
-if ! "$PYTHON" -c 'import flask, sqlalchemy' >/dev/null 2>&1; then
-  echo "Flask and SQLAlchemy are required for $PYTHON." >&2
+if ! "$PYTHON" -c 'import flask' >/dev/null 2>&1; then
+  echo "Flask is not installed for $PYTHON." >&2
   echo "Install it with: $PYTHON -m pip install -r \"$BACKEND_DIR/requirements-dev.txt\"" >&2
   pause_before_exit
   exit 1

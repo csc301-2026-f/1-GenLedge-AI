@@ -29,9 +29,9 @@ if not defined PYTHON (
   exit /b 1
 )
 
-%PYTHON% -c "import flask, sqlalchemy" >nul 2>&1
+%PYTHON% -c "import flask" >nul 2>&1
 if errorlevel 1 (
-  echo Flask and SQLAlchemy are required for %PYTHON%.
+  echo Flask is not installed for %PYTHON%.
   echo Install it with: %PYTHON% -m pip install -r "%BACKEND_DIR%\requirements-dev.txt"
   pause
   exit /b 1
