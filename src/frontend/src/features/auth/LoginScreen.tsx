@@ -1,28 +1,30 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react'
-import { T, cx, StatusPill, Btn, TextInput, SelectInput, Ico, Pager, SortIcon, TH, TR, TD, FilterBar, SearchBox, FilterSelect, PageHeader, Panel, InfoRow, Modal, Alert } from '../../shared'
-import type { Screen, Nav } from '../../app/types'
-import { login, type AuthUser } from './api'
+import { useRef, useState } from 'react'
+import { T, Btn, TextInput } from '../../shared'
+import { login, type AuthUser } from './client'
 
 // ─── US1 — Login ──────────────────────────────────────────────────────────────
-export function LoginScreen({ onLogin }: { onLogin: (u: AuthUser) => void }) {
+export function LoginScreen({ onLogin, connectionError, onRetry }: { onLogin: (u: AuthUser) => void; connectionError: string; onRetry: () => void }) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [rememberMe, setRememberMe] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
+  const submitting = useRef(false)
   const submit = async () => {
-    if (loading) return
+    if (submitting.current) return
     if (!email.trim()) { setError('Email is required.'); return }
     if (!password) { setError('Password is required.'); return }
+    submitting.current = true
     setLoading(true); setError('')
     try {
-      const user = await login(email, password, rememberMe)
+      const user = await login(email.trim(), password, rememberMe)
       setPassword('')
       onLogin(user)
     } catch (error) {
-      setError(error instanceof Error ? error.message : 'Unable to sign in. Please retry.')
+      setError(error instanceof Error ? error.message : 'Unable to sign in. Please try again.')
     } finally {
+      submitting.current = false
       setLoading(false)
     }
   }
@@ -42,7 +44,7 @@ export function LoginScreen({ onLogin }: { onLogin: (u: AuthUser) => void }) {
               <h1 style={{ fontSize: `calc(${15}px * var(--font-scale, 1))`, fontWeight: 600, color: T.text }}>Sign In</h1>
               <p style={{ fontSize: `calc(${12}px * var(--font-scale, 1))`, color: T.textMid, marginTop: 3 }}>Use your organization credentials to access GenLedge.</p>
             </div>
-            <form onSubmit={e => { e.preventDefault(); void submit() }} style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <form noValidate onSubmit={event => { event.preventDefault(); void submit() }} style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 16 }}>
               <TextInput label="Email Address" type="email" value={email} onChange={setEmail} placeholder="name@company.com" />
               <TextInput label="Password" type="password" value={password} onChange={setPassword} placeholder="••••••••" />
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -72,7 +74,10 @@ export function LoginScreen({ onLogin }: { onLogin: (u: AuthUser) => void }) {
                   </span>
                 </span>
               </div>
-              {error && <div style={{ fontSize: `calc(${12}px * var(--font-scale, 1))`, color: 'var(--c-b42318)', background: 'var(--c-fef3f2)', border: '1px solid var(--c-fecdca)', padding: '8px 12px', borderRadius: 3 }}>{error}</div>}
+              {connectionError && <div role="alert" style={{ color: 'var(--c-b42318)', fontSize: 12 }}>
+                {connectionError} <button type="button" onClick={onRetry} disabled={loading}>Retry connection</button>
+              </div>}
+              {error && <div role="alert" style={{ fontSize: `calc(${12}px * var(--font-scale, 1))`, color: 'var(--c-b42318)', background: 'var(--c-fef3f2)', border: '1px solid var(--c-fecdca)', padding: '8px 12px', borderRadius: 3 }}>{error}</div>}
               <Btn type="submit" variant="primary" disabled={loading} className="w-full justify-center" >
                 {loading
                   ? <><span style={{ width: 12, height: 12, border: '2px solid #fff', borderTopColor: 'transparent', borderRadius: '50%' }} className="spin" />Authenticating…</>

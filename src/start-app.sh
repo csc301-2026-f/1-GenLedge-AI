@@ -31,8 +31,8 @@ else
   exit 1
 fi
 
-if ! "$PYTHON" -c 'import flask' >/dev/null 2>&1; then
-  echo "Flask is not installed for $PYTHON." >&2
+if ! "$PYTHON" -c 'import flask, sqlalchemy' >/dev/null 2>&1; then
+  echo "Flask and SQLAlchemy are required for $PYTHON." >&2
   echo "Install it with: $PYTHON -m pip install -r \"$BACKEND_DIR/requirements-dev.txt\"" >&2
   pause_before_exit
   exit 1
@@ -43,12 +43,12 @@ cleanup() {
 }
 trap cleanup INT TERM EXIT
 
-(cd "$FRONTEND_DIR" && pnpm dev --host 127.0.0.1) &
+(cd "$FRONTEND_DIR" && pnpm dev --host 127.0.0.1 --port 5173 --strictPort) &
 FRONTEND_PID=$!
 (cd "$BACKEND_DIR" && "$PYTHON" main.py) &
 BACKEND_PID=$!
 
-echo "Frontend: http://127.0.0.1:5173"
-echo "Backend:  http://127.0.0.1:5000"
+echo "Connected frontend: http://127.0.0.1:5173"
+echo "Flask backend:     http://127.0.0.1:5000"
 wait "$FRONTEND_PID" "$BACKEND_PID"
 pause_before_exit

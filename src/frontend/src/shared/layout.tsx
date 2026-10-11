@@ -23,7 +23,7 @@ export const NAV_SECTIONS = [
 ]
 
 // ─── Global top bar ───────────────────────────────────────────────────────────
-export function TopBar({ user, onLogout }: { user: { email: string; role: string }; onLogout: () => void }) {
+export function TopBar({ user, onLogout, loggingOut, logoutError }: { user: { email: string; role: string }; onLogout: () => void; loggingOut: boolean; logoutError: string }) {
   const [open, setOpen] = useState(false)
   return (
     <div style={{
@@ -64,11 +64,12 @@ export function TopBar({ user, onLogout }: { user: { email: string; role: string
                 <div style={{ fontSize: `calc(${12}px * var(--font-scale, 1))`, fontWeight: 600 }}>{user.email}</div>
                 <div style={{ fontSize: `calc(${11}px * var(--font-scale, 1))`, color: T.textMid, textTransform: 'capitalize', marginTop: 2 }}>{user.role}</div>
               </div>
-              <button onClick={onLogout} style={{ width: '100%', padding: '8px 14px', display: 'flex', alignItems: 'center', gap: 8, background: 'none', border: 'none', cursor: 'pointer', fontSize: `calc(${12}px * var(--font-scale, 1))`, color: T.text, textAlign: 'left' }}
+              <button disabled={loggingOut} onClick={onLogout} style={{ width: '100%', padding: '8px 14px', display: 'flex', alignItems: 'center', gap: 8, background: 'none', border: 'none', cursor: 'pointer', fontSize: `calc(${12}px * var(--font-scale, 1))`, color: T.text, textAlign: 'left' }}
                 onMouseEnter={e => (e.currentTarget.style.background = T.rowHover)}
                 onMouseLeave={e => (e.currentTarget.style.background = 'none')}>
-                <Ico.LogOut /> Sign Out
+                <Ico.LogOut /> {loggingOut ? 'Signing Out…' : 'Sign Out'}
               </button>
+              {logoutError && <div role="alert" style={{ padding: '8px 14px', color: 'var(--c-b42318)', fontSize: 12 }}>{logoutError} Use Sign Out to retry.</div>}
             </div>
           )}
         </div>

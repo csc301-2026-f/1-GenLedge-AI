@@ -17,8 +17,9 @@ default accounts or public registration endpoints. Organization names select an
 existing organization or create one. Only trusted administrators should run this CLI.
 The default role is Analyst; Administrator can be selected explicitly.
 
-Start the application using the existing start scripts with dependencies available
-to their Python/Node commands, or start each service separately:
+Start the connected application using `src/start-app.bat` on Windows or
+`./src/start-app.sh` on macOS/Linux, after installing dependencies for the
+Python interpreter that the launcher selects. Or start each service separately:
 
 ```powershell
 # backend terminal, from src/backend
