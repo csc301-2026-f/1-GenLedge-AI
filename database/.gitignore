@@ -1,0 +1,18 @@
+# Database environment
+.env
+.env.*
+!.env.example
+
+# Secrets
+secrets/
+credentials/
+*.key
+*.pem
+
+# Database dumps
+*.dump
+*.backup
+*.sql.gz
+
+# Local data
+postgres_data/
