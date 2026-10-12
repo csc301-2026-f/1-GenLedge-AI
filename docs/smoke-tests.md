@@ -42,3 +42,16 @@ PYTHON
 ```
 
 Expected: `added` contains `currency`; `missing` contains `paid`; `typeChanges` reports `total` changing from null/number/string to string. These are sample observations; the comparison does not delete source fields or mappings.
+
+## US3 discovery presentation
+
+- Action: Open the working app, sign in and choose Discover from the source screen.
+  Expected: Discovery is labelled Synthetic preview, with source Synthetic orders fixture and collection orders. The initial result reports three sampled records and 14 fields; `total` displays null/number/string and `customer_code` retains quoted leading-zero strings.
+- Action: Search `LINES` and choose the number type filter. Clear filters before the next step.
+  Expected: Search is case-insensitive; `lines[].qty` matches the type filter; no-match queries show an explicit empty-filter message.
+- Action: Click Re-sample or select Refreshed sample.
+  Expected: `currency` is added, `paid` is missing from the sample, and `total` changes to string. The notice explains missing is not confirmed deletion. Added and Type changed filters show the matching current fields.
+- Action: Use the labelled preview selector to choose Empty sample, Loading, then Error.
+  Expected: Empty fields, loading status and explicit error are shown separately. Routing is disabled in all three states; Re-sample is disabled during loading and returns to the refreshed fixture from error/empty.
+- Action: Advance from a nonempty sample.
+  Expected: The existing mock routing screen opens. Discovery does not make an HTTP request, persist data, or supply live records to routing.

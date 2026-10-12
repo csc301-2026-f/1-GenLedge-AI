@@ -90,3 +90,13 @@ From `src/backend`, run:
 ```
 
 The fixtures `tests/fixtures/us3/orders.json` and `orders-refreshed.json` contain synthetic nested orders. Their comparison reports added `currency`, missing `paid`, and changed observed types for `total`. Tests cover mixed types, missing/null values, arrays, sampling bounds, bounded samples, literal punctuation in keys, input preservation, deterministic comparisons, and JSON serialization.
+
+## Frontend presentation
+
+`src/frontend/src/features/discovery/DiscoverScreen.tsx` consumes contract v1 via the types in `types.ts`. Its caller supplies `sourceName`, `collectionName`, controlled `state`, `onResample`, and `onAdvance`. State is either loading, error with a message, or ready with a result and optional comparison. It performs no network or storage operations. Remount it with the selected collection identity as its React key when changing collections to reset filters.
+
+The table displays canonical paths, type unions, nullable/repeating observations and JSON-rendered samples. Search is case-insensitive; type filters match any observed type. Change filters apply to currently observed fields. Missing paths remain visible in the comparison notice, even though they are absent from the current field table. Initial fields are labelled Observed; Unchanged only means unchanged paths/types relative to the supplied comparison.
+
+`DiscoveryPreview.tsx` is the temporary application host. It clearly labels synthetic data and provides initial/refreshed/empty/loading/error scenarios. Re-sample selects the refreshed fixture immediately; it does not read a source or save a snapshot. `previewData.ts` is generated from the backend synthetic orders fixtures with `discover_records(...).as_dict()` and `compare_discoveries(...).as_dict()`. No semantic date detection, ObjectId inference, or real source metadata is invented.
+
+For real integration, replace the preview host with the authorized source/collection caller and supply the same props after validating the HTTP response. The caller owns request lifecycle, organization access/redaction, snapshot comparison scope and downstream result handoff. Existing routing/mapping screens still use their own mock data; advancing from this preview does not feed them a real mapping input.
