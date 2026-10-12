@@ -46,10 +46,8 @@ PORT=5432
 DATABASE=YOUR_DATABASE_NAME
 USER=YOUR_DATABASE_USER
 PASSWORD=YOUR_DATABASE_PASSWORD
-SECRET_KEY=REPLACE_WITH_A_RANDOM_SECRET
 APP_ENV=development
 DB_SSLMODE=require
-# DB_SSLROOTCERT=C:/path/to/server.crt
 ```
 
 Use your assigned role and database. Put the database password in `PASSWORD`;
@@ -63,6 +61,8 @@ or `verify-full`, set `DB_SSLROOTCERT` to the trusted certificate file path.
 `require` encrypts the connection but does not verify the server identity.
 The backend reads `.env` for both Flask CLI commands and the existing app
 launchers; a variable already set in the process takes precedence.
+The development app generates its Flask session signing key at startup, so no
+`SECRET_KEY` entry is needed in this file.
 
 The database owner reports that public access is now available. The older
 database deployment guide records an earlier failed public connection and an

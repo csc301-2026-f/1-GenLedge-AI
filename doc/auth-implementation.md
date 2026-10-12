@@ -36,9 +36,9 @@ For PostgreSQL, follow `doc/setup-postgres-env.md`. Copy
 `src/backend/.env.example` to `src/backend/.env` and replace every
 placeholder. The backend loads that file automatically; process environment
 variables take precedence. Without the PostgreSQL fields, development uses
-src/backend/instance/auth.sqlite3 (ignored by Git). Set a stable SECRET_KEY to
-keep sessions across backend restarts; otherwise development uses a temporary
-random key and emits a warning. Never commit secrets.
+src/backend/instance/auth.sqlite3 (ignored by Git). Development generates a
+temporary session signing key at startup. A deployment that needs persistent
+sessions should provide `SECRET_KEY` outside the developer database `.env`.
 
 ## PostgreSQL and deployment
 
@@ -50,12 +50,12 @@ $env:PORT = '5432'
 $env:DATABASE = 'YOUR_DATABASE_NAME'
 $env:USER = 'YOUR_DATABASE_USER'
 $env:PASSWORD = 'YOUR_DATABASE_PASSWORD'
-$env:SECRET_KEY = '<random secret from your secret manager>'
 $env:APP_ENV = 'production'
 $env:DB_SSLMODE = 'require'
 ```
 
-Use HTTPS in production. Production requires the database fields and SECRET_KEY and uses
+Use HTTPS in production. Production requires the database fields and a
+deployment-managed `SECRET_KEY` and uses
 Secure, HttpOnly, SameSite=Lax cookies. Serve /api under the same origin as the UI;
 the Vite proxy is for development only. Do not deploy the debug development server.
 auth-init-db applies the initial Alembic migration. Existing auth tables are
