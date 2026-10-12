@@ -21,4 +21,4 @@ without a developer role. The pre-existing D1 image was preserved. The root
 README remains untouched as requested. Both launchers now run
 `auth-db-check`, pause for confirmation, then run `auth-init-db` before starting
 services and stop if the connection check or migration fails. The status check
-normalizes copied JDBC/PostgreSQL URL forms and never prints passwords.
+prints connection metadata without printing passwords.

@@ -108,6 +108,12 @@ It also records the schema revision. If an existing database already contains
 these tables, the command stops and asks for schema review; do not delete those
 tables to force the migration.
 
+In DBeaver, refresh the database connection after the migration, then expand
+`Schemas > public > Tables`. The application tables are named
+`auth_organizations`, `auth_users`, and `auth_sessions`; `alembic_version` stores
+the migration revision. An empty `auth_users` table is expected until you run
+`auth-create-user`.
+
 Create a local application login for testing:
 
 ```powershell
