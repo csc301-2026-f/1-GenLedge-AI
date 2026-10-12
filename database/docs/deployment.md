@@ -363,13 +363,16 @@ The actual password must never be committed to Git, included in documentation, o
 
 **Setup**
 
-Create the configuration file:
+From a checkout of this repository on the Raspberry Pi, copy the tracked
+configuration file to the server deployment directory:
 
 ```bash
-nano /srv/genledge/postgres/compose.yaml
+sudo install -m 600 -o piadmin -g piadmin \
+  database/compose.yaml /srv/genledge/postgres/compose.yaml
+cd /srv/genledge/postgres
 ```
 
-Configuration:
+The tracked `database/compose.yaml` contains the following configuration:
 
 ```yaml
 name: genledge-db
