@@ -32,9 +32,13 @@ pnpm dev
 Use http://127.0.0.1:5173 consistently. Vite proxies /api to Flask on port 5000,
 so the browser uses same-origin cookies without permissive CORS.
 
-Without DATABASE_URL, development uses src/backend/instance/auth.sqlite3 (ignored
-by Git). Set a stable SECRET_KEY to keep sessions across backend restarts; otherwise
-development uses a temporary random key and emits a warning. Never commit secrets.
+For PostgreSQL, follow `doc/setup-postgres-env.md`. Copy
+`src/backend/.env.example` to `src/backend/.env` and replace every
+placeholder. The backend loads that file automatically; process environment
+variables take precedence. Without DATABASE_URL, development uses
+src/backend/instance/auth.sqlite3 (ignored by Git). Set a stable SECRET_KEY to
+keep sessions across backend restarts; otherwise development uses a temporary
+random key and emits a warning. Never commit secrets.
 
 ## PostgreSQL and deployment
 
@@ -44,13 +48,15 @@ Before running Flask commands, set environment variables in the same terminal:
 $env:DATABASE_URL = 'postgresql+psycopg://USER:PASSWORD@HOST:5432/DATABASE'
 $env:SECRET_KEY = '<random secret from your secret manager>'
 $env:APP_ENV = 'production'
+$env:DB_SSLMODE = 'require'
 ```
 
 Use HTTPS in production. Production requires DATABASE_URL and SECRET_KEY and uses
 Secure, HttpOnly, SameSite=Lax cookies. Serve /api under the same origin as the UI;
 the Vite proxy is for development only. Do not deploy the debug development server.
-auth-init-db creates missing auth tables; it is not a schema migration system.
-Subsequent schema changes need reviewed database migrations.
+auth-init-db applies the initial Alembic migration. Existing auth tables are
+intentionally rejected until their schema has been reviewed. Subsequent schema
+changes must use reviewed migrations.
 
 ## API and session behavior
 

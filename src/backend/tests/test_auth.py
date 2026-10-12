@@ -18,7 +18,8 @@ def app(tmp_path):
         DATABASE_URL = "sqlite:///" + str(tmp_path / "auth.sqlite3").replace("\\", "/")
         SESSION_COOKIE_SECURE = False
     app = create_app(TestConfig)
-    Base.metadata.create_all(app.extensions["auth_engine"])
+    assert app.test_cli_runner().invoke(args=["auth-init-db"]).exit_code == 0
+    assert app.test_cli_runner().invoke(args=["auth-init-db"]).exit_code == 0
     with app.extensions["auth_database"]() as db:
         db.add(Organization(id="org-1", name="Acme"))
         db.flush()
@@ -121,6 +122,12 @@ def test_cli_provisioning(app):
     assert runner.invoke(args=args, input="a-long-password\na-long-password\n").exit_code != 0
     client = app.test_client()
     assert post(client, "login", {"email": "new@example.com", "password": "a-long-password"}).status_code == 200
+
+
+def test_connection_check_for_sqlite(app):
+    result = app.test_cli_runner().invoke(args=['auth-db-check'])
+    assert result.exit_code == 0
+    assert 'dialect=sqlite' in result.output
 
 
 def test_database_failure_returns_actionable_response(app):
