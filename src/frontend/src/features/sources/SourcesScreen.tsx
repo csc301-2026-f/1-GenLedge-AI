@@ -3,6 +3,7 @@ import { T, cx, StatusPill, Btn, TextInput, SelectInput, Ico, Pager, SortIcon, T
 import type { Screen, Nav } from '../../app/types'
 import type { SortDir } from '../../shared'
 import { SOURCES_DATA } from './data'
+import { UploadFileModal } from './UploadFileModal'
 
 // ─── US2 — Data Sources ───────────────────────────────────────────────────────
 const DB_FIELDS: Record<string, { label: string; fields: { key: string; label: string; type?: string; placeholder?: string }[] }> = {
@@ -261,25 +262,7 @@ export function SourcesScreen({ onNav, onAdvance, onInvalidate }: { onNav: Nav; 
       )}
 
       {showUpload && (
-        <Modal title="Upload Source File" onClose={() => setShowUpload(false)} width={460}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            <Alert type="info">Supported formats: CSV, TSV, XLSX, XLS, JSON, NDJSON, MongoDB, DocumentDB. Maximum 25 MB per file or 50,000 rows per worksheet.</Alert>
-            <div style={{ border: `2px dashed ${T.border}`, borderRadius: 3, padding: '32px 24px', textAlign: 'center', background: T.tableHead }}>
-              <div style={{ color: T.textMid, marginBottom: 8 }}><Ico.Upload /></div>
-              <p style={{ fontSize: `calc(${13}px * var(--font-scale, 1))`, color: T.textMid }}>Drag and drop files here, or <span style={{ color: 'var(--link-color)', cursor: 'pointer' }}>browse to select</span></p>
-              <p style={{ fontSize: `calc(${11}px * var(--font-scale, 1))`, color: T.textMuted, marginTop: 4 }}>Each worksheet will become a separate source collection</p>
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              <TextInput label="Source Owner / Team" value="Finance Ops" onChange={() => {}} />
-              <SelectInput label="Target Environment" value="production" onChange={() => {}}
-                options={[{ value: 'production', label: 'Production (intake-acme-prod)' }, { value: 'staging', label: 'Staging (intake-acme-stg)' }]} />
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, paddingTop: 8, borderTop: `1px solid ${T.border}` }}>
-              <Btn variant="secondary" onClick={() => setShowUpload(false)}>Cancel</Btn>
-              <Btn variant="primary" onClick={() => { setShowUpload(false); onAdvance() }}><Ico.Upload /> Upload & Proceed</Btn>
-            </div>
-          </div>
-        </Modal>
+        <UploadFileModal onClose={() => setShowUpload(false)} />
       )}
     </div>
   )

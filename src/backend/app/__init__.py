@@ -11,4 +11,6 @@ def create_app(config_object: object | None = None) -> Flask:
     if config_object is not None:
         app.config.from_object(config_object)
     app.register_blueprint(auth_bp)
+    from .sources.routes import bp as sources_bp
+    app.register_blueprint(sources_bp)
     return app
