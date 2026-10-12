@@ -4,7 +4,7 @@
 
 This document records the initial host deployment for a team PostgreSQL **development/test** service on a primarily personal Raspberry Pi. Team members will later access authorized databases, **not** the Ubuntu administrative account.
 
-**Status (2026-10-10): Host initialization and host verification completed; all applicable tests below reported passed by the device owner. Docker and PostgreSQL are not yet deployed.**
+**Current status (2026-10-11):** Host initialization, Docker Engine, PostgreSQL 17 deployment, database persistence, individual database provisioning, and local-network TCP access are complete. PostgreSQL TLS is configured; DBeaver has successfully connected from Windows to the Pi LAN address. Public domain access remains unverified/unsuccessful, and remote superuser login is still possible. Sections 3–10 document the original deployment stages; later changes are recorded in Sections 11–14.
 
 Actual host output was not archived for every check. The expected examples below are **acceptance criteria**, not fabricated copies of terminal output.
 
@@ -20,7 +20,7 @@ Actual host output was not archived for every check. The expected examples below
 | Connectivity | Wi-Fi, local network; remote admin over SSH |
 | Client | Windows PowerShell / MobaXterm Personal 23.4 |
 | SSH key type | Ed25519 |
-| Docker / PostgreSQL | Not installed/deployed in this phase |
+| Docker / PostgreSQL | Docker Engine + Compose; `postgres:17-alpine` (deployed; see Sections 8–13) |
 
 ## 3. Installation: Ubuntu Server and first boot
 
@@ -728,9 +728,297 @@ Container volume persistence is not equivalent to a verified backup and recovery
 - [ ] Prepare repeatable provisioning scripts.
 - [ ] Configure secure remote team connectivity.
 
-## 11. Not in scope yet
+## 11. Deployment progression after initial verification
 
-- Eight databases and eight corresponding roles.
-- Team networking, SQL privileges, backups and PostgreSQL verification.
+The earlier sections intentionally retain the **original** local-only deployment configuration and stage-specific acceptance results. Those earlier port bindings, pending items, and scope statements are historical, not a description of the current deployment. Subsequent implementation and verification are recorded below. Do not retroactively mark an earlier test as failed because the intended configuration later changed.
 
-Record these in subsequent deployment sections **only after actually implementing and testing them**.
+### 11.1 Updated PostgreSQL provisioning
+
+**Objective**
+
+Provision independent development databases and roles without granting Ubuntu SSH or Docker privileges to team members.
+
+**Implementation**
+
+- Individual role/database pairs: `daniel/daniel`, `likunyu2/likunyu2`, `jeff06/jeff06`, `lvlvhu/lvlvhu`, `steven/steven`, and `xiran/xiran`.
+- Shared integration role/database pair: `integration/dev`.
+- `postgres` is reserved for local PostgreSQL administration.
+- Developer roles were configured without superuser, database creation, role creation, or replication privileges; individual databases are owned by their intended roles.
+- Access to unrelated databases was restricted. Database privilege/membership audits and selected login tests were reported successful during provisioning.
+- Database-only identities do **not** provide Ubuntu login, SSH, sudo, or Docker control.
+
+**Verification**
+
+```bash
+cd /srv/genledge/postgres
+sudo docker compose exec -T postgres \
+  psql -U postgres -d postgres -c "\du"
+sudo docker compose exec -T postgres \
+  psql -U postgres -d postgres -c "SELECT datname, pg_get_userbyid(datdba) AS owner FROM pg_database ORDER BY datname;"
+```
+
+**Expected result:** All seven named non-admin roles exist and own their respective development databases; sensitive credentials are not displayed.
+
+**Status:** **PASS — owner-reported provisioning and isolation tests.** Additional current DBeaver testing for `integration` is still pending.
+
+## 12. Remote connectivity and TLS configuration
+
+### 12.1 Objective
+
+Enable encrypted PostgreSQL client connections for the development team while retaining personal Ubuntu administrator access separately. This section describes **local-network TCP access completed so far**, not completed internet exposure.
+
+### 12.2 Current environment
+
+| Component | Current configuration |
+|---|---|
+| Image | `postgres:17-alpine` |
+| Compose deployment | `/srv/genledge/postgres/compose.yaml` |
+| LAN address observed | `192.168.30.43` (verify before reuse; DHCP may change) |
+| Docker TCP publishing | `192.168.30.43:5432:5432` (replaced earlier localhost-only binding) |
+| PostgreSQL listen address | `*` (reported configured) |
+| TLS | `ssl=on`, minimum TLS 1.2 (reported configured) |
+| Certificate hostname | `301db.dbestserv.com` |
+| Certificate location (volume) | `/var/lib/postgresql/data/server.crt` |
+| Private key location (volume) | `/var/lib/postgresql/data/server.key` |
+| Database URL (LAN test) | `jdbc:postgresql://192.168.30.43:5432/dev?sslmode=require` |
+| Intended public URL | `jdbc:postgresql://301db.dbestserv.com:5432/dev?sslmode=verify-full` (**not yet functional**) |
+
+### 12.3 TLS certificate preparation
+
+**Setup (Pi)**
+
+A self-signed TLS certificate was generated for `301db.dbestserv.com` using OpenSSL. It was copied into the PostgreSQL named-volume-backed data directory and assigned to `postgres` inside the container.
+
+**Verification**
+
+```bash
+cd /srv/genledge/postgres
+sudo openssl x509 -in tls/server.crt -noout -subject -dates -ext subjectAltName
+sudo docker compose exec -T postgres \
+  stat -c '%a %U %G %n' \
+  /var/lib/postgresql/data/server.crt \
+  /var/lib/postgresql/data/server.key
+```
+
+**Expected result:** Certificate subject/SAN contains `DNS:301db.dbestserv.com`; `server.crt` is `644 postgres postgres` and `server.key` is `600 postgres postgres` within the container.
+
+**Result:** **PASS — observed certificate metadata, certificate/private-key match, and container file permissions.** Container image did not include the `openssl` CLI; that error is not itself a TLS failure. Actual DBeaver session TLS remains to be verified with `pg_stat_ssl`.
+
+### 12.4 PostgreSQL startup settings
+
+**Current configuration (relevant portion of `compose.yaml`)**
+
+```yaml
+services:
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "192.168.30.43:5432:5432"
+    command:
+      - postgres
+      - -c
+      - listen_addresses=*
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/var/lib/postgresql/data/server.crt
+      - -c
+      - ssl_key_file=/var/lib/postgresql/data/server.key
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - password_encryption=scram-sha-256
+```
+
+This is an excerpt; the actual file also retains the `environment`, healthcheck, and persistent volume from Section 9. `POSTGRES_PASSWORD` continues to be injected from a protected `.env` file.
+
+**Verification**
+
+```bash
+cd /srv/genledge/postgres
+sudo docker compose config --quiet
+sudo docker compose ps
+sudo docker compose exec -T postgres \
+  psql -U postgres -d postgres -c "SHOW ssl;"
+sudo docker compose exec -T postgres \
+  psql -U postgres -d postgres -c "SHOW listen_addresses;"
+```
+
+**Expected result:** Valid Compose configuration, healthy PostgreSQL container, `ssl = on`, and `listen_addresses = *`.
+
+**Status:** **Configured; running service and LAN reachability owner-confirmed.** Do not treat TLS certificate validation by a remote client as complete until the DBeaver verification below passes.
+
+### 12.5 PostgreSQL host-based authentication (`pg_hba.conf`)
+
+**Observed authentication rules (before any later, unverified edits):**
+
+- Local Unix-socket and container-loopback rules used `trust`.
+- Broad TCP rule: `host all all all scram-sha-256`.
+- Existing broad `host` rule requires password authentication but **does not require TLS**.
+
+A later attempt to restrict TCP access for the `postgres` superuser has **not passed verification**: the owner was still able to authenticate as `postgres` through DBeaver over the LAN.
+
+**Verification**
+
+```bash
+sudo docker compose exec -T postgres \
+  psql -U postgres -d postgres -c \
+  "SELECT line_number, type, database, user_name, address, auth_method, error FROM pg_hba_file_rules ORDER BY line_number;"
+```
+
+**Expected result:** No parse errors, and any newly added refusal rules appear before broad authorizing rules. Separately test from DBeaver: remote `postgres` login must fail while ordinary developer login works.
+
+**Status:** **OPEN SECURITY ISSUE** — remote `postgres` connection succeeded in the latest owner-reported test. Do not claim the restriction is active. Mandatory TLS remains deferred.
+
+### 12.6 DBeaver LAN connection
+
+**Setup (Windows)**
+
+- PostgreSQL connection via host `192.168.30.43`, TCP port `5432`.
+- No SSH tunnel and no VPN.
+- For a normal developer test, choose database `dev` with role `integration` and SSL mode `require`.
+- `sslmode=require` encrypts the connection but does not provide full hostname verification. The certificate was issued for `301db.dbestserv.com`, not the LAN IP.
+
+**Verification (Windows PowerShell)**
+
+```powershell
+Test-NetConnection 192.168.30.43 -Port 5432
+```
+
+**Expected/observed:** `TcpTestSucceeded : True`.
+
+**Verification (DBeaver SQL Editor; repeat as `integration` rather than `postgres`)**
+
+```sql
+SELECT current_user, current_database();
+SELECT ssl, version, cipher
+FROM pg_stat_ssl
+WHERE pid = pg_backend_pid();
+```
+
+**Expected result:** `integration`, `dev`, and `ssl = true` with an accepted TLS version and nonempty cipher.
+
+**Status:** **PARTIAL PASS** — DBeaver successfully connected to the Pi LAN endpoint using `postgres`. An `integration` DBeaver session and its actual TLS session attributes have **not yet been confirmed**.
+
+## 13. Public domain connectivity (in progress)
+
+### 13.1 Objective
+
+Allow authorized development clients to use `301db.dbestserv.com:5432` without Tailscale or an SSH tunnel, subject to adequate network and database security controls.
+
+### 13.2 Domain and network checks
+
+- The Pi-reported outward-facing IPv4 and the DNS A record for `301db.dbestserv.com` were reported to match.
+- The router WAN/public address match was also reported confirmed.
+- The specific external TCP 5432 router-forwarding rule has not been independently verified as active and correct.
+- A DBeaver connection attempt to `301db.dbestserv.com:5432` failed with `Connection refused: getsockopt`.
+- DBeaver LAN connection to `192.168.30.43:5432` subsequently succeeded.
+- Public connectivity must be tested from a genuinely external network; NAT loopback behavior can affect tests from home Wi-Fi.
+
+**Verification (Windows, external network such as mobile hotspot)**
+
+```powershell
+Resolve-DnsName 301db.dbestserv.com -Type A
+Test-NetConnection 301db.dbestserv.com -Port 5432
+```
+
+**Expected result:** Domain resolves to the intended public IPv4 and `TcpTestSucceeded : True`. A positive TCP test verifies reachability, **not** database authentication or TLS identity.
+
+**Status:** **NOT VERIFIED / FAILED DURING HOME-NETWORK TEST.** Do not label public DBeaver access as operational.
+
+### 13.3 Outstanding security requirements
+
+- [ ] Correct and verify the HBA policy so the `postgres` superuser cannot authenticate from externally forwarded TCP connections; preserve a separate local administrative recovery path.
+- [ ] Audit all developer password hashes for SCRAM-SHA-256 and rotate weak or exposed credentials.
+- [ ] Test the `integration` login against database `dev` from DBeaver.
+- [ ] Verify the active client connection is TLS-encrypted using `pg_stat_ssl`.
+- [ ] Configure DBeaver with `sslmode=verify-full`, the correct hostname, and the trusted public certificate before using a public network.
+- [ ] Revisit server-side `hostssl` policy; TLS is available but is **not currently mandatory** for all TCP clients.
+- [ ] Verify Docker's published-port behavior and router security; ordinary UFW policy alone does not necessarily filter Docker-published ports.
+- [ ] Verify domain-to-public-IP routing and TCP 5432 from a truly external network.
+- [ ] Maintain offline/encrypted database backups and perform a restoration test.
+
+**Caution:** Do not enable or leave a public TCP 5432 forward active before the remote-admin authentication issue and essential credentials are resolved. Docker-published ports can bypass ordinary UFW input filtering.
+
+## 14. Environment variables and repository hygiene
+
+### 14.1 Objective
+
+Keep administrator secrets out of Docker Compose YAML, source control, and team documentation. Preserve the established `.env` method from Section 9.4.
+
+### 14.2 Server-side `.env`
+
+**Location:** `/srv/genledge/postgres/.env`
+
+**Format** (placeholder only; never commit or paste the actual value):
+
+```dotenv
+POSTGRES_PASSWORD=REPLACE_WITH_EXISTING_STRONG_ADMIN_PASSWORD
+```
+
+**Verification**
+
+```bash
+cd /srv/genledge/postgres
+stat -c '%a %U %G %n' .env
+grep -q '^POSTGRES_PASSWORD=.' .env && echo 'Password configured'
+sudo docker compose config --quiet
+```
+
+**Expected result:** `.env` mode `600`, password variable present, and Compose configuration valid. Do **not** share unredacted `docker compose config` output: secrets may be expanded.
+
+**Status:** **PASS — existing protected `.env` previously created and verified.** Changing `.env` alone will not rotate a password inside an already initialized PostgreSQL data volume.
+
+### 14.3 Template and Git ignore rules
+
+**Suggested `.env.example`** (safe to commit):
+
+```dotenv
+POSTGRES_PASSWORD=REPLACE_WITH_A_STRONG_PASSWORD
+```
+
+**Suggested `.gitignore`:**
+
+```gitignore
+.env
+.env.*
+!.env.example
+```
+
+This file pattern excludes `.env` and local variants but permits `.env.example`. Check tracked files separately: `.gitignore` does not retroactively untrack a secret already committed.
+
+### 14.4 Application-side configuration (future)
+
+The backend's database connection environment should be stored **separately** from the server administrator `.env` and use a least-privileged database identity.
+
+```dotenv
+DB_HOST=301db.dbestserv.com
+DB_PORT=5432
+DB_NAME=dev
+DB_USER=integration
+DB_PASSWORD=REPLACE_WITH_INTEGRATION_PASSWORD
+DB_SSLMODE=verify-full
+```
+
+This is a future configuration example, **not** evidence that public-domain connectivity or certificate validation already works. The client must also trust the appropriate public certificate and match the certificate hostname. Do not commit database URLs containing real passwords. If embedding passwords into a URL, percent-encode reserved characters.
+
+### 14.5 Consolidated current acceptance status
+
+| Check | Current status |
+|---|---|
+| Host/SSH, Docker Engine and PostgreSQL container | PASS |
+| SQL read/write and named-volume persistence | PASS |
+| Seven developer role/database pairs and isolation | PASS — owner-reported provisioning checks |
+| TLS certificate installed in persistent PostgreSQL data directory | PASS |
+| PostgreSQL SSL-enabled Compose settings | Configured and running — owner-reported |
+| Windows to Pi LAN TCP 5432 | PASS (`Test-NetConnection`) |
+| DBeaver connection via LAN | PASS with `postgres` (security gap) |
+| DBeaver normal user and session TLS validation | PENDING |
+| Remote TCP superuser denial | **FAIL — remote `postgres` login succeeded** |
+| Domain DNS matches outward public IPv4 | PASS — owner-reported |
+| Domain DBeaver TCP 5432 access | NOT WORKING / unverified externally |
+| Public router forwarding and TLS hostname verification | PENDING |
+| Independent restore verification | PENDING |
+
+**Next actions:** Resolve the remote-superuser HBA rule, validate normal-account SSL connections, and investigate external router connectivity without exposing SSH or committing credentials.
+
