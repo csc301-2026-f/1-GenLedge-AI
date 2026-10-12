@@ -26,3 +26,19 @@ PYTHON
 ```
 
 Expected: three sampled records; nested paths such as `shipping_address.city` and `lines[].sku`; `total` has null/number/string types; date and leading-zero identifier values remain strings. No database or API service is used.
+
+For sample-to-sample comparison, run from `src/backend`:
+
+```bash
+.venv/bin/python - <<'PYTHON'
+import json
+from pathlib import Path
+from app.sources.discovery import compare_discoveries, discover_records
+fixtures = Path("tests/fixtures/us3")
+previous = discover_records(json.loads((fixtures / "orders.json").read_text()))
+current = discover_records(json.loads((fixtures / "orders-refreshed.json").read_text()))
+print(json.dumps(compare_discoveries(previous, current).as_dict(), indent=2))
+PYTHON
+```
+
+Expected: `added` contains `currency`; `missing` contains `paid`; `typeChanges` reports `total` changing from null/number/string to string. These are sample observations; the comparison does not delete source fields or mappings.

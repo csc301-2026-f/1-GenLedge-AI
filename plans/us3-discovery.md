@@ -18,9 +18,9 @@ Implement pure Python discovery over parsed JSON-compatible records, a synthetic
 
 - [x] Run the current backend test baseline.
 - [x] Add synthetic discovery tests and confirm they fail because discovery is not implemented.
-- [x] Implement bounded discovery and document its contract; verify before the discovery-core commit.
-- [ ] Add drift tests, implement comparison, and update documentation; verify and commit.
-- [ ] Inspect the final diff and save the finalized plan in `doc/`.
+- [x] Implement bounded discovery and document its contract; verify and commit the core.
+- [x] Add drift tests, implement comparison, and update documentation; verify the comparison feature.
+- [x] Inspect the final diff and save the finalized plan in `doc/`.
 
 ## Contract decisions
 
@@ -30,4 +30,16 @@ Nullable describes observed null/missing values, not a database constraint. Miss
 
 ## Verification
 
-Baseline: 18 existing backend tests passed. The new discovery test module initially failed collection because `app.sources.discovery` did not exist. After implementation, the full suite passed 34 tests (18 existing and 16 discovery cases). The synthetic fixture smoke and final diff review are performed before the feature commit.
+- Baseline: all 18 existing backend tests passed.
+- Before implementation, the discovery module's tests failed collection because `app.sources.discovery` did not exist.
+- Discovery core: 34 backend tests passed, including 16 discovery cases. Synthetic fixture smoke inspected three records and reported 14 fields. The core was committed as `07d778c`.
+- Before comparison implementation, comparison tests failed collection because `compare_discoveries` did not exist.
+- Final suite: 44 backend tests passed, including 26 US3 discovery/comparison cases. Command: `.venv/bin/python -m pytest tests -q -p no:cacheprovider` from `src/backend`.
+- Refresh smoke reported added `currency`, missing `paid`, and observed `total` types changing from null/number/string to string. No database or API service was involved.
+- `git diff --check` passed. Final scope review found no changes to frontend, authentication, startup scripts, database setup, README files, or historical deliverables.
+
+## Handoff
+
+Entry points are `discover_records` and `compare_discoveries` in `app.sources.discovery`. Input/output semantics and integration requirements are documented in `doc/us3-discovery.md`; repeatable fixture checks are in `docs/smoke-tests.md`.
+
+Next integration work requires an authorized collection sample reader, stable collection/field identity policy, schema snapshot persistence/versioning, and an agreed UI/API contract. This change implements the independent US3 core; it does not claim the complete source-to-UI workflow or full harness profiling is implemented.

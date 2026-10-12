@@ -117,3 +117,45 @@ def discover_records(records: Iterable[dict[str, JSONValue]], *,
             samples=tuple(item.samples),
         ) for path, item in sorted(observed.items())
     ))
+
+
+@dataclass(frozen=True)
+class FieldTypeChange:
+    path: str
+    previous_types: tuple[ObservedType, ...]
+    current_types: tuple[ObservedType, ...]
+
+
+@dataclass(frozen=True)
+class DiscoveryChanges:
+    added_paths: tuple[str, ...]
+    missing_paths: tuple[str, ...]
+    type_changes: tuple[FieldTypeChange, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "contractVersion": 1,
+            "added": list(self.added_paths),
+            "missing": list(self.missing_paths),
+            "typeChanges": [{
+                "path": change.path,
+                "previousTypes": list(change.previous_types),
+                "currentTypes": list(change.current_types),
+            } for change in self.type_changes],
+        }
+
+
+def compare_discoveries(previous: DiscoveryResult,
+                        current: DiscoveryResult) -> DiscoveryChanges:
+    """Compare canonical paths/types; missing paths are sample observations."""
+    before = {item.path: item for item in previous.fields}
+    after = {item.path: item for item in current.fields}
+    return DiscoveryChanges(
+        added_paths=tuple(sorted(after.keys() - before.keys())),
+        missing_paths=tuple(sorted(before.keys() - after.keys())),
+        type_changes=tuple(
+            FieldTypeChange(path, before[path].types, after[path].types)
+            for path in sorted(before.keys() & after.keys())
+            if before[path].types != after[path].types
+        ),
+    )

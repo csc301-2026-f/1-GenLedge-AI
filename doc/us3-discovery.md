@@ -51,6 +51,29 @@ These paths are local field references, not globally assigned field IDs. The sou
 
 `nullable=true` means an explicit null was observed, the field was absent from at least one sampled record, or an object property was missing from at least one observed parent object (including objects in arrays). It is a conservative sample observation, not a required/optional database constraint or proof about unsampled records. Empty arrays contain no observed element field.
 
+## Comparison contract v1
+
+`compare_discoveries(previous, current)` compares two `DiscoveryResult` values for the same source collection. The caller supplies the collection/version scope; this function does not infer it or access a database.
+
+It returns immutable `DiscoveryChanges` with `added_paths`, `missing_paths`, and `type_changes`. Paths and changes are sorted. `changes.as_dict()` returns:
+
+```json
+{
+  "contractVersion": 1,
+  "added": ["currency"],
+  "missing": ["paid"],
+  "typeChanges": [
+    {
+      "path": "total",
+      "previousTypes": ["null", "number", "string"],
+      "currentTypes": ["string"]
+    }
+  ]
+}
+```
+
+This is a sample-to-sample comparison. `missing` means not observed in the current sample, not confirmed deletion from the full source. Types describe observed values, not a declared database schema. Changes in values, sample order, or nullable flags alone do not change canonical path identity or produce a type change. The function neither deletes field references nor changes mappings; persistence/review must preserve and display references to paths no longer observed.
+
 ## Integration handoff
 
 The core receives records after authorized source reading. The integration must pin a source/collection/batch, attach the discovery result to a schema snapshot, and retain previous field references for existing mappings. An upload batch manifest and a discovery schema snapshot are different artifacts.
@@ -62,8 +85,8 @@ Before connecting the UI or AI harness, agree on the sample reader, stable globa
 From `src/backend`, run:
 
 ```bash
-.venv/bin/python -m pytest tests/test_discovery.py -q
+.venv/bin/python -m pytest tests/test_discovery.py tests/test_discovery_changes.py -q
 .venv/bin/python -m pytest tests -q
 ```
 
-The fixture `tests/fixtures/us3/orders.json` contains synthetic nested orders. Tests cover mixed types, missing/null values, arrays, sampling bounds, bounded samples, literal punctuation in keys, input preservation, and JSON serialization.
+The fixtures `tests/fixtures/us3/orders.json` and `orders-refreshed.json` contain synthetic nested orders. Their comparison reports added `currency`, missing `paid`, and changed observed types for `total`. Tests cover mixed types, missing/null values, arrays, sampling bounds, bounded samples, literal punctuation in keys, input preservation, deterministic comparisons, and JSON serialization.
