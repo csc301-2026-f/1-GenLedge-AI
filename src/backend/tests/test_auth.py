@@ -127,7 +127,10 @@ def test_cli_provisioning(app):
 def test_connection_check_for_sqlite(app):
     result = app.test_cli_runner().invoke(args=['auth-db-check'])
     assert result.exit_code == 0
+    assert 'environment=development' in result.output
     assert 'dialect=sqlite' in result.output
+    assert 'connected_database=local-development' in result.output
+    assert 'password' not in result.output.lower()
 
 
 def test_database_failure_returns_actionable_response(app):

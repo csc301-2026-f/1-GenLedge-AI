@@ -9,6 +9,7 @@
 - [x] Document per-developer versus shared integration database setup, credential handling, and troubleshooting.
 - [x] Add opt-in PostgreSQL verification and run the backend/frontend checks.
 - [x] Make the existing app launchers apply pending migrations before startup.
+- [x] Show a redacted database status summary and require confirmation before startup.
 
 ## Review
 
@@ -18,4 +19,6 @@ Vite build passed. `Test-NetConnection` reached `301db.dbestserv.com:5432`
 from this machine, but authentication, authorization, and TLS remain unverified
 without a developer role. The pre-existing D1 image was preserved. The root
 README remains untouched as requested. Both launchers now run
-`auth-init-db` before starting services and stop if migration fails.
+`auth-db-check`, pause for confirmation, then run `auth-init-db` before starting
+services and stop if the connection check or migration fails. The status check
+normalizes copied JDBC/PostgreSQL URL forms and never prints passwords.

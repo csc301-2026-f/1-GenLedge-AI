@@ -57,6 +57,8 @@ in `DATABASE_URL`. Keep `.env` private; it is ignored by Git. The committed
 `require` while the team is validating the public certificate. For `verify-ca`
 or `verify-full`, set `DB_SSLROOTCERT` to the trusted certificate file path.
 `require` encrypts the connection but does not verify the server identity.
+The backend also accepts `postgresql://` and copied
+`jdbc:postgresql://` forms and normalizes them to the psycopg driver.
 The backend reads `.env` for both Flask CLI commands and the existing app
 launchers; a variable already set in the process takes precedence.
 
@@ -125,7 +127,11 @@ shared `integration/dev` database.
 The existing launchers load `src/backend/.env` and apply all pending checked-in
 database migrations before starting Flask. This creates the schema in a fresh
 database and upgrades a database that is already at an earlier migration
-revision. If migration fails, neither service starts.
+revision. Before doing that, they print a redacted status summary containing the
+environment, database type, remote host and port, configured role, database,
+SSL mode, actual connected role/database, and TLS state. They pause for your
+confirmation. Passwords and full connection URLs are never printed. If the
+connection check or migration fails, neither service starts.
 
 ```powershell
 src\start-app.bat

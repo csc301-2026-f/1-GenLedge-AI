@@ -38,6 +38,22 @@ if errorlevel 1 (
 )
 
 pushd "%BACKEND_DIR%"
+echo.
+echo ===== Database connection status =====
+%PYTHON% -m flask --app main auth-db-check
+if errorlevel 1 (
+  popd
+  echo Database connection check failed. The frontend and backend were not started.
+  pause
+  exit /b 1
+)
+echo.
+choice /C YN /N /M "Continue with migrations and start services? [Y/N] "
+if errorlevel 2 (
+  popd
+  echo Startup cancelled.
+  exit /b 0
+)
 %PYTHON% -m flask --app main auth-init-db
 if errorlevel 1 (
   popd

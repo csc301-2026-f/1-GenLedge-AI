@@ -25,8 +25,9 @@ class Config:
             return os.environ.get(name, values.get(name, default))
 
         self.AUTH_ENV = setting('APP_ENV', 'development')
+        self.ENV_FILE_PATH = str(ENV_FILE)
         self.SECRET_KEY = setting('SECRET_KEY')
-        self.DATABASE_URL = setting('DATABASE_URL')
+        self.DATABASE_URL = normalize_database_url(setting('DATABASE_URL'))
         self.DB_SSLMODE = setting('DB_SSLMODE', 'require')
         self.DB_SSLROOTCERT = setting('DB_SSLROOTCERT')
         self.SESSION_COOKIE_SECURE = self.AUTH_ENV != 'development'
@@ -42,3 +43,13 @@ class Config:
             raise RuntimeError('DB_SSLMODE must be require, verify-ca, or verify-full.')
         if self.DB_SSLMODE in {'verify-ca', 'verify-full'} and not self.DB_SSLROOTCERT:
             raise RuntimeError('DB_SSLROOTCERT is required for certificate verification.')
+
+
+def normalize_database_url(value):
+    if not value:
+        return value
+    if value.startswith('jdbc:postgresql://'):
+        return 'postgresql+psycopg://' + value.removeprefix('jdbc:postgresql://')
+    if value.startswith('postgresql://'):
+        return 'postgresql+psycopg://' + value.removeprefix('postgresql://')
+    return value

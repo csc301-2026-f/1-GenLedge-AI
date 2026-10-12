@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 
 from app import create_app
-from app.config import Config
+from app.config import Config, normalize_database_url
 from app.migrations import upgrade_database
 
 
@@ -25,6 +25,11 @@ def test_dotenv_values_and_process_precedence(tmp_path, monkeypatch):
 
     monkeypatch.setenv('DATABASE_URL', 'sqlite:///from-process.db')
     assert Config().DATABASE_URL == 'sqlite:///from-process.db'
+
+
+def test_normalizes_common_postgres_url_forms():
+    assert normalize_database_url('jdbc:postgresql://db.example/dev') == 'postgresql+psycopg://db.example/dev'
+    assert normalize_database_url('postgresql://db.example/dev') == 'postgresql+psycopg://db.example/dev'
 
 
 def test_placeholder_and_tls_validation(tmp_path, monkeypatch):

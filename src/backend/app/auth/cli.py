@@ -27,11 +27,22 @@ def init_db():
 @click.command('auth-db-check')
 @with_appcontext
 def db_check():
-    """Report database identity and TLS state without writing data."""
+    """Print a redacted connection summary and verify the database connection."""
     from flask import current_app
     from sqlalchemy import text
 
     engine = current_app.extensions['auth_engine']
+    url = engine.url
+    click.echo('GenLedge startup database status')
+    click.echo(f'environment={current_app.config["AUTH_ENV"]}')
+    click.echo(f'env_file={current_app.config.get("ENV_FILE_PATH", "process environment")}')
+    click.echo(f'dialect={engine.dialect.name}')
+    click.echo(f'remote={url.host or "local"}')
+    click.echo(f'port={url.port or "default"}')
+    click.echo(f'configured_database={url.database or "local-development"}')
+    click.echo(f'configured_role={url.username or "not-set"}')
+    click.echo(f'sslmode={current_app.config.get("DB_SSLMODE") or "not-set"}')
+    click.echo(f'sslrootcert={"configured" if current_app.config.get("DB_SSLROOTCERT") else "not-set"}')
     try:
         with engine.connect() as connection:
             if engine.dialect.name == 'postgresql':
@@ -39,9 +50,13 @@ def db_check():
                     'SELECT current_user, current_database(), '
                     '(SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid())'
                 )).one()
-                click.echo(f'role={identity[0]} database={identity[1]} tls={identity[2]}')
+                click.echo(f'connected_role={identity[0]}')
+                click.echo(f'connected_database={identity[1]}')
+                click.echo(f'tls={identity[2]}')
             else:
-                click.echo(f'dialect={engine.dialect.name} database=local-development')
+                click.echo('connected_role=local-process')
+                click.echo('connected_database=local-development')
+                click.echo('tls=not-applicable')
     except SQLAlchemyError as error:
         raise click.ClickException('Database connection failed. Check the URL, credentials, network, and TLS settings.') from error
 
