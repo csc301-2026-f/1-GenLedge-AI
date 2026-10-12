@@ -66,13 +66,33 @@ unfinished `feature-login` branch.
 
 ## API
 
-`POST /api/sources/uploads/validate`
+Two US2 endpoints are currently implemented on the Flask backend (default port
+5000). The frontend uses relative `/api/...` URLs, proxied by Vite on port 5173.
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| GET | `/api/sources/uploads/csrf` | Obtain the session's upload CSRF token |
+| POST | `/api/sources/uploads/validate` | Parse and validate one uploaded file without saving it |
+
+Request order: sign in through the existing auth API, fetch the upload token,
+then send the file with that token using the same session cookie. There is no
+HTTP endpoint for persisting imports or registering database connections yet;
+the writer interface is an internal Python contract, not an HTTP API.
+
+### GET /api/sources/uploads/csrf
+
+- Requires a signed-in session; no request body or CSRF header is needed.
+- Returns 200 with `{"csrfToken": "<token>"}`, or 401 if signed out.
+- Creates a token if the session has none; otherwise returns the existing token.
+- Tokens are stored under `sources_csrf_token` in the session. Existing login
+  and logout clear the session, invalidating the token for subsequent requests.
+- Returns `Cache-Control: no-store`.
+
+### POST /api/sources/uploads/validate
 
 - Signed-in demo session and `X-CSRF-Token` from
   `GET /api/sources/uploads/csrf` required. The token endpoint also requires a
   signed-in session. Both endpoints return `Cache-Control: no-store`.
-- Tokens are stored under `sources_csrf_token` in the session; existing login
-  and logout clear the session, invalidating the token for subsequent requests.
 - Multipart form with exactly one file in the `file` field.
 - Do not set the multipart Content-Type manually in browser fetch; FormData
   provides the boundary.
