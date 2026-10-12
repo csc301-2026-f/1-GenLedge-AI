@@ -38,6 +38,12 @@ if ! "$PYTHON" -c 'import flask, sqlalchemy' >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! (cd "$BACKEND_DIR" && "$PYTHON" -m flask --app main auth-init-db); then
+  echo "Database migration failed. The frontend and backend were not started." >&2
+  pause_before_exit
+  exit 1
+fi
+
 cleanup() {
   kill "$FRONTEND_PID" "$BACKEND_PID" 2>/dev/null || true
 }

@@ -122,7 +122,10 @@ shared `integration/dev` database.
 
 ## 5. Run the app
 
-The existing launchers load `src/backend/.env` through the backend startup:
+The existing launchers load `src/backend/.env` and apply all pending checked-in
+database migrations before starting Flask. This creates the schema in a fresh
+database and upgrades a database that is already at an earlier migration
+revision. If migration fails, neither service starts.
 
 ```powershell
 src\start-app.bat
@@ -137,6 +140,10 @@ or on macOS/Linux:
 Open `http://127.0.0.1:5173`, then sign in with the application account created
 above. The PostgreSQL role is used by Flask to store application data; it is not
 the email/password used in the browser.
+
+Schema changes must be added as reviewed Alembic migration files and committed
+with the code change. The launcher applies those migrations on the next start;
+it does not generate migrations from model differences or delete existing data.
 
 ## 6. Shared integration testing
 
@@ -157,3 +164,6 @@ because another developer may change or remove those records.
   `verify-ca` or `verify-full`.
 - **Migration stops on existing tables:** stop and have the schema reviewed;
   never drop another developer's database.
+- **Migration fails on startup:** read the Flask migration error, fix the
+  connection or migration issue, and restart the launcher. The services are
+  intentionally not started with an unknown database schema.

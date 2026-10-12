@@ -37,6 +37,16 @@ if errorlevel 1 (
   exit /b 1
 )
 
+pushd "%BACKEND_DIR%"
+%PYTHON% -m flask --app main auth-init-db
+if errorlevel 1 (
+  popd
+  echo Database migration failed. The frontend and backend were not started.
+  pause
+  exit /b 1
+)
+popd
+
 start "GenLedge Frontend" /D "%FRONTEND_DIR%" cmd /k "pnpm dev --host 127.0.0.1 --port 5173 --strictPort"
 start "GenLedge Backend" /D "%BACKEND_DIR%" cmd /k "%PYTHON% main.py"
 
