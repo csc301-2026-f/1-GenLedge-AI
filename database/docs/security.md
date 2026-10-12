@@ -308,7 +308,200 @@ The database port must not be publicly exposed without an explicitly reviewed ac
 
 The pending checks will be completed during later database deployment phases.
 
-## 9. Host security verification summary
+## 9. PostgreSQL Container Security
+
+### 9.1 Security Objectives
+
+The PostgreSQL container runs on a personal Raspberry Pi server.
+
+The database deployment must:
+
+- Protect PostgreSQL administrator credentials.
+- Prevent direct external access during initial deployment.
+- Preserve host administrator control.
+- Keep PostgreSQL data outside the team Git repository.
+- Avoid granting team members access to Docker or the Ubuntu host.
+
+### 9.2 Administrator Credential Protection
+
+The PostgreSQL administrator password is stored in:
+
+```text
+/srv/genledge/postgres/.env
+```
+
+**Setup**
+
+The file was created with restricted permissions:
+
+```bash
+chmod 600 /srv/genledge/postgres/.env
+```
+
+**Verification**
+
+```bash
+stat -c '%a %U %G %n' /srv/genledge/postgres/.env
+```
+
+**Expected result**
+
+```text
+600 piadmin piadmin /srv/genledge/postgres/.env
+```
+
+**Status:** PASS — Owner confirmed.
+
+The `.env` file must not be committed to Git or shared with team members.
+
+### 9.3 Local-Only PostgreSQL Access
+
+The PostgreSQL service uses the following Docker Compose port binding:
+
+```yaml
+ports:
+  - "127.0.0.1:5432:5432"
+```
+
+**Verification**
+
+```bash
+sudo ss -ltnp | grep ':5432 '
+```
+
+**Expected result**
+
+A listener bound to `127.0.0.1:5432`, without a listener bound to `0.0.0.0:5432` or `[::]:5432`.
+
+**Status:** PASS — Owner confirmed.
+
+Remote team access is not yet enabled.
+
+### 9.4 Host Firewall Verification
+
+**Verification**
+
+```bash
+sudo ufw status verbose
+```
+
+**Expected result**
+
+- UFW is active.
+- Incoming connections are denied by default.
+- Outgoing connections are allowed by default.
+- SSH TCP 22 remains allowed.
+- No additional public PostgreSQL access rule has been introduced.
+
+**Status:** PASS — Owner confirmed during the Docker setup phase.
+
+Docker-published ports must be checked independently because Docker networking may bypass some ordinary UFW filtering paths.
+
+### 9.5 Persistent Data Protection
+
+The database uses a Docker named volume rather than storing live database files in Git.
+
+**Verification**
+
+```bash
+sudo docker volume ls
+```
+
+**Expected result**
+
+```text
+genledge-db_postgres_data
+```
+
+**Status:** Volume configured; persistence and backup verification pending.
+
+A Docker volume is not a backup. Separate backup and restore procedures will be required.
+
+### 9.6 Administrator and Team Access
+
+The Ubuntu administrator `piadmin` retains host management authority.
+
+The PostgreSQL `postgres` role is the database administrator and must not be shared with team members.
+
+Future developer accounts will use separate PostgreSQL roles with non-superuser permissions.
+
+Team members will not receive:
+
+- The `piadmin` SSH private key.
+- The Ubuntu administrator password.
+- The PostgreSQL superuser password.
+- Membership in the host `sudo` or `docker` groups.
+
+### 9.7 Security Verification Summary
+
+- [x] Administrator password stored in protected `.env`
+- [x] `.env` file permission verified as `600`
+- [x] PostgreSQL container healthy
+- [x] Local-only IPv4 port binding verified
+- [x] UFW remained active following Docker installation
+- [x] No team database access enabled
+- [ ] Database user permissions verified
+- [ ] Database persistence verified by SQL test
+- [ ] Backup and recovery procedure verified
+- [ ] Remote team network restrictions verified
+
+### 9.8 Future Security Requirements
+
+Before providing team access:
+
+1. Create separate PostgreSQL roles with unique credentials.
+2. Grant access only to authorized databases and schemas.
+3. Test successful and unauthorized database connections.
+4. Review network access restrictions.
+5. Configure database backups and validate restoration.
+6. Ensure no credentials or live database data are committed to Git.
+
+### PostgreSQL Data Persistence Verification
+
+PostgreSQL data persistence was tested using a dedicated verification table.
+
+**Test procedure:**
+
+1. Create a verification table in the `postgres` database.
+2. Insert a known test record.
+3. Read the record using SQL.
+4. Stop and remove the container using `docker compose down`.
+5. Recreate the container using `docker compose up -d`.
+6. Read the original record again.
+7. Remove the temporary verification table.
+
+**Verification command**
+
+```bash
+sudo docker compose exec -T postgres \
+  psql -U postgres -d postgres \
+  -c "SELECT * FROM public.deployment_verification;"
+```
+
+**Expected result**
+
+The original test record remains available after container recreation.
+
+**Status:** PASS — Owner confirmed.
+
+**Security considerations:**
+
+- Docker named volumes provide storage persistence, not independent backups.
+- PostgreSQL data must not be committed to Git.
+- Container removal must not unintentionally remove named volumes.
+- Backup and restore procedures still need to be implemented and tested.
+
+**Updated verification checklist:**
+
+- [x] PostgreSQL SQL read/write verified
+- [x] Data persistence verified after container recreation
+- [x] Temporary verification table removed
+- [ ] Independent backup and restoration verified
+- [ ] Developer account permissions verified
+- [ ] Unauthorized cross-database access rejected
+- [ ] Remote network access restrictions verified
+
+## 11. Host security verification summary
 
 | ID | Check | Expected result | Status |
 |---|---|---|---|

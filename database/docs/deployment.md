@@ -255,16 +255,481 @@ Result: **PASS — Owner confirmed.**
 - [x] Docker Hub image pull successful
 - [x] Hello-world container executed successfully
 
-### 8.6 Next Phase
+## 9. PostgreSQL Container Deployment
 
-Deploy PostgreSQL using Docker Compose with a persistent data volume, environment-based credentials, health checks, and local-only network access.
+### 9.1 Objective
 
-Team remote access remains disabled until database permissions and network restrictions are independently verified.
+Deploy PostgreSQL as a Docker container on the Raspberry Pi 5.
 
-## 9. Not in scope yet
+The initial deployment must provide:
 
-- Docker Engine / Compose installation and Docker Hub pull test.
-- PostgreSQL image, persistent volume, health check and restart policy.
+- A fixed PostgreSQL major version.
+- Persistent database storage using a Docker named volume.
+- Administrator credentials stored outside Git.
+- Local-only network access.
+- Automatic container restart.
+- PostgreSQL service health monitoring.
+
+Remote team access is not enabled during this phase.
+
+### 9.2 Deployment Environment
+
+| Component | Configuration |
+|---|---|
+| Host | Raspberry Pi 5 |
+| OS | Ubuntu Server 24.04 LTS (ARM64) |
+| Container Runtime | Docker Engine |
+| Container Orchestration | Docker Compose |
+| Image | `postgres:17-alpine` |
+| Deployment Directory | `/srv/genledge/postgres` |
+| Compose Project | `genledge-db` |
+| Database Port | `127.0.0.1:5432` |
+| Volume | `postgres_data` |
+
+### 9.3 Deployment Directory
+
+**Setup**
+
+```bash
+sudo mkdir -p /srv/genledge/postgres
+sudo chown piadmin:piadmin /srv/genledge/postgres
+chmod 700 /srv/genledge/postgres
+
+cd /srv/genledge/postgres
+```
+
+**Verification**
+
+```bash
+pwd
+stat -c '%a %U %G %n' /srv/genledge/postgres
+```
+
+**Expected result**
+
+```text
+/srv/genledge/postgres
+700 piadmin piadmin /srv/genledge/postgres
+```
+
+**Status:** PASS — Owner confirmed.
+
+### 9.4 PostgreSQL Administrator Credentials
+
+A random administrator password was generated using Python's `secrets` module and stored in a protected `.env` file.
+
+**Setup**
+
+```bash
+cd /srv/genledge/postgres
+umask 077
+
+python3 - <<'PY'
+import secrets
+from pathlib import Path
+
+password = secrets.token_urlsafe(32)
+
+with open(".env", "x") as f:
+    f.write(f"POSTGRES_PASSWORD={password}\n")
+
+Path(".env").chmod(0o600)
+
+print("Password file created successfully.")
+PY
+```
+
+The exclusive file creation mode prevents accidentally overwriting an existing password.
+
+**Verification**
+
+```bash
+stat -c '%a %U %G %n' .env
+grep -q '^POSTGRES_PASSWORD=.' .env && echo "Password configured"
+```
+
+**Expected result**
+
+```text
+600 piadmin piadmin .env
+Password configured
+```
+
+**Status:** PASS — Owner confirmed.
+
+The actual password must never be committed to Git, included in documentation, or shared in logs.
+
+### 9.5 Docker Compose Configuration
+
+**Setup**
+
+Create the configuration file:
+
+```bash
+nano /srv/genledge/postgres/compose.yaml
+```
+
+Configuration:
+
+```yaml
+name: genledge-db
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: postgres
+
+    ports:
+      - "127.0.0.1:5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  postgres_data:
+```
+
+**Verification**
+
+```bash
+cd /srv/genledge/postgres
+sudo docker compose config --quiet
+echo $?
+```
+
+**Expected result**
+
+```text
+0
+```
+
+Verify the network binding:
+
+```bash
+grep -F '127.0.0.1:5432:5432' compose.yaml
+```
+
+**Expected result**
+
+```text
+      - "127.0.0.1:5432:5432"
+```
+
+**Status:** PASS — Owner confirmed.
+
+Do not share the unredacted output of `docker compose config`, as it may contain resolved environment variables and sensitive credentials.
+
+### 9.6 Container Startup
+
+**Setup**
+
+```bash
+cd /srv/genledge/postgres
+sudo docker compose up -d
+```
+
+Docker Compose downloads the PostgreSQL image, creates the configured named volume, and starts the container.
+
+**Verification**
+
+```bash
+sudo docker compose ps
+```
+
+**Expected result**
+
+The PostgreSQL container is running and reaches the `healthy` state.
+
+**Status:** PASS — Owner confirmed.
+
+### 9.7 Health Verification
+
+**Verification**
+
+```bash
+sudo docker compose exec -T postgres \
+  pg_isready -U postgres -d postgres
+```
+
+**Expected result**
+
+```text
+/var/run/postgresql:5432 - accepting connections
+```
+
+**Status:** PASS — Owner confirmed.
+
+This confirms PostgreSQL is accepting connection attempts. Authentication and SQL read/write permissions require separate verification.
+
+### 9.8 Network Binding Verification
+
+**Verification**
+
+```bash
+sudo ss -ltnp | grep ':5432 '
+```
+
+**Expected result**
+
+PostgreSQL is published on:
+
+```text
+127.0.0.1:5432
+```
+
+It must not be published on all host interfaces:
+
+```text
+0.0.0.0:5432
+[::]:5432
+```
+
+**Status:** PASS — Owner confirmed.
+
+### 9.9 Persistent Storage Configuration
+
+The PostgreSQL data directory is backed by a Docker named volume:
+
+```yaml
+volumes:
+  - postgres_data:/var/lib/postgresql/data
+```
+
+**Verification**
+
+```bash
+sudo docker volume ls
+```
+
+**Expected result**
+
+The volume list includes:
+
+```text
+genledge-db_postgres_data
+```
+
+This verifies that the named volume exists. Persistence across container recreation will be tested separately.
+
+**Status:** Volume configured; data persistence test pending.
+
+### 9.10 Deployment Verification Summary
+
+| Test | Expected Result | Status |
+|---|---|---|
+| Deployment directory | Owner `piadmin`, permission `700` | PASS |
+| Administrator password file | Exists, permission `600` | PASS |
+| Compose configuration | Valid configuration | PASS |
+| Container startup | PostgreSQL container running | PASS |
+| Health check | `healthy` / accepting connections | PASS |
+| Network binding | Localhost only | PASS |
+| Docker volume | Persistent volume configured | PASS |
+| SQL read/write | Successfully execute SQL | Pending |
+| Container recreation persistence | Data survives recreation | Pending |
+| Developer databases | Separate developer databases created | Pending |
+| Database role isolation | Unauthorized access rejected | Pending |
+
+### 9.11 Next Steps
+
+- [ ] Verify SQL connectivity and read/write operations.
+- [ ] Verify data persistence after container recreation.
+- [ ] Create separate developer databases and roles.
+- [ ] Configure the shared integration database.
+- [ ] Verify database-level permission isolation.
+- [ ] Configure restricted remote access for authorized team members.
+
+## 10. PostgreSQL Functional Verification
+
+### 10.1 Objective
+
+Verify that the PostgreSQL instance supports SQL read/write operations and preserves database contents across container recreation.
+
+### 10.2 SQL Connection
+
+**Command**
+
+```bash
+cd /srv/genledge/postgres
+sudo docker compose exec postgres psql -U postgres -d postgres
+```
+
+**Expected result**
+
+```text
+postgres=#
+```
+
+**Status:** PASS — Owner confirmed.
+
+This test uses a local connection inside the PostgreSQL container. External TCP password authentication is not covered by this test.
+
+### 10.3 Create a Test Table
+
+**SQL**
+
+```sql
+CREATE TABLE public.deployment_verification (
+    id INTEGER PRIMARY KEY,
+    message TEXT NOT NULL
+);
+```
+
+**Expected result**
+
+```text
+CREATE TABLE
+```
+
+**Status:** PASS — Owner confirmed.
+
+### 10.4 Insert Test Data
+
+**SQL**
+
+```sql
+INSERT INTO public.deployment_verification (id, message)
+VALUES (1, 'PostgreSQL persistence test');
+```
+
+**Expected result**
+
+```text
+INSERT 0 1
+```
+
+**Status:** PASS — Owner confirmed.
+
+### 10.5 Verify SQL Read Operations
+
+**SQL**
+
+```sql
+SELECT * FROM public.deployment_verification;
+```
+
+**Expected result**
+
+```text
+ id |            message
+----+------------------------------
+  1 | PostgreSQL persistence test
+(1 row)
+```
+
+**Status:** PASS — Owner confirmed.
+
+Exit the SQL console using `\q`.
+
+### 10.6 Container Recreation
+
+**Commands**
+
+```bash
+cd /srv/genledge/postgres
+
+sudo docker compose down
+sudo docker compose up -d
+sudo docker compose ps
+```
+
+**Expected result**
+
+The PostgreSQL container is recreated and returns to a healthy running state.
+
+Important: `docker compose down` preserves named volumes by default. Do not use `docker compose down -v`, as this removes managed volumes.
+
+**Status:** PASS — Owner confirmed.
+
+### 10.7 Data Persistence Verification
+
+**Command**
+
+```bash
+sudo docker compose exec -T postgres \
+  psql -U postgres -d postgres \
+  -c "SELECT * FROM public.deployment_verification;"
+```
+
+**Expected result**
+
+```text
+ id |            message
+----+------------------------------
+  1 | PostgreSQL persistence test
+(1 row)
+```
+
+The original record must remain accessible after container recreation.
+
+**Status:** PASS — Owner confirmed.
+
+### 10.8 Test Data Cleanup
+
+**Command**
+
+```bash
+sudo docker compose exec -T postgres \
+  psql -U postgres -d postgres \
+  -c "DROP TABLE public.deployment_verification;"
+```
+
+**Expected result**
+
+```text
+DROP TABLE
+```
+
+**Status:** PASS — Owner confirmed.
+
+### 10.9 Verification Summary
+
+| Test | Expected Result | Status |
+|---|---|---|
+| Local SQL connection | Connection successful | PASS |
+| Table creation | `CREATE TABLE` | PASS |
+| Insert operation | `INSERT 0 1` | PASS |
+| Select operation | Expected record returned | PASS |
+| Container recreation | Container running and healthy | PASS |
+| Data persistence | Record retained after recreation | PASS |
+| Cleanup | `DROP TABLE` | PASS |
+
+All Phase 5 verification tests passed, as confirmed by the server owner.
+
+### 10.10 Limitations
+
+The following have not yet been verified:
+
+- Authentication using individual developer credentials.
+- Database-level authorization and isolation.
+- Remote database connectivity.
+- Backup and restoration from an independent backup.
+
+Container volume persistence is not equivalent to a verified backup and recovery mechanism.
+
+### 10.11 Next Steps
+
+- [ ] Provision individual developer databases and roles.
+- [ ] Provision the shared integration database.
+- [ ] Configure minimum required privileges.
+- [ ] Verify authorized database access.
+- [ ] Verify unauthorized cross-database access is rejected.
+- [ ] Prepare repeatable provisioning scripts.
+- [ ] Configure secure remote team connectivity.
+
+## 11. Not in scope yet
+
 - Eight databases and eight corresponding roles.
 - Team networking, SQL privileges, backups and PostgreSQL verification.
 
