@@ -6,7 +6,8 @@
 - [x] Verify focused auth tests and frontend build; document setup and limitations.
 
 Preserve the D1 images from main. Account creation is admin CLI only.
-Use DATABASE_URL for PostgreSQL; SQLite is a local development fallback.
+Use HOST, PORT, DATABASE, USER, and PASSWORD for PostgreSQL; SQLite is a local
+development fallback.
 
 Integration verification: backend tests, TypeScript check, and Vite build pass.
 Browser and live proxy checks are tracked in the final review below.

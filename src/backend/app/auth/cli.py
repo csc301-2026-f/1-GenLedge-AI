@@ -41,6 +41,7 @@ def db_check():
     click.echo(f'port={url.port or "default"}')
     click.echo(f'configured_database={url.database or "local-development"}')
     click.echo(f'configured_role={url.username or "not-set"}')
+    click.echo(f'password_configured={"yes" if current_app.config.get("DB_PASSWORD_CONFIGURED") else "no"}')
     click.echo(f'sslmode={current_app.config.get("DB_SSLMODE") or "not-set"}')
     click.echo(f'sslrootcert={"configured" if current_app.config.get("DB_SSLROOTCERT") else "not-set"}')
     try:

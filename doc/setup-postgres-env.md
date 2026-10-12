@@ -41,24 +41,26 @@ chmod 600 src/backend/.env
 Edit `src/backend/.env` and replace the placeholders:
 
 ```dotenv
-DATABASE_URL=postgresql+psycopg://YOUR_DB_USER:URL_ENCODED_PASSWORD@301db.dbestserv.com:5432/YOUR_DB_NAME
+HOST=301db.dbestserv.com
+PORT=5432
+DATABASE=YOUR_DATABASE_NAME
+USER=YOUR_DATABASE_USER
+PASSWORD=YOUR_DATABASE_PASSWORD
 SECRET_KEY=REPLACE_WITH_A_RANDOM_SECRET
 APP_ENV=development
 DB_SSLMODE=require
 # DB_SSLROOTCERT=C:/path/to/server.crt
 ```
 
-Use your assigned role and database. If the password contains `@`, `:`, `/`,
-`#`, `%`, or another URL-reserved character, percent-encode it before putting it
-in `DATABASE_URL`. Keep `.env` private; it is ignored by Git. The committed
-`.env.example` contains placeholders only.
+Use your assigned role and database. Put the database password in `PASSWORD`;
+the backend safely constructs the PostgreSQL connection from these fields. Keep
+`.env` private; it is ignored by Git. The committed `.env.example` contains
+placeholders only.
 
 `DB_SSLMODE` accepts `require`, `verify-ca`, or `verify-full`. Start with
 `require` while the team is validating the public certificate. For `verify-ca`
 or `verify-full`, set `DB_SSLROOTCERT` to the trusted certificate file path.
 `require` encrypts the connection but does not verify the server identity.
-The backend also accepts `postgresql://` and copied
-`jdbc:postgresql://` forms and normalizes them to the psycopg driver.
 The backend reads `.env` for both Flask CLI commands and the existing app
 launchers; a variable already set in the process takes precedence.
 
@@ -114,8 +116,9 @@ Create a local application login for testing:
 
 The command prompts for the application password and stores only its hash.
 
-For the optional PostgreSQL integration check, set `TEST_DATABASE_URL` to your
-developer-owned database URL in the test process and run `python -m pytest
+For the optional PostgreSQL integration check, set the `HOST`, `PORT`,
+`DATABASE`, `USER`, and `PASSWORD` settings for your developer-owned database
+in the test process and run `python -m pytest
 tests/test_postgres_integration.py` from `src/backend`. The test creates a
 uniquely named disposable schema, exercises migration and login, and removes
 that schema. Set `TEST_FORBIDDEN_DATABASE` to another developer's database to
@@ -159,10 +162,9 @@ because another developer may change or remove those records.
 
 ## Common errors
 
-- **Placeholder error:** replace every `YOUR_`, `URL_ENCODED_`, and
-  `REPLACE_WITH_` value in `.env`.
-- **Password authentication failed:** confirm the assigned role, password, and
-  URL-encoded password characters.
+- **Placeholder error:** replace every `YOUR_` and `REPLACE_WITH_` value in
+  `.env`.
+- **Password authentication failed:** confirm the assigned role and password.
 - **Database does not exist:** use the database paired with your role; ask the
   database owner to provision it rather than using `postgres`.
 - **Certificate verification failed:** keep `DB_SSLMODE=require` temporarily,

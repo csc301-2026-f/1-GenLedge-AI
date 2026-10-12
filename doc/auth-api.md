@@ -19,5 +19,6 @@ session token in the database so logout can revoke a copied cookie.
 
 `GENLEDGE_BACKEND_PORT` changes the development backend listener (default
 5000). The Vite proxy targets port 5000, so keep that default when using the
-full-stack launcher. `SECRET_KEY`, `DATABASE_URL`, and `APP_ENV` configure
+full-stack launcher. `SECRET_KEY`, `HOST`, `PORT`, `DATABASE`, `USER`,
+`PASSWORD`, and `APP_ENV` configure
 authentication; see `doc/auth-implementation.md`.

@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 
 from app import create_app
-from app.config import Config, normalize_database_url
+from app.config import Config
 from app.migrations import upgrade_database
 
 
@@ -11,36 +11,40 @@ def test_dotenv_values_and_process_precedence(tmp_path, monkeypatch):
 
     env_file = tmp_path / '.env'
     env_file.write_text(
-        'DATABASE_URL=sqlite:///from-file.db\n'
+        'APP_ENV=development\n'
         'SECRET_KEY=file-secret\n'
         'DB_SSLMODE=require\n',
         encoding='utf-8',
     )
     monkeypatch.setattr(config_module, 'ENV_FILE', env_file)
-    monkeypatch.delenv('DATABASE_URL', raising=False)
+    for name in ('HOST', 'PORT', 'DATABASE', 'USER', 'PASSWORD'):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv('SECRET_KEY', raising=False)
     values = Config()
-    assert values.DATABASE_URL == 'sqlite:///from-file.db'
+    assert values.DATABASE_URL is None
     assert values.SECRET_KEY == 'file-secret'
 
-    monkeypatch.setenv('DATABASE_URL', 'sqlite:///from-process.db')
-    assert Config().DATABASE_URL == 'sqlite:///from-process.db'
-
-
-def test_normalizes_common_postgres_url_forms():
-    assert normalize_database_url('jdbc:postgresql://db.example/dev') == 'postgresql+psycopg://db.example/dev'
-    assert normalize_database_url('postgresql://db.example/dev') == 'postgresql+psycopg://db.example/dev'
+    monkeypatch.setenv('HOST', 'db.example')
+    monkeypatch.setenv('PORT', '5432')
+    monkeypatch.setenv('DATABASE', 'from-process')
+    monkeypatch.setenv('USER', 'developer')
+    monkeypatch.setenv('PASSWORD', 'p@ssword')
+    assert Config().DATABASE_URL == 'postgresql+psycopg://developer:p%40ssword@db.example:5432/from-process'
 
 
 def test_placeholder_and_tls_validation(tmp_path, monkeypatch):
     import app.config as config_module
 
     monkeypatch.setattr(config_module, 'ENV_FILE', tmp_path / '.env')
-    monkeypatch.setenv('DATABASE_URL', 'postgresql+psycopg://YOUR_DB_USER:pass@host/db')
+    monkeypatch.setenv('HOST', 'YOUR_DB_HOST')
+    monkeypatch.setenv('PORT', '5432')
+    monkeypatch.setenv('DATABASE', 'db')
+    monkeypatch.setenv('USER', 'user')
+    monkeypatch.setenv('PASSWORD', 'pass')
     with pytest.raises(RuntimeError, match='placeholder'):
         Config()
 
-    monkeypatch.setenv('DATABASE_URL', 'postgresql+psycopg://user:pass@host/db')
+    monkeypatch.setenv('HOST', 'host')
     monkeypatch.setenv('DB_SSLMODE', 'verify-full')
     monkeypatch.delenv('DB_SSLROOTCERT', raising=False)
     with pytest.raises(RuntimeError, match='DB_SSLROOTCERT'):
