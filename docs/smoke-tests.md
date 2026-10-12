@@ -1,12 +1,20 @@
 # Smoke Tests
 
+## Import workflow contract (fake writer only)
+
+- Action: From `src/backend`, run `.\.venv\Scripts\python.exe -m pytest tests/test_import_workflow.py -q -p no:cacheprovider`.
+  Expected: Workflow tests pass without any database. They cover stable metadata,
+  nested records, failed staging/writes, concurrent publication and uncertain
+  publication outcomes. The fake is test-only; the UI still validates without saving.
+- Contract and database adapter handoff: [US2 import guide](../doc/us2-import-data.md).
+
 ## File validation (US2, no intake database)
 
-- Action: Install backend development requirements and run `python -m pytest tests`
+- Action: Install backend development requirements and run `.\.venv\Scripts\python.exe -m pytest tests -q -p no:cacheprovider`
   from `src/backend`.
   Expected: Parser and upload API tests pass with no database. API tests use
   main's existing demo login session.
-- Action: From `src/backend`, run `python -m app.sources.connectors.files <file>`.
+- Action: From `src/backend`, run `.\.venv\Scripts\python.exe -m app.sources.connectors.files <file>`.
   Expected: A valid file prints collection summaries with `persisted: false`;
   an invalid file exits nonzero with a validation message. No database is needed.
 - Action: Sign into the connected frontend, click Upload File, select a CSV, then
