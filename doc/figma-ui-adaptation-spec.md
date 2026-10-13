@@ -48,7 +48,7 @@ The sidebar may mark earlier workflow steps complete and keep later steps locked
 
 ## Prototype behavior to replace
 
-- Authentication is implemented using the local-demo Flask API documented in `doc/auth-api.md`. Any non-empty username/password is accepted; this does not verify identity. The Email Address field is sent as username without email-format validation. Remember me controls the backend cookie lifetime. Session restore distinguishes 401 from connection failures; failed logout retains local user state and offers retry. Credentials and sessions are never stored in browser storage.
+- Authentication uses the database-backed Flask API documented in `doc/auth-api.md`. The Email Address field is validated by the backend, passwords are checked against stored hashes, and Remember me controls the session lifetime. Session restore distinguishes 401 from connection failures; failed logout retains local user state and offers retry. Credentials and sessions are never stored in browser storage.
 - Source rows and source counts are fixed fixtures. The connection form and upload dialog do not create a source or transfer a file.
 - Discovery fields and sample values are fixed fixtures. Resampling only shows a temporary loading state.
 - Routing proposals are static. Accept/reject decisions are local component state and are not saved.

@@ -31,9 +31,31 @@ else
   exit 1
 fi
 
-if ! "$PYTHON" -c 'import flask' >/dev/null 2>&1; then
-  echo "Flask is not installed for $PYTHON." >&2
+if ! "$PYTHON" -c 'import flask, sqlalchemy' >/dev/null 2>&1; then
+  echo "Flask and SQLAlchemy are required for $PYTHON." >&2
   echo "Install it with: $PYTHON -m pip install -r \"$BACKEND_DIR/requirements-dev.txt\"" >&2
+  pause_before_exit
+  exit 1
+fi
+
+echo
+echo "===== Database connection status ====="
+if ! (cd "$BACKEND_DIR" && "$PYTHON" -m flask --app main auth-db-check); then
+  echo "Database connection check failed. The frontend and backend were not started." >&2
+  pause_before_exit
+  exit 1
+fi
+
+if [[ -t 0 ]]; then
+  read -r -p "Continue with migrations and start services? [Y/n] " answer
+  if [[ "$answer" =~ ^[Nn]$ ]]; then
+    echo "Startup cancelled."
+    exit 0
+  fi
+fi
+
+if ! (cd "$BACKEND_DIR" && "$PYTHON" -m flask --app main auth-init-db); then
+  echo "Database migration failed. The frontend and backend were not started." >&2
   pause_before_exit
   exit 1
 fi
