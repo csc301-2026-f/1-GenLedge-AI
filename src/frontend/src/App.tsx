@@ -6,6 +6,7 @@ import { LoginScreen } from './features/auth/LoginScreen'
 import { SourcesScreen } from './features/sources/SourcesScreen'
 import { DiscoverScreen } from './features/discovery/DiscoverScreen'
 import { RouteScreen } from './features/mappings/RouteScreen'
+import { stored, store } from './features/mappings/client'
 import { MappingScreen } from './features/mappings/MappingScreen'
 import { RunScreen } from './features/runs/RunScreen'
 import { MonitorScreen } from './features/runs/MonitorScreen'
@@ -13,6 +14,7 @@ import { AppearanceSettings } from './features/settings/AppearanceSettings'
 
 // ─── Root ─────────────────────────────────────────────────────────────────────
 export default function App() {
+  const [routingJobId, setRoutingJobId] = useState<string | null>(null)
   const [screen, setScreen] = useState<Screen>('login')
   const [user, setUser] = useState<AuthUser | null>(null)
   const [completedThrough, setCompletedThrough] = useState(-1)
@@ -27,8 +29,10 @@ export default function App() {
   const signedIn = (nextUser: AuthUser) => {
     setUser(nextUser)
     setConnectionError('')
-    setCompletedThrough(-1)
-    setScreen('sources')
+    const savedJob = stored(`active:${nextUser.username}`)
+    setRoutingJobId(savedJob)
+    setCompletedThrough(savedJob ? 1 : -1)
+    setScreen(savedJob ? 'route' : 'sources')
   }
 
   useEffect(() => {
@@ -95,8 +99,8 @@ export default function App() {
         <Sidebar current={screen} onNav={navigateWorkflow} completedThrough={completedThrough} />
         <main style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
           {screen === 'sources'  && <SourcesScreen  onNav={navigateWorkflow} onAdvance={() => advance('sources', 'discover')} onInvalidate={() => invalidateAfter('sources')} />}
-          {screen === 'discover' && <DiscoverScreen onNav={navigateWorkflow} onAdvance={() => advance('discover', 'route')} onInvalidate={() => invalidateAfter('discover')} />}
-          {screen === 'route'    && <RouteScreen    onNav={navigateWorkflow} onAdvance={() => advance('route', 'mapping')} onInvalidate={() => invalidateAfter('route')} />}
+          {screen === 'discover' && <DiscoverScreen owner={user.username} onNav={navigateWorkflow} onAdvance={id => { store(`active:${user.username}`, id); setRoutingJobId(id); advance('discover', 'route') }} onInvalidate={() => invalidateAfter('discover')} />}
+          {screen === 'route' && routingJobId && <RouteScreen jobId={routingJobId} owner={user.username} onJob={setRoutingJobId} onNav={navigateWorkflow} onInvalidate={() => invalidateAfter('route')} />}
           {screen === 'mapping'  && <MappingScreen  onNav={navigateWorkflow} onAdvance={() => advance('mapping', 'run')} onInvalidate={() => invalidateAfter('mapping')} />}
           {screen === 'run'      && <RunScreen      onNav={navigateWorkflow} onAdvance={() => advance('run', 'monitor')} onInvalidate={() => invalidateAfter('run')} />}
           {screen === 'monitor'  && <MonitorScreen  onNav={navigateWorkflow} />}
