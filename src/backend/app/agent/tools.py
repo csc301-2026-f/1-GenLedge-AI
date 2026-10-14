@@ -60,11 +60,13 @@ def redact_value(value: Any, field_path: str = "") -> Any:
     Applied at the tool layer *before* persistence, so a restricted value is not
     stored in a tool result at all — and therefore cannot be projected into a
     prompt later. Structure is preserved; only the offending scalar is replaced.
+    Contact detection uses `search`, not `match`: an address embedded in a longer
+    sentence is still a contact detail.
     """
 
     if isinstance(value, str) and (
         _CREDENTIAL.search(value)
-        or _EMAIL.match(value.strip())
+        or _EMAIL.search(value.strip())
         or _PAYMENT_CARD.search(value)
     ):
         return REDACTION_MARKER
@@ -87,12 +89,37 @@ def redact_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {str(key): redact_value(value, str(key)) for key, value in payload.items()}
 
 
+def _rows_of(payload: dict[str, Any]) -> list[Any] | None:
+    """The top-level row list of a result model, whatever the tool calls it.
+
+    `max_tool_rows` is enforced against the one row collection the *declared* result
+    model actually has, so the cap cannot be bypassed by nesting the rows under a
+    different key.
+    """
+
+    for key in ("rows", "resources", "changed_resources"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    return None
+
+
 def payload_bytes(payload: dict[str, Any]) -> int:
     return len(json.dumps(payload, sort_keys=True, default=str).encode("utf-8"))
 
 
 class ToolArgumentModel(StrictModel):
     """Base for per-tool argument models; unknown fields are rejected."""
+
+
+class ToolResultModel(StrictModel):
+    """Base for per-tool result models.
+
+    Boundary 4 of `plans/LANGGRAPH_HARNESS_PLAN.md` §5.4: the connector's answer is
+    validated before it is redacted and persisted. A shape the harness did not
+    declare becomes a typed `connector_error` the model can read, rather than data
+    that silently gains a field the row/byte caps do not know about.
+    """
 
 
 class ListResourcesArgs(ToolArgumentModel):
@@ -132,10 +159,58 @@ class GetChangesArgs(ToolArgumentModel):
     cursor: str | None = None
 
 
+class ResourceSummaryResult(StrictModel):
+    resource_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    kind: str = Field(min_length=1)
+
+
+class ListResourcesResult(ToolResultModel):
+    resources: list[ResourceSummaryResult] = Field(default_factory=list)
+    next_page_token: str | None = None
+
+
+class DescribeResourceResult(ToolResultModel):
+    resource_id: str = Field(min_length=1)
+    fields: list[str] = Field(default_factory=list)
+    field_count: int = Field(default=0, ge=0)
+    declared_key: list[str] = Field(default_factory=list)
+
+
+class ProfileResourceResult(ToolResultModel):
+    resource_id: str = Field(min_length=1)
+    profiled_fields: list[str] = Field(default_factory=list)
+    row_count: int = Field(default=0, ge=0)
+    nulls: dict[str, int] = Field(default_factory=dict)
+    cardinality: dict[str, int] = Field(default_factory=dict)
+    evidence_ref: str | None = None
+
+
+class SampleRowsResult(ToolResultModel):
+    resource_id: str = Field(min_length=1)
+    sampling: str = Field(default="head", min_length=1)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_ref: str | None = None
+
+
+class CompareFieldsResult(ToolResultModel):
+    overlap: float = Field(default=0.0, ge=0.0, le=1.0)
+    left_unique: bool = False
+    cardinality: str = Field(default="unknown", min_length=1)
+    evidence_ref: str | None = None
+
+
+class GetChangesResult(ToolResultModel):
+    status: str = Field(default="ok", min_length=1)
+    reason: str | None = None
+    changed_resources: list[str] = Field(default_factory=list)
+
+
 class ToolSpec(StrictModel):
     name: str = Field(min_length=1)
     description: str = Field(min_length=1)
     arguments: type[ToolArgumentModel]
+    result: type[ToolResultModel]
 
     model_config = {"extra": "forbid", "frozen": True, "strict": True, "arbitrary_types_allowed": True}
 
@@ -143,12 +218,42 @@ class ToolSpec(StrictModel):
 TOOL_SPECS: dict[str, ToolSpec] = {
     spec.name: spec
     for spec in (
-        ToolSpec(name="list_resources", description="List the resources available in a source.", arguments=ListResourcesArgs),
-        ToolSpec(name="describe_resource", description="Describe one resource's fields, types and declared keys.", arguments=DescribeResourceArgs),
-        ToolSpec(name="profile_resource", description="Return bounded counts, nulls and cardinality for selected fields.", arguments=ProfileResourceArgs),
-        ToolSpec(name="sample_rows", description="Return a bounded number of redacted representative rows.", arguments=SampleRowsArgs),
-        ToolSpec(name="compare_fields", description="Return overlap and cardinality evidence for two fields.", arguments=CompareFieldsArgs),
-        ToolSpec(name="get_changes", description="Report source changes since a cursor, or an explicit unsupported result.", arguments=GetChangesArgs),
+        ToolSpec(
+            name="list_resources",
+            description="List the resources available in a source.",
+            arguments=ListResourcesArgs,
+            result=ListResourcesResult,
+        ),
+        ToolSpec(
+            name="describe_resource",
+            description="Describe one resource's fields, types and declared keys.",
+            arguments=DescribeResourceArgs,
+            result=DescribeResourceResult,
+        ),
+        ToolSpec(
+            name="profile_resource",
+            description="Return bounded counts, nulls and cardinality for selected fields.",
+            arguments=ProfileResourceArgs,
+            result=ProfileResourceResult,
+        ),
+        ToolSpec(
+            name="sample_rows",
+            description="Return a bounded number of redacted representative rows.",
+            arguments=SampleRowsArgs,
+            result=SampleRowsResult,
+        ),
+        ToolSpec(
+            name="compare_fields",
+            description="Return overlap and cardinality evidence for two fields.",
+            arguments=CompareFieldsArgs,
+            result=CompareFieldsResult,
+        ),
+        ToolSpec(
+            name="get_changes",
+            description="Report source changes since a cursor, or an explicit unsupported result.",
+            arguments=GetChangesArgs,
+            result=GetChangesResult,
+        ),
     )
 }
 
@@ -237,7 +342,12 @@ class FakeConnector:
                 ]
             }
         if name == "describe_resource":
-            return {"resource_id": resource_id, "field_count": len(fields) or 4}
+            return {
+                "resource_id": resource_id,
+                "fields": fields,
+                "field_count": len(fields) or 4,
+                "declared_key": ["order_id"] if resource_id == "orders" else [],
+            }
         if name == "profile_resource":
             return {
                 "resource_id": resource_id,
@@ -334,7 +444,23 @@ class ToolDispatcher:
         except Exception as error:  # noqa: BLE001 - a connector fault is data, not a crash
             return self._error(request, job_id, CONNECTOR_ERROR, str(error))
 
-        redacted = redact_payload(dict(raw))
+        # Boundary 4: validate the connector's answer *inside* the guarded block, so
+        # a shape the harness did not declare is data rather than an exception.
+        try:
+            if not isinstance(raw, dict):
+                raise ConnectorError(CONNECTOR_ERROR, f"connector returned {type(raw).__name__}, not an object")
+            validated = spec.result.model_validate(raw)
+        except ValidationError as error:
+            return self._error(
+                request,
+                job_id,
+                CONNECTOR_ERROR,
+                f"{request.name} result does not match its contract: {_brief(error)}",
+            )
+        except ConnectorError as error:
+            return self._error(request, job_id, error.code, error.message)
+
+        redacted = {key: redact_value(value, key) for key, value in validated.model_dump().items()}
         size = payload_bytes(redacted)
         if size > self.budgets.max_tool_bytes:
             return self._error(
@@ -345,8 +471,8 @@ class ToolDispatcher:
                 persist=False,
             )
 
-        rows = redacted.get("rows")
-        if isinstance(rows, list) and len(rows) > self.budgets.max_tool_rows:
+        rows = _rows_of(redacted)
+        if rows is not None and len(rows) > self.budgets.max_tool_rows:
             return self._error(
                 request,
                 job_id,
@@ -424,13 +550,20 @@ __all__ = [
     "TOOL_SPECS",
     "UNAUTHORIZED_SOURCE",
     "UNSUPPORTED",
+    "CompareFieldsResult",
     "ConnectorError",
+    "DescribeResourceResult",
     "FakeConnector",
+    "GetChangesResult",
+    "ListResourcesResult",
+    "ProfileResourceResult",
+    "SampleRowsResult",
     "ToolArgumentModel",
     "ToolCallRequest",
     "ToolDispatcher",
     "ToolOutcome",
     "ToolResult",
+    "ToolResultModel",
     "ToolSpec",
     "payload_bytes",
     "redact_payload",

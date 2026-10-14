@@ -16,7 +16,12 @@ MODEL_CONFIGURATION_ERROR = "model_configuration_error"
 MODEL_REFUSED = "model_refused"
 MODEL_CALL_BUDGET_EXHAUSTED = "model_call_budget_exhausted"
 TOOL_BUDGET_EXHAUSTED = "tool_budget_exhausted"
+TOKEN_BUDGET_EXHAUSTED = "token_budget_exhausted"
+COST_BUDGET_EXHAUSTED = "cost_budget_exhausted"
+WALL_CLOCK_BUDGET_EXHAUSTED = "wall_clock_budget_exhausted"
 EMPTY_INVENTORY = "empty_inventory"
+CATALOGUE_NOT_FOUND = "catalogue_not_found"
+PROMPT_RENDER_FAILED = "prompt_render_failed"
 INVALID_STATE_UPDATE = "invalid_state_update"
 
 

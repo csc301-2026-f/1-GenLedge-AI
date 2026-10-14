@@ -164,7 +164,7 @@ def test_a_resource_outside_the_snapshot_is_not_found():
 
 def test_recorded_results_are_redacted_before_persistence():
     repository = seeded_repository()
-    connector = _SessionConnector()
+    connector = _CredentialConnector()
     dispatcher = _dispatcher(repository, connector)
     outcome = dispatcher.dispatch(
         ToolCallRequest(
@@ -176,17 +176,21 @@ def test_recorded_results_are_redacted_before_persistence():
         tool_calls_used=0,
     )
     assert outcome.result.redacted is True
+    assert outcome.result.status == "ok"
     stored = repository.get_tool_result("job-6", "call-redact")
     assert stored is not None
     assert stored.redacted is True
-    assert stored.payload["password"] == "[redacted]"
-    assert stored.payload["contact"] == "[redacted]"
+    row = stored.payload["rows"][0]
+    assert row["password"] == "[redacted]"
+    assert row["contact"] == "[redacted]"
+    assert row["dsn"] == "[redacted]"
     assert stored.payload["resource_id"] == "orders.lines[]"
-    assert "hunter2" not in str(stored.payload)
+    for secret in ("hunter2", "ada@example.com", "postgresql://"):
+        assert secret not in str(stored.payload)
 
 
-class _SessionConnector:
-    """A connector returning a credential-like and a contact-like value."""
+class _CredentialConnector:
+    """A connector whose row values include credential-like and contact-like data."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict, str]] = []
@@ -195,7 +199,12 @@ class _SessionConnector:
         self.calls.append((name, dict(arguments), job_id))
         return {
             "resource_id": arguments.get("resource_id"),
-            "password": "hunter2",
-            "contact": "ada@example.com",
-            "dsn": "postgresql://user:pw@host/db",
+            "sampling": "head",
+            "rows": [
+                {
+                    "password": "hunter2",
+                    "contact": "ada@example.com",
+                    "dsn": "postgresql://user:pw@host/db",
+                }
+            ],
         }

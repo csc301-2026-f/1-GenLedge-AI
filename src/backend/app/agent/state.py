@@ -18,6 +18,7 @@ accumulate across steps or across tool-loop turns.
 from __future__ import annotations
 
 import operator
+from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, TypedDict
 
 from app.agent.contracts import (
@@ -64,6 +65,7 @@ class RoutingJobState(TypedDict, total=False):
     tokens_used: int
     failure: FailureInfo | None
     status: str | None
+    started_at: str | None
     updated_at: str | None
 
     # accumulated
@@ -75,9 +77,9 @@ class RoutingJobState(TypedDict, total=False):
 
 
 #: Keys a node may return when it is acting for a given node name, mirroring
-#: `plans/user-stories/US4.md` §4.2's "Writes" column. A node returning a key
-#: outside its own list is a programming error, and `validate_node_update` turns
-#: it into a typed `invalid_state_update` failure instead of a silent merge.
+#: `plans/user-stories/US4.md` §4.2's "Writes" column. `graphs.guarded` checks every
+#: node update against its own list, so a node returning an undeclared key fails
+#: loudly instead of merging a field the state design never accounted for.
 NODE_WRITES: dict[str, frozenset[str]] = {
     "context": frozenset(
         {"source_snapshot_ids", "inventory_ref", "catalogue_ref", "status", "failure", "updated_at"}
@@ -88,6 +90,7 @@ NODE_WRITES: dict[str, frozenset[str]] = {
             "pending_tool_calls",
             "model_calls_used",
             "tokens_used",
+            "revision_count",
             "messages",
             "prompt_ref",
             "status",
@@ -128,6 +131,7 @@ def initial_state(
     Frozen inputs are set here and only here: the runner owns them, not a node.
     """
 
+    started = datetime.now(timezone.utc).isoformat()
     return RoutingJobState(
         job_id=job_id,
         source_snapshot_ids=list(source_snapshot_ids),
@@ -144,7 +148,8 @@ def initial_state(
         tokens_used=0,
         failure=None,
         status="running",
-        updated_at=None,
+        started_at=started,
+        updated_at=started,
         tool_results=[],
         messages=[],
         prompt_ref=None,
@@ -166,7 +171,9 @@ def budget_exhausted(budgets: AgentBudgets, state: RoutingJobState) -> str | Non
 
     Checked *before* a dispatch or a model call, so exhaustion routes to `END`
     with a recorded failure rather than raising or being masked by the graph
-    runtime's own recursion limit.
+    runtime's own recursion limit. Cost and wall clock are evaluated by the node
+    from the recorded usage (`nodes._budget_stop`); this predicate covers the three
+    that a state counter alone can answer.
     """
 
     if state.get("tool_calls_used", 0) >= budgets.max_tool_calls:

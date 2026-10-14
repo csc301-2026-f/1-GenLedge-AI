@@ -25,16 +25,22 @@ from app.agent import prompts as prompt_module
 from app.agent import state as state_module
 from app.agent.contracts import AgentBudgets, FailureInfo, InventoryView, ModelDraft, ToolResultRef
 from app.agent.errors import (
+    CATALOGUE_NOT_FOUND,
+    COST_BUDGET_EXHAUSTED,
     EMPTY_INVENTORY,
     MODEL_CALL_BUDGET_EXHAUSTED,
+    MODEL_CONFIGURATION_ERROR,
+    PROMPT_RENDER_FAILED,
+    TOKEN_BUDGET_EXHAUSTED,
     TOOL_BUDGET_EXHAUSTED,
+    WALL_CLOCK_BUDGET_EXHAUSTED,
     AgentFailure,
     InvalidModelOutputError,
 )
 from app.agent.models import ModelClient, ModelRequest, ModelResponse, parse_model_draft
 from app.agent.repositories import CatalogueView, RoutingRepository
 from app.agent.state import RoutingJobState
-from app.agent.tools import FakeConnector, ToolConnector, ToolDispatcher, ToolResult
+from app.agent.tools import FakeConnector, ToolConnector, ToolDispatcher, ToolResult, tool_schemas
 
 CONTEXT = "context"
 PROPOSE = "propose"
@@ -61,6 +67,9 @@ class GraphRuntime:
     tool_results: list[ToolResult] = field(default_factory=list)
     responses: list[ModelResponse] = field(default_factory=list)
     repairs_used: int = 0
+    #: Price used to evaluate `AgentBudgets.max_cost_usd`. `None` means the ceiling
+    #: cannot be evaluated, and the run says so rather than guessing a price.
+    cost_per_1k_tokens_usd: float | None = None
 
     def last_response(self) -> ModelResponse | None:
         return self.responses[-1] if self.responses else None
@@ -113,7 +122,19 @@ def context_node(state: RoutingJobState, runtime: GraphRuntime) -> dict[str, Any
             )
         )
 
-    catalogue = runtime.repository.get_catalogue(state.get("catalogue_ref"))
+    # An unresolvable `catalog_ref` is a typed failure, not a silent downgrade: a
+    # reviewer who asked for reuse must not be handed a cold-start proposal with no
+    # signal that AC3's semantics flipped.
+    requested_catalogue = state.get("catalogue_ref")
+    catalogue = runtime.repository.get_catalogue(requested_catalogue)
+    if requested_catalogue and catalogue is None:
+        return _failure_update(
+            AgentFailure(
+                CATALOGUE_NOT_FOUND,
+                f"catalogue {requested_catalogue!r} was not found for this job",
+                retryable=False,
+            )
+        )
     runtime.inventory = inventory
     runtime.catalogue = catalogue
     runtime.dispatcher = ToolDispatcher(
@@ -135,6 +156,76 @@ def context_node(state: RoutingJobState, runtime: GraphRuntime) -> dict[str, Any
 # --- propose -------------------------------------------------------------------
 
 
+def _budget_stop(state: RoutingJobState, runtime: GraphRuntime, budgets: AgentBudgets) -> FailureInfo | None:
+    """The first exhausted budget, as a typed failure, or `None` when one remains.
+
+    Every budget here is checked **before** the work it bounds, so exhaustion is a
+    recorded outcome rather than a framework error or an overspend.
+    """
+
+    used = _budget_counter(state, runtime)
+    if used >= budgets.max_model_calls:
+        return FailureInfo(
+            code=MODEL_CALL_BUDGET_EXHAUSTED,
+            message=f"model call budget exhausted ({budgets.max_model_calls})",
+            retryable=False,
+        )
+    if state.get("tokens_used", 0) >= budgets.max_tokens:
+        return FailureInfo(
+            code=TOKEN_BUDGET_EXHAUSTED,
+            message=f"token budget exhausted ({budgets.max_tokens})",
+            retryable=False,
+        )
+    elapsed = _elapsed_seconds(state)
+    if elapsed is not None and elapsed >= budgets.max_wall_clock_seconds:
+        return FailureInfo(
+            code=WALL_CLOCK_BUDGET_EXHAUSTED,
+            message=f"wall clock budget exhausted ({budgets.max_wall_clock_seconds}s)",
+            retryable=False,
+        )
+    spent = _estimated_cost_usd(state, runtime)
+    if spent is not None and spent >= budgets.max_cost_usd:
+        return FailureInfo(
+            code=COST_BUDGET_EXHAUSTED,
+            message=f"cost budget exhausted (${spent:.4f} of ${budgets.max_cost_usd})",
+            retryable=False,
+        )
+    return None
+
+
+def _elapsed_seconds(state: RoutingJobState) -> float | None:
+    """Seconds since the run's start marker, or `None` when it is not recorded."""
+
+    started = runtime_started_at(state)
+    if started is None:
+        return None
+    return (datetime.now(timezone.utc) - started).total_seconds()
+
+
+def runtime_started_at(state: RoutingJobState) -> datetime | None:
+    raw = state.get("started_at")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+
+
+def _estimated_cost_usd(state: RoutingJobState, runtime: GraphRuntime) -> float | None:
+    """Cost from the recorded token count and the configured price, if any.
+
+    Cost is computed at read time from a price table rather than stored, so a price
+    change does not rewrite history (master §8.2). With no configured price the
+    ceiling cannot be evaluated and `None` says so instead of guessing.
+    """
+
+    price = runtime.cost_per_1k_tokens_usd
+    if price is None:
+        return None
+    return (state.get("tokens_used", 0) / 1000.0) * price
+
+
 def propose_node(state: RoutingJobState, runtime: GraphRuntime) -> dict[str, Any]:
     """One structured model call per invocation, with one repair attempt."""
 
@@ -145,48 +236,48 @@ def propose_node(state: RoutingJobState, runtime: GraphRuntime) -> dict[str, Any
             AgentFailure(EMPTY_INVENTORY, "context did not load an inventory", retryable=False)
         )
 
-    used = _budget_counter(state, runtime)
-    if used >= budgets.max_model_calls:
-        return _failure_update(
-            AgentFailure(
-                MODEL_CALL_BUDGET_EXHAUSTED,
-                f"model call budget exhausted ({budgets.max_model_calls})",
-                retryable=False,
-            )
-        )
-    if state.get("tokens_used", 0) >= budgets.max_tokens:
-        return _failure_update(
-            AgentFailure(
-                MODEL_CALL_BUDGET_EXHAUSTED,
-                f"token budget exhausted ({budgets.max_tokens})",
-                retryable=False,
-            )
-        )
+    stop = _budget_stop(state, runtime, budgets)
+    if stop is not None:
+        return _failure_update(stop)
 
     model = runtime.model
     if model is None:
         return _failure_update(
-            AgentFailure(MODEL_CALL_BUDGET_EXHAUSTED, "no model client was configured", retryable=False)
+            AgentFailure(
+                MODEL_CONFIGURATION_ERROR,
+                "no model client was configured for this run",
+                retryable=False,
+            )
         )
 
-    rendered = prompt_module.render_proposal_prompt(
-        job_id=state.get("job_id", ""),
-        inventory=inventory,
-        catalogue=runtime.catalogue,
-        tool_results=runtime.tool_results,
-        budgets=budgets,
-    )
+    try:
+        rendered = prompt_module.render_proposal_prompt(
+            job_id=state.get("job_id", ""),
+            inventory=inventory,
+            catalogue=runtime.catalogue,
+            tool_results=runtime.tool_results,
+            budgets=budgets,
+        )
+    except prompt_module.PromptError as error:
+        # A rendering fault is a typed job failure. It must never escape the graph.
+        return _failure_update(
+            AgentFailure(PROMPT_RENDER_FAILED, f"prompt rendering failed: {error}", retryable=False)
+        )
     request = ModelRequest(
         node=PROPOSE,
         system=rendered.system,
         user=rendered.user,
         prompt_ref=rendered.ref,
         job_id=state.get("job_id", ""),
+        # Tools are bound so a live provider can request one. Without this the tool
+        # loop is unreachable outside the fake adapter.
+        tools=tool_schemas(),
         results=tuple(runtime.tool_results),
     )
     response = model.invoke(request)
     runtime.responses.append(response)
-    calls_used = state.get("model_calls_used", 0) + 1
+    runtime.repository.record_model_call(state.get("job_id", ""), node=PROPOSE, tokens=response.tokens)
+    calls_used = _budget_counter(state, runtime)
     tokens_used = state.get("tokens_used", 0) + response.tokens
 
     if response.error_code:
@@ -231,25 +322,25 @@ def propose_node(state: RoutingJobState, runtime: GraphRuntime) -> dict[str, Any
         )
         return update
 
-    draft, error = parse_model_draft(response.text)
+    draft, contract_error = parse_model_draft(response.text)
     if draft is None:
         repaired, repair_tokens, attempted = _attempt_repair(
-            error or "invalid model output",
+            contract_error or "invalid model output",
+            previous_response=response.text,
             runtime=runtime,
             state=state,
             calls_used=calls_used,
-            max_model_calls=budgets.max_model_calls,
+            budgets=budgets,
         )
         # A repair is charged as soon as it is attempted: the provider was called,
         # so the in-state counter and the durable count must both see it.
         if attempted:
-            calls_used += 1
+            calls_used = _budget_counter(state, runtime)
             tokens_used += repair_tokens
         if repaired is None:
+            after = " after one repair attempt" if attempted else " (no repair was attempted)"
             update = _failure_update(
-                InvalidModelOutputError(
-                    f"model output failed the contract after one repair attempt: {error}"
-                )
+                InvalidModelOutputError(f"model output failed the contract{after}: {contract_error}")
             )
             update.update(
                 {
@@ -282,34 +373,50 @@ def propose_node(state: RoutingJobState, runtime: GraphRuntime) -> dict[str, Any
 def _attempt_repair(
     errors: str,
     *,
+    previous_response: str,
     runtime: GraphRuntime,
     state: RoutingJobState,
     calls_used: int,
-    max_model_calls: int,
+    budgets: AgentBudgets,
 ) -> tuple[ModelDraft | None, int, bool]:
-    """Exactly one repair call.
+    """Exactly one repair call, carrying the same evidence as the proposal call.
 
     Returns `(draft, tokens, attempted)`. `attempted` is `True` only when the
     provider was actually called, so the caller charges the budget exactly once and
     only for a call that happened.
     """
 
-    if calls_used >= max_model_calls:
+    if calls_used >= budgets.max_model_calls:
         return None, 0, False
     model = runtime.model
-    if model is None:
+    inventory = runtime.inventory
+    if model is None or inventory is None:
         return None, 0, False
-    rendered = prompt_module.render_repair_prompt(validation_errors=errors)
+    try:
+        rendered = prompt_module.render_repair_prompt(
+            validation_errors=errors,
+            previous_response=previous_response,
+            job_id=state.get("job_id", ""),
+            inventory=inventory,
+            catalogue=runtime.catalogue,
+            tool_results=runtime.tool_results,
+            budgets=budgets,
+        )
+    except prompt_module.PromptError:
+        return None, 0, False
     request = ModelRequest(
         node=PROPOSE,
         system=rendered.system,
         user=rendered.user,
         prompt_ref=rendered.ref,
         job_id=state.get("job_id", ""),
+        tools=tool_schemas(),
         repair=True,
+        results=tuple(runtime.tool_results),
     )
     response = model.invoke(request)
     runtime.responses.append(response)
+    runtime.repository.record_model_call(state.get("job_id", ""), node=PROPOSE, tokens=response.tokens)
     runtime.repairs_used += 1
     if response.error_code or response.tool_calls:
         return None, response.tokens, True
@@ -347,8 +454,9 @@ def tool_call_node(state: RoutingJobState, runtime: GraphRuntime) -> dict[str, A
         outcome = dispatcher.dispatch(request, job_id=state.get("job_id", ""), tool_calls_used=used)
         if outcome.charged:
             used += 1
-        if outcome.result.status == "ok":
-            runtime.tool_results.append(outcome.result)
+        # Errors are kept too: they are the typed data the model has to adapt to, and
+        # the projection is where they become prompt text.
+        runtime.tool_results.append(outcome.result)
         refs.append(outcome.ref)
 
     return {

@@ -5,10 +5,10 @@ from __future__ import annotations
 import pytest
 
 from app.agent.contracts import AgentBudgets
-from app.agent.errors import INVALID_MODEL_OUTPUT
+from app.agent.errors import CATALOGUE_NOT_FOUND, EMPTY_INVENTORY, INVALID_MODEL_OUTPUT, PROMPT_RENDER_FAILED
 from app.agent.graph import run_routing_job
 from app.agent.models import ModelResponse, build_fake_draft, parse_model_draft
-from app.agent.repositories import SNAPSHOT_ID, seeded_repository
+from app.agent.repositories import SNAPSHOT_ID, empty_inventory_repository, seeded_repository
 from app.agent.state import NODE_WRITES, validate_node_update
 
 from .doubles import ScriptedModel
@@ -127,3 +127,82 @@ def test_a_node_cannot_write_a_field_it_does_not_own():
         validate_node_update("context", {"model_draft": None})
     assert "model_draft" in NODE_WRITES["propose"]
     assert "model_draft" not in NODE_WRITES["context"]
+
+
+def test_the_write_guard_is_wired_into_graph_execution():
+    """A node that writes an undeclared key fails at the graph boundary, not silently."""
+
+    import app.agent.graph as graph_module
+    import app.agent.nodes as nodes_module
+
+    original = nodes_module.context_node
+
+    def rogue_context(state, runtime):
+        return {**original(state, runtime), "model_draft": None}
+
+    graph_module.node_module.context_node = rogue_context
+    try:
+        with pytest.raises(ValueError, match="model_draft"):
+            graph_module.build_graph()
+            run_routing_job(
+                job_id="job-guard",
+                source_snapshot_ids=[SNAPSHOT_ID],
+                repository=seeded_repository(),
+                budgets=AgentBudgets(max_tool_calls=5, max_model_calls=5),
+            )
+    finally:
+        graph_module.node_module.context_node = original
+
+
+def test_an_unresolvable_catalogue_is_a_typed_failure_not_a_cold_start():
+    run = run_routing_job(
+        job_id="job-catalogue",
+        source_snapshot_ids=[SNAPSHOT_ID],
+        repository=seeded_repository(),
+        budgets=AgentBudgets(max_tool_calls=5, max_model_calls=5),
+        catalogue_ref="catalog-does-not-exist",
+    )
+    assert run.failure is not None
+    assert run.failure.code == CATALOGUE_NOT_FOUND
+    assert run.model_draft is None
+    assert run.final_state["status"] == "failed"
+
+
+def test_an_empty_inventory_fails_the_job_with_a_typed_reason():
+    run = run_routing_job(
+        job_id="job-empty",
+        source_snapshot_ids=[SNAPSHOT_ID],
+        repository=empty_inventory_repository(),
+        budgets=AgentBudgets(max_tool_calls=5, max_model_calls=5),
+    )
+    assert run.failure is not None
+    assert run.failure.code == EMPTY_INVENTORY
+    assert run.model_draft is None
+    assert run.model_responses == [], "no model call is made for an empty inventory"
+
+
+def test_a_prompt_render_fault_is_reported_rather_than_raised():
+    """Source data can look like anything; a render fault must not escape the graph."""
+
+    import app.agent.nodes as nodes_module
+
+    original = nodes_module.prompt_module.render_proposal_prompt
+
+    def broken(**kwargs):
+        raise nodes_module.prompt_module.PromptError("synthetic render failure")
+
+    nodes_module.prompt_module.render_proposal_prompt = broken
+    try:
+        run = run_routing_job(
+            job_id="job-render-fault",
+            source_snapshot_ids=[SNAPSHOT_ID],
+            repository=seeded_repository(),
+            budgets=AgentBudgets(max_tool_calls=5, max_model_calls=5),
+        )
+    finally:
+        nodes_module.prompt_module.render_proposal_prompt = original
+
+    assert run.failure is not None
+    assert run.failure.code == PROMPT_RENDER_FAILED
+    assert "synthetic render failure" in run.failure.message
+    assert run.model_draft is None

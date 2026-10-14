@@ -4,9 +4,16 @@ from __future__ import annotations
 
 from app.agent.contracts import ModelDraft
 from app.agent.graph import run_routing_job
-from app.agent.models import FAKE_TARGET_RESOURCE, FAKE_TOOL_CALL_ID, FakeModel, provider_configured
+from app.agent.models import (
+    FAKE_TARGET_RESOURCE,
+    FAKE_TOOL_CALL_ID,
+    FakeModel,
+    ModelRequest,
+    ModelResponse,
+    provider_configured,
+)
 from app.agent.repositories import ORDER_LINES, SNAPSHOT_ID, seeded_repository
-from app.agent.tools import FakeConnector
+from app.agent.tools import TOOL_NAMES, FakeConnector
 
 
 def _run(**kwargs):
@@ -23,7 +30,7 @@ def _run(**kwargs):
 
 
 def test_fake_model_requests_exactly_one_tool_call_then_returns_a_draft():
-    repository, connector, run = _run()
+    _, connector, run = _run()
 
     assert run.mode.mode == "fake"
     assert run.failure is None
@@ -116,9 +123,41 @@ def test_catalogue_reuse_path_keeps_catalogue_table_ids():
     assert reuse.runtime.catalogue is not None
 
 
-def test_no_live_provider_is_contacted_by_the_loop():
-    # The fake adapter is the only model in this test module; nothing here opens a
-    # socket, and no assertion depends on the host's provider configuration.
-    model = FakeModel(inventory=seeded_repository().get_inventory(SNAPSHOT_ID))
-    assert model.name == "deterministic-fake"
-    assert provider_configured({"ANTHROPIC_API_KEY": ""}) is False
+def test_the_loop_binds_tools_so_a_provider_can_request_one():
+    """The proposal call carries the tool schemas; without them no provider can loop.
+
+    The fake adapter ignores `tools`, so the request is recorded from a spy subclass.
+    """
+
+    repository = seeded_repository()
+    connector = FakeConnector()
+    spy = _RecordingFake(inventory=repository.get_inventory(SNAPSHOT_ID))
+    run_routing_job(
+        job_id="job-tool-binding",
+        source_snapshot_ids=[SNAPSHOT_ID],
+        repository=repository,
+        connector=connector,
+        model=spy,
+    )
+    assert spy.requests_seen, "the propose node made a call"
+    names = {schema["name"] for schema in spy.requests_seen[0].tools}
+    assert names == set(TOOL_NAMES)
+    assert all(schema["input_schema"]["type"] == "object" for schema in spy.requests_seen[0].tools)
+
+
+class _RecordingFake(FakeModel):
+    """A fake adapter that keeps the requests it was handed."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.requests_seen: list[ModelRequest] = []
+
+    def invoke(self, request: ModelRequest) -> ModelResponse:
+        self.requests_seen.append(request)
+        return super().invoke(request)
+
+
+def test_provider_configured_is_presence_only():
+    assert provider_configured({"ANTHROPIC_API_KEY": "sk-live"}) is True
+    assert provider_configured({"ANTHROPIC_API_KEY": "   "}) is False
+    assert provider_configured({}) is False

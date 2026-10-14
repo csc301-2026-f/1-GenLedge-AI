@@ -6,9 +6,12 @@ import pytest
 
 from app.agent.contracts import AgentBudgets
 from app.agent.errors import (
+    COST_BUDGET_EXHAUSTED,
     INVALID_MODEL_OUTPUT,
     MODEL_CALL_BUDGET_EXHAUSTED,
+    TOKEN_BUDGET_EXHAUSTED,
     TOOL_BUDGET_EXHAUSTED,
+    WALL_CLOCK_BUDGET_EXHAUSTED,
 )
 from app.agent.graph import derived_recursion_limit, run_routing_job
 from app.agent.repositories import SNAPSHOT_ID, seeded_repository
@@ -105,12 +108,18 @@ def test_durable_model_call_count_governs_the_budget():
     assert run.final_state["model_calls_used"] == 0, "no call was made"
 
 
-def test_every_semantic_budget_has_its_own_code():
-    assert set(ALL_BUDGETS_EXHAUSTED.values()) == {
+def test_every_semantic_budget_code_is_distinct():
+    """Four budgets, four codes: a stop must name the budget that actually fired."""
+
+    codes = {
         TOOL_BUDGET_EXHAUSTED,
         MODEL_CALL_BUDGET_EXHAUSTED,
+        TOKEN_BUDGET_EXHAUSTED,
+        COST_BUDGET_EXHAUSTED,
+        WALL_CLOCK_BUDGET_EXHAUSTED,
     }
-    assert len(ALL_BUDGETS_EXHAUSTED) == len(set(ALL_BUDGETS_EXHAUSTED.values()))
+    assert len(codes) == 5
+    assert TOOL_BUDGET_EXHAUSTED != MODEL_CALL_BUDGET_EXHAUSTED
 
 
 @pytest.mark.parametrize(
@@ -134,10 +143,73 @@ def test_token_budget_stops_the_job_before_the_next_model_call():
         budgets=AgentBudgets(max_tool_calls=10, max_model_calls=5, max_tokens=1),
     )
     assert run.failure is not None
-    assert run.failure.code == MODEL_CALL_BUDGET_EXHAUSTED
+    assert run.failure.code == TOKEN_BUDGET_EXHAUSTED
     assert "token budget" in run.failure.message
     assert run.final_state["tokens_used"] > 1, "the spent tokens are recorded"
     assert len(run.model_responses) == 1, "exactly one call was made before the stop"
+
+
+def test_wall_clock_budget_stops_the_job_with_its_own_code():
+    run = run_routing_job(
+        job_id="job-budget-clock",
+        source_snapshot_ids=[SNAPSHOT_ID],
+        repository=seeded_repository(),
+        budgets=AgentBudgets(max_tool_calls=10, max_model_calls=5, max_wall_clock_seconds=0),
+    )
+    assert run.failure is not None
+    assert run.failure.code == WALL_CLOCK_BUDGET_EXHAUSTED
+    assert run.model_draft is None
+
+
+def test_cost_budget_stops_the_job_when_a_price_is_configured():
+    runtime_price = 1000.0  # $1000 per 1k tokens: the first call already exceeds $5
+    run = run_routing_job(
+        job_id="job-budget-cost",
+        source_snapshot_ids=[SNAPSHOT_ID],
+        repository=seeded_repository(),
+        budgets=AgentBudgets(max_tool_calls=10, max_model_calls=5, max_cost_usd=5.0),
+        cost_per_1k_tokens_usd=runtime_price,
+    )
+    assert run.failure is not None
+    assert run.failure.code == COST_BUDGET_EXHAUSTED
+    assert len(run.model_responses) == 1
+
+
+def test_cost_budget_is_not_evaluated_without_a_configured_price():
+    """No price means the ceiling cannot be evaluated — it must not be guessed."""
+
+    run = run_routing_job(
+        job_id="job-budget-cost-unpriced",
+        source_snapshot_ids=[SNAPSHOT_ID],
+        repository=seeded_repository(),
+        budgets=AgentBudgets(max_tool_calls=10, max_model_calls=5, max_cost_usd=0.0),
+    )
+    assert run.failure is None
+    assert run.model_draft is not None
+
+
+def test_the_byte_cap_is_enforced_with_its_own_typed_result():
+    repository = seeded_repository()
+    dispatcher = ToolDispatcher(
+        connector=FakeConnector(),
+        repository=repository,
+        inventory=repository.get_inventory(SNAPSHOT_ID),
+        budgets=AgentBudgets(max_tool_bytes=40),
+    )
+    outcome = dispatcher.dispatch(
+        ToolCallRequest(
+            id="call-bytes",
+            name="sample_rows",
+            arguments={"source_id": "source-orders-1", "resource_id": "orders.lines[]", "limit": 3},
+        ),
+        job_id="job-bytes",
+        tool_calls_used=0,
+    )
+    assert outcome.result.status == "error"
+    assert outcome.result.error_code == "budget_exhausted"
+    assert "max_tool_bytes" in (outcome.result.message or "")
+    assert outcome.charged is False
+    assert repository.get_tool_result("job-bytes", "call-bytes") is None
 
 
 def test_tool_row_and_byte_caps_are_typed_results_not_crashes():
@@ -163,16 +235,16 @@ def test_tool_row_and_byte_caps_are_typed_results_not_crashes():
 
 
 def test_recursion_limit_is_not_the_stopping_condition():
-    """Every budget above stops through a typed code; the derivation sits above it."""
+    """Each budget stops through its own typed code; the derivation sits above them."""
 
     budgets = AgentBudgets(max_tool_calls=40, max_model_calls=20)
     limit = derived_recursion_limit(budgets)
     assert limit > 2 * budgets.max_tool_calls + 2 * budgets.max_model_calls
     cases = [
-        (AgentBudgets(max_tool_calls=1, max_model_calls=10), GreedyModel(), "job-derived-1"),
-        (AgentBudgets(max_tool_calls=10, max_model_calls=1), None, "job-derived-2"),
+        (AgentBudgets(max_tool_calls=1, max_model_calls=10), GreedyModel(), "job-derived-1", TOOL_BUDGET_EXHAUSTED),
+        (AgentBudgets(max_tool_calls=10, max_model_calls=1), None, "job-derived-2", MODEL_CALL_BUDGET_EXHAUSTED),
     ]
-    for run_budgets, model, job_id in cases:
+    for run_budgets, model, job_id, expected in cases:
         run = run_routing_job(
             job_id=job_id,
             source_snapshot_ids=[SNAPSHOT_ID],
@@ -181,7 +253,9 @@ def test_recursion_limit_is_not_the_stopping_condition():
             model=model,
         )
         assert run.failure is not None
-        assert run.failure.code in set(ALL_BUDGETS_EXHAUSTED.values())
+        assert run.failure.code == expected
+        # The framework's own limit never fired; the semantic budget did.
+        assert run.failure.code != "recursion_limit_exceeded"
 
 
 def test_a_scripted_model_still_respects_the_model_budget():

@@ -10,8 +10,9 @@ prompt instruction, so it is enforced by construction:
   type change instead of an oversight;
 * the projection allow-list is exactly: snapshot id, resource ids and kinds, field
   paths, types, nullability, repeating status, at most three (redacted) samples per
-  field, the ambiguity marker, and the field status. Field descriptions are
-  deliberately **not** projected (US4 §9.2 `DC-1`);
+  field, the ambiguity marker, the field status, and the native type; for the
+  catalogue, an opaque `catalog_ref` plus table and column names and types. Field
+  descriptions are deliberately **not** projected (US4 §9.2 `DC-1`);
 * every source-derived string is emitted inside an `<untrusted_...>` block;
 * restricted values — credentials, DSNs, connection strings, e-mail addresses —
   are redacted by the tool layer before persistence and again defensively here.
@@ -47,6 +48,8 @@ MAX_PROJECTED_TOOL_ROWS = 3
 MAX_PROJECTED_TEXT = 4000
 
 _VARIABLE = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
+#: One capture group, so `re.split` yields alternating literal/name segments.
+_TEMPLATE_SPLIT = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 _FRONT_MATTER = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.S)
 
 
@@ -147,7 +150,15 @@ def manifest() -> dict[str, str]:
 
 
 def render(prompt_id: str, variables: Mapping[str, Any]) -> RenderedPrompt:
-    """Render a prompt strictly: every declared variable must be supplied."""
+    """Render a prompt strictly: every declared variable must be supplied.
+
+    Substitution is a **single pass** over the template, so a substituted value can
+    never be reinterpreted as a placeholder. Source data may legitimately contain
+    `{{...}}` — sample text is untrusted and is allowed to look like anything — and a
+    two-pass `str.replace` loop would both crash on it and let it splice another
+    prompt block into itself. The template is split into literal and placeholder
+    segments once; only the template's own placeholders are ever substituted.
+    """
 
     spec = load_prompt(prompt_id)
     supplied = set(variables)
@@ -159,11 +170,11 @@ def render(prompt_id: str, variables: Mapping[str, Any]) -> RenderedPrompt:
             f"render map for {spec.ref} does not match its declaration: "
             f"missing={sorted(missing)} extra={sorted(extra)}"
         )
-    body = spec.template
-    for name in spec.variables:
-        body = body.replace("{{" + name + "}}", str(variables[name]))
-    if _VARIABLE.search(body):
-        raise PromptError(f"{spec.ref} still contains an unrendered placeholder")
+    pieces = _TEMPLATE_SPLIT.split(spec.template)
+    # `re.split` with one capture group alternates literal, name, literal, name, …
+    body = "".join(
+        str(variables[piece]) if index % 2 else piece for index, piece in enumerate(pieces)
+    )
     return RenderedPrompt(
         system=load_prompt("shared_system").template.strip(),
         user=body.strip(),
@@ -249,22 +260,36 @@ def project_catalogue(catalogue: CatalogueView | None) -> str:
 
 
 def project_tool_results(results: list[ToolResult]) -> str:
-    """Recorded tool results, redacted again and bounded, as compact JSON."""
+    """Recorded tool results, redacted again and bounded, as compact JSON.
 
-    usable = [result for result in results if result.status == "ok"][-MAX_PROJECTED_TOOL_RESULTS:]
+    Successes **and** typed errors are projected. A tool error is data the model has
+    to adapt to (US4 §4.2, master §5.4 boundary 3), so dropping it would leave a live
+    model re-requesting blind until its budget ran out.
+    """
+
+    usable = results[-MAX_PROJECTED_TOOL_RESULTS:]
     if not usable:
         return "No tool results recorded yet."
     blocks = []
     for result in usable:
-        # The tool layer redacts before persistence. This second pass is defence in
-        # depth at the boundary that actually reaches the provider, so a result
-        # recorded by a buggy or older writer still cannot leak a credential.
-        payload = redact_payload(result.payload)
-        rows = payload.get("rows")
-        if isinstance(rows, list) and len(rows) > MAX_PROJECTED_TOOL_ROWS:
-            payload = {**payload, "rows": rows[:MAX_PROJECTED_TOOL_ROWS], "rows_truncated": len(rows)}
-        rendered = _bounded_text(json.dumps(payload, sort_keys=True, default=str))
-        blocks.append(f"- {result.tool} (tool_call_id={result.tool_call_id}): {rendered}")
+        if result.status == "ok":
+            # The tool layer redacts before persistence. This second pass is defence
+            # in depth at the boundary that actually reaches the provider, so a
+            # result recorded by a buggy or older writer still cannot leak a
+            # credential.
+            payload = _cap_rows(redact_payload(result.payload), MAX_PROJECTED_TOOL_ROWS)
+            rendered = _bounded_text(json.dumps(payload, sort_keys=True, default=str))
+            blocks.append(f"- {result.tool} (tool_call_id={result.tool_call_id}): {rendered}")
+            continue
+        failure = {
+            "error_code": result.error_code,
+            "message": _bounded_text(str(result.message or "")),
+        }
+        blocks.append(
+            f"- {result.tool} (tool_call_id={result.tool_call_id}) FAILED: "
+            f"{_bounded_text(json.dumps(failure, sort_keys=True))} "
+            "Adapt to this result; do not repeat the same call."
+        )
     return "\n".join(blocks)
 
 
@@ -272,6 +297,23 @@ def _bounded_text(text: str) -> str:
     if len(text) <= MAX_PROJECTED_TEXT:
         return text
     return text[:MAX_PROJECTED_TEXT] + f" […truncated {len(text) - MAX_PROJECTED_TEXT} chars]"
+
+
+def _cap_rows(value: Any, limit: int) -> Any:
+    """Cap every row list in a projected payload, at any depth.
+
+    Capping only a top-level `rows` key would let a connector's nested row list
+    through unbounded. The cap follows the data, not one expected key name.
+    """
+
+    if isinstance(value, list):
+        capped = [_cap_rows(item, limit) for item in value[:limit]]
+        if len(value) > limit:
+            capped.append(f"… and {len(value) - limit} more rows")
+        return capped
+    if isinstance(value, dict):
+        return {str(key): _cap_rows(item, limit) for key, item in value.items()}
+    return value
 
 
 def project_budgets(budgets: AgentBudgets) -> str:
@@ -332,13 +374,49 @@ def render_proposal_prompt(**kwargs: Any) -> RenderedPrompt:
     return render("propose", proposal_prompt_variables(**kwargs))
 
 
-def render_repair_prompt(*, validation_errors: str) -> RenderedPrompt:
+def repair_prompt_variables(
+    *,
+    validation_errors: str,
+    previous_response: str,
+    job_id: str,
+    inventory: Any,
+    catalogue: CatalogueView | None,
+    tool_results: list[ToolResult],
+    budgets: AgentBudgets,
+) -> dict[str, str]:
+    """The complete render map for `repair`.
+
+    A repair is a *corrected proposal*, so it carries the same evidence the proposal
+    call had. Sending the schema and the error alone would let a live model answer
+    from nothing.
+    """
+
+    proposal = proposal_prompt_variables(
+        job_id=job_id,
+        inventory=inventory,
+        catalogue=catalogue,
+        tool_results=tool_results,
+        budgets=budgets,
+    )
+    return {
+        "validation_errors": validation_errors,
+        "previous_response": _bounded_text(previous_response),
+        "inventory": proposal["inventory"],
+        "catalogue": proposal["catalogue"],
+        "tool_results": proposal["tool_results"],
+        "budgets": proposal["budgets"],
+        "output_schema": proposal["output_schema"],
+    }
+
+
+def render_repair_prompt(*, validation_errors: str, previous_response: str, **proposal: Any) -> RenderedPrompt:
     return render(
         "repair",
-        {
-            "validation_errors": validation_errors,
-            "output_schema": project_output_schema("ModelDraft"),
-        },
+        repair_prompt_variables(
+            validation_errors=validation_errors,
+            previous_response=previous_response,
+            **proposal,
+        ),
     )
 
 
@@ -360,4 +438,5 @@ __all__ = [
     "render",
     "render_proposal_prompt",
     "render_repair_prompt",
+    "repair_prompt_variables",
 ]

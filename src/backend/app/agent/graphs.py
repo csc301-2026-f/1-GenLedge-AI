@@ -29,7 +29,9 @@ __all__ = [
     "START",
     "LocalGraphRunner",
     "LocalStateGraph",
+    "RecursionLimitExceeded",
     "graph_runtime",
+    "guarded",
 ]
 
 START = "__start__"
@@ -65,6 +67,30 @@ def _channel_reducer(annotation: Any) -> Callable[[Any, Any], Any] | None:
             if callable(item):
                 return item
     return None
+
+
+class RecursionLimitExceeded(RuntimeError):
+    """The local runner's backstop. Mapped to `recursion_limit_exceeded` by the callers."""
+
+
+def guarded(node_name: str, action: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a node so its partial update is checked against its declared writes.
+
+    Boundary 5 of `plans/LANGGRAPH_HARNESS_PLAN.md` §5.4: a node returning a key it
+    does not own is `invalid_state_update`, not a silent merge. The check runs here,
+    in the one place every runtime goes through, so a decorator cannot be forgotten.
+    """
+
+    from app.agent.state import validate_node_update  # noqa: PLC0415 - avoids a cycle at import
+
+    def wrapped(state: dict[str, Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
+        update = action(state, *args, **kwargs)
+        if update:
+            validate_node_update(node_name, dict(update))
+        return update
+
+    wrapped.__name__ = getattr(action, "__name__", node_name)
+    return wrapped
 
 
 class LocalStateGraph:
@@ -138,7 +164,7 @@ class LocalGraphRunner:
         while node not in (END, None):
             steps += 1
             if steps > limit:
-                raise RuntimeError(RECURSION_ERROR)
+                raise RecursionLimitExceeded(RECURSION_ERROR)
             action = self.builder._nodes[node]
             parameters = inspect.signature(action).parameters
             if len(parameters) >= 2:

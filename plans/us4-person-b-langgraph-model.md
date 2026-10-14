@@ -49,7 +49,9 @@ tool_call -> propose
 - [x] `app/agent/graph.py` — `build_graph`, `run_routing_job`, startup banner
 - [x] `app/agent/compat.py` — `StrEnum` on Python 3.10
 - [x] `requirements.txt` — `langgraph>=1.2,<2`
+- [x] `app/__init__.py` — `create_app` emits the resolved model mode at start-up
 - [x] Tests under `tests/agent/`
+- [x] GLM 5.3 review findings fixed, each with a regression test
 - [x] Plan finalized into `doc/us4-person-b-langgraph-model.md`
 
 ## Verification
@@ -65,7 +67,7 @@ Pass criteria and their outcomes:
 | --- | --- |
 | exactly three graph nodes and the declared edges | met (`test_graph_shape.py`); the two compiled-LangGraph introspection cases skip without the package |
 | the fake model completes a real tool loop and returns a valid `ModelDraft` | met (`test_fake_model_tool_loop.py`) |
-| tool and model budget exhaustion each produce a typed failure | met (`test_budget_exhaustion.py`) |
+| tool and model budget exhaustion each produce a typed failure | met, plus token, wall-clock and cost (`test_budget_exhaustion.py`) |
 | invalid output → one repair attempt → `invalid_model_output` | met (`test_repair_path.py`) |
 | duplicate `(job_id, tool_call_id)` replays without a second connector call | met (`test_duplicate_tool_replay.py`) |
 | fake/live adapter compatibility | met against an SDK stub (`test_adapters_and_modes.py`) |
@@ -77,12 +79,17 @@ Pass criteria and their outcomes:
   is no network access, and neither the Python 3.13 interpreter nor any reachable
   image has `pydantic`, `flask` or `langgraph`. Every suite in the repository fails
   at collection for that pre-existing reason, not because of this change.
-- The 86 `tests/agent` cases were **executed unmodified** through a temporary
+- The 104 `tests/agent` cases were **executed unmodified** through a temporary
   pytest-compatible harness against Python 3.10 + pydantic 2.11.9:
-  `passed=86 failed=0 skipped=2` (the two skips are the LangGraph-introspection
+  `passed=104 failed=0 skipped=2` (the two skips are the LangGraph-introspection
   cases). The harness was a local verification aid and was removed before the
   commit.
 - `python -m mypy --check-untyped-defs app/agent tests/agent` — clean.
+
+A GLM 5.3 review of the first commit found one blocker (source data containing
+`{{...}}` could escape the renderer) and several majors; all are fixed and each has a
+regression test. The full list of what was fixed, and the limitations that remain,
+is in [`doc/us4-person-b-langgraph-model.md`](../doc/us4-person-b-langgraph-model.md).
 
 Full detail, environment variables, and the remaining provider and persistence
 limitations are in [`doc/us4-person-b-langgraph-model.md`](../doc/us4-person-b-langgraph-model.md).

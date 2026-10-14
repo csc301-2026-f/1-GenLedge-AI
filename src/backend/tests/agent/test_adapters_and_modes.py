@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import sys
 import types
 
@@ -306,12 +307,15 @@ def test_live_adapter_without_a_key_is_a_typed_configuration_error(stub_anthropi
 # --- adapter compatibility -----------------------------------------------------
 
 
-def test_both_adapters_satisfy_the_same_client_contract():
-    fake = FakeModel(inventory=_inventory())
-    live = LiveModel(api_key="sk-test")
-    for client in (fake, live):
-        assert callable(client.invoke)
+def test_both_adapters_satisfy_the_same_client_contract(stub_anthropic):
+    """One interface, two adapters: same call shape, same return type."""
+
+    stub_anthropic([_StubResponse([_StubBlock(type="text", text=_fake_draft_json())])])
+    request = _proposal_request()
+    for client in (FakeModel(inventory=_inventory()), LiveModel(api_key="sk-test")):
         assert isinstance(client.name, str) and client.name
+        assert list(inspect.signature(client.invoke).parameters) == ["request"]
+        assert isinstance(client.invoke(request), ModelResponse)
 
 
 def test_both_adapters_produce_a_graph_that_ends_with_a_schema_valid_draft(stub_anthropic):

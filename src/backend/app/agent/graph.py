@@ -21,7 +21,16 @@ from typing import Any, Mapping
 from app.agent import nodes as node_module
 from app.agent.contracts import AgentBudgets, FailureInfo, InventoryView, ModelDraft
 from app.agent.errors import ModelConfigurationError
-from app.agent.graphs import END, START, GRAPH_RUNTIME_AVAILABLE, LocalStateGraph, StateGraph, graph_runtime
+from app.agent.graphs import (
+    END,
+    START,
+    GRAPH_RUNTIME_AVAILABLE,
+    LocalStateGraph,
+    RecursionLimitExceeded,
+    StateGraph,
+    graph_runtime,
+    guarded,
+)
 from app.agent.models import ModelClient, ModelResponse, ResolvedModelMode, build_model_client, resolve_model_mode
 from app.agent.nodes import CONTEXT, PROPOSE, TOOL_CALL, GraphRuntime
 from app.agent.repositories import RoutingRepository
@@ -29,6 +38,15 @@ from app.agent.state import RoutingJobState, initial_state
 from app.agent.tools import FakeConnector, ToolConnector
 
 logger = logging.getLogger(__name__)
+
+RECURSION_LIMIT_EXCEEDED = "recursion_limit_exceeded"
+
+try:  # pragma: no cover - depends on whether langgraph is installed
+    from langgraph.errors import GraphRecursionError
+except ImportError:  # pragma: no cover - the local runner has its own error type
+
+    class GraphRecursionError(RuntimeError):  # type: ignore[no-redef]
+        """Placeholder so the mapping below is uniform across runtimes."""
 
 DECLARED_NODES: tuple[str, ...] = (CONTEXT, PROPOSE, TOOL_CALL)
 DECLARED_EDGES: tuple[tuple[str, str], ...] = (
@@ -79,12 +97,16 @@ def graph_shape() -> GraphShape:
 
 
 def build_graph() -> Any:
-    """Build and compile the three-node graph against whichever runtime is present."""
+    """Build and compile the three-node graph against whichever runtime is present.
+
+    Each node is wrapped by `graphs.guarded`, so a node that returns a state key it
+    does not declare fails as a state-guard error rather than merging silently.
+    """
 
     builder = StateGraph(RoutingJobState) if GRAPH_RUNTIME_AVAILABLE else LocalStateGraph(RoutingJobState)
-    builder.add_node(CONTEXT, node_module.context_node)
-    builder.add_node(PROPOSE, node_module.propose_node)
-    builder.add_node(TOOL_CALL, node_module.tool_call_node)
+    builder.add_node(CONTEXT, guarded(CONTEXT, node_module.context_node))
+    builder.add_node(PROPOSE, guarded(PROPOSE, node_module.propose_node))
+    builder.add_node(TOOL_CALL, guarded(TOOL_CALL, node_module.tool_call_node))
     builder.add_edge(START, CONTEXT)
     builder.add_conditional_edges(CONTEXT, node_module.route_after_context, DECLARED_CONDITIONAL_EDGES[CONTEXT])
     builder.add_conditional_edges(PROPOSE, node_module.route_after_propose, DECLARED_CONDITIONAL_EDGES[PROPOSE])
@@ -116,11 +138,15 @@ def run_routing_job(
     model: ModelClient | None = None,
     mode: ResolvedModelMode | None = None,
     env: Mapping[str, str] | None = None,
+    cost_per_1k_tokens_usd: float | None = None,
 ) -> RoutingRunResult:
     """Run one routing job end to end and return the terminal state.
 
     The runner — not a node — builds the initial state from frozen configuration,
     which is what keeps a mid-job configuration change from extending a loop.
+    `cost_per_1k_tokens_usd` is the price table `AgentBudgets.max_cost_usd` is
+    evaluated against; with no price the ceiling is reported as unevaluable rather
+    than guessed.
     """
 
     frozen_budgets = budgets or AgentBudgets()
@@ -140,6 +166,7 @@ def run_routing_job(
         connector=connector or FakeConnector(),
         inventory=inventory,
         catalogue=catalogue,
+        cost_per_1k_tokens_usd=cost_per_1k_tokens_usd,
     )
     if model is not None:
         runtime.model = model
@@ -153,9 +180,9 @@ def run_routing_job(
         model_mode=resolved.mode,
         catalogue_ref=catalogue_ref,
     )
+    repository.create_job(job_id, source_snapshot_ids=list(source_snapshot_ids), catalogue_ref=catalogue_ref)
     graph = build_graph()
-    config = {"configurable": {"thread_id": job_id}, "recursion_limit": derived_recursion_limit(frozen_budgets)}
-    final = graph.invoke(job_state, context=runtime, config=config)
+    final = _run_graph(graph, job_state, runtime, frozen_budgets)
 
     failure = final.get("failure")
     return RoutingRunResult(
@@ -164,9 +191,57 @@ def run_routing_job(
         mode=resolved,
         model_draft=final.get("model_draft"),
         failure=failure,
-        status=str(final.get("status") or ("failed" if failure else "awaiting_review")),
+        status=str(final.get("status") or _terminal_status(failure)),
         model_responses=list(runtime.responses),
     )
+
+
+def _terminal_status(failure: FailureInfo | None) -> str:
+    """The status a run leaves when no node wrote one.
+
+    `context` writes `running` and `propose` writes its own terminal status, so this
+    is only reached by a run that ended without either — which the graph does not
+    produce. It reports the invariant honestly rather than assuming success.
+    """
+
+    return "failed" if failure is not None else "incomplete"
+
+
+def _run_graph(graph: Any, job_state: RoutingJobState, runtime: GraphRuntime, budgets: AgentBudgets) -> RoutingJobState:
+    """Invoke the graph, mapping the runtime's own backstop to a typed failure.
+
+    The semantic budgets are derived to fire first, so reaching the recursion limit
+    is a derivation bug. It is still reported as `recursion_limit_exceeded` with the
+    counter snapshot rather than escaping as a framework error (master §9.1 row 15).
+    """
+
+    config = {
+        "configurable": {"thread_id": job_state["job_id"]},
+        "recursion_limit": derived_recursion_limit(budgets),
+    }
+    try:
+        return graph.invoke(job_state, context=runtime, config=config)
+    except RecursionLimitExceeded:
+        failed = dict(job_state)
+        failed["failure"] = FailureInfo(
+            code=RECURSION_LIMIT_EXCEEDED,
+            message=(
+                "the graph reached its derived recursion limit; the semantic budgets "
+                "should have fired first"
+            ),
+            retryable=False,
+        )
+        failed["status"] = "failed"
+        return failed  # type: ignore[return-value]
+    except GraphRecursionError:
+        failed = dict(job_state)
+        failed["failure"] = FailureInfo(
+            code=RECURSION_LIMIT_EXCEEDED,
+            message="the graph runtime stopped the run at its recursion limit",
+            retryable=False,
+        )
+        failed["status"] = "failed"
+        return failed  # type: ignore[return-value]
 
 
 def startup_banner(

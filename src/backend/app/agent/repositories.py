@@ -13,7 +13,7 @@ fixture (requirement: `orders`, `orders.lines[]`, `customers`, an ambiguous
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import Field
 
@@ -62,6 +62,15 @@ class CatalogueView(StrictModel):
 class RoutingRepository(Protocol):
     """The persisted boundary the graph reads and writes."""
 
+    def create_job(
+        self,
+        job_id: str,
+        *,
+        source_snapshot_ids: list[str],
+        catalogue_ref: str | None = None,
+    ) -> None:
+        """Register the job before the first node runs."""
+
     def get_inventory(self, snapshot_id: str) -> InventoryView | None:
         """Load the frozen inventory for a snapshot, or `None` when unknown."""
 
@@ -73,6 +82,9 @@ class RoutingRepository(Protocol):
 
     def get_tool_result(self, job_id: str, tool_call_id: str) -> ToolResult | None:
         """Fetch a recorded result for `(job_id, tool_call_id)`, or `None`."""
+
+    def record_model_call(self, job_id: str, *, node: str, tokens: int) -> None:
+        """Record one provider call. The row count is the model budget's authority."""
 
     def get_model_call_count(self, job_id: str) -> int:
         """Durable model-call count for a job (authority across a crash)."""
@@ -92,7 +104,21 @@ class InMemoryRoutingRepository:
         self.catalogues = dict(catalogues or {})
         self.model_call_counts = dict(model_call_counts or {})
         self.tool_results: dict[tuple[str, str], ToolResult] = {}
+        self.jobs: dict[str, dict[str, Any]] = {}
         self.record_calls = 0
+
+    def create_job(
+        self,
+        job_id: str,
+        *,
+        source_snapshot_ids: list[str],
+        catalogue_ref: str | None = None,
+    ) -> None:
+        self.jobs[job_id] = {
+            "source_snapshot_ids": list(source_snapshot_ids),
+            "catalogue_ref": catalogue_ref,
+        }
+        self.model_call_counts.setdefault(job_id, 0)
 
     def get_inventory(self, snapshot_id: str) -> InventoryView | None:
         return self.inventories.get(snapshot_id)
@@ -109,6 +135,10 @@ class InMemoryRoutingRepository:
 
     def get_tool_result(self, job_id: str, tool_call_id: str) -> ToolResult | None:
         return self.tool_results.get((job_id, tool_call_id))
+
+    def record_model_call(self, job_id: str, *, node: str, tokens: int) -> None:
+        del node, tokens
+        self.model_call_counts[job_id] = self.model_call_counts.get(job_id, 0) + 1
 
     def get_model_call_count(self, job_id: str) -> int:
         return self.model_call_counts.get(job_id, 0)

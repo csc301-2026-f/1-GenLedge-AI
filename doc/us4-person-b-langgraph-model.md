@@ -24,45 +24,62 @@ deterministic work after the graph is Person C's and Person D's.
 
 | Module | Responsibility | Key interfaces |
 | --- | --- | --- |
-| `app/agent/state.py` | `RoutingJobState`, `replace_messages`, `validate_node_update`, `budget_exhausted` | `RoutingJobState`, `initial_state`, `NODE_WRITES` |
+| `app/agent/state.py` | `RoutingJobState`, `replace_messages`, the node-write table, `budget_exhausted` | `RoutingJobState`, `initial_state`, `NODE_WRITES`, `validate_node_update` |
 | `app/agent/errors.py` | Typed failure codes | `AgentFailure`, `InvalidModelOutputError`, `ModelConfigurationError` |
-| `app/agent/graphs.py` | The **only** module that imports `langgraph`; carries the labelled local runner fallback | `graph_runtime`, `LocalStateGraph` |
+| `app/agent/graphs.py` | The **only** module that imports `langgraph`; carries the labelled local runner and the node-write guard | `graph_runtime`, `guarded`, `LocalStateGraph` |
 | `app/agent/repositories.py` | Repository `Protocol` + in-memory doubles + the seeded orders fixture | `RoutingRepository`, `InMemoryRoutingRepository`, `seeded_repository` |
-| `app/agent/tools.py` | Tool catalog, argument models, the dispatch contract, redaction | `TOOL_SPECS`, `ToolDispatcher`, `FakeConnector`, `redact_value` |
-| `app/agent/prompts.py` + `prompts/*.md` + `prompts/manifest.json` | Versioned prompts, strict rendering, the projection allow-list | `render`, `proposal_prompt_variables`, `project_inventory` |
+| `app/agent/tools.py` | Tool catalog, argument **and result** models, the dispatch contract, redaction | `TOOL_SPECS`, `ToolDispatcher`, `FakeConnector`, `redact_value` |
+| `app/agent/prompts.py` + `prompts/*.md` + `prompts/manifest.json` | Versioned prompts, single-pass strict rendering, the projection allow-list | `render`, `proposal_prompt_variables`, `repair_prompt_variables`, `project_inventory` |
 | `app/agent/models.py` | `ModelClient` protocol, `FakeModel`, `LiveModel`, mode resolution | `resolve_model_mode`, `build_model_client`, `startup_banner` |
 | `app/agent/nodes.py` | `context`, `propose`, `tool_call` and the routers | `context_node`, `propose_node`, `tool_call_node`, `route_after_*` |
 | `app/agent/graph.py` | Compile, run, budgets, startup banner | `build_graph`, `run_routing_job`, `graph_shape` |
-| `app/agent/compat.py` | `StrEnum` for Python 3.10 | `StrEnum` |
+| `app/agent/compat.py` | `StrEnum` on Python 3.10 | `StrEnum` |
 
 ## 2. Node behaviour, as implemented
 
 **`context`** loads the frozen inventory for `source_snapshot_ids` and the optional
 catalogue (`None` = cold start). No model call. An empty or missing inventory is a
-typed `empty_inventory` failure routed straight to `END` — never an empty
-proposal. It builds the `ToolDispatcher` for the run.
+typed `empty_inventory` failure routed straight to `END` — never an empty proposal.
+A `catalogue_ref` that cannot be resolved is a typed `catalogue_not_found` failure:
+a reviewer who asked for reuse is not silently handed a cold-start proposal. It
+builds the `ToolDispatcher` for the run.
 
 **`propose`** performs exactly one structured model call per invocation and never
 executes a tool. Order of operations:
 
 1. the model-call budget is checked against **both** the in-state counter and the
    durable `get_model_call_count` record, so a crash loop cannot re-spend it;
-2. the token budget is checked;
-3. the prompt is rendered from the projection allow-list only;
-4. the model answers with tool requests, a `ModelDraft`, or a typed error;
-5. a malformed answer gets **one** repair call (`repair@1`), itself budget-checked
-   and charged; if the repair also fails the run ends `invalid_model_output` and
-   **no** fabricated draft is produced;
-6. `ModelDraft.revision` is overwritten from `revision_count` after validation, so
+2. the token, wall-clock and cost budgets are checked;
+3. the prompt is rendered from the projection allow-list only; a render fault is a
+   typed `prompt_render_failed` failure, never an escaping exception;
+4. the tools from `TOOL_SPECS` are bound to the call, so a live provider can
+   actually request one;
+5. the model answers with tool requests, a `ModelDraft`, or a typed error;
+6. each call (and the repair) is recorded through `record_model_call`, which is the
+   durable count the budget reads;
+7. a malformed answer gets **one** repair call carrying the evidence, the previous
+   response and the validation errors; if that also fails the run ends
+   `invalid_model_output` and **no** fabricated draft is produced;
+8. `ModelDraft.revision` is overwritten from `revision_count` after validation, so
    a wrong echo cannot trip the staleness guard.
 
-**`tool_call`** applies the seven-step dispatch contract per requested call:
-validate arguments against the tool's own model → check the job's source/resource
-scope → check the budget **before** dispatch → replay a recorded
-`(job_id, tool_call_id)` → dispatch through the connector seam → validate the
-result → redact, persist, and return a compact `ToolResultRef`. Every
-model-authored problem is a typed `error` result the model reads, not an
-exception. It clears `pending_tool_calls` and always returns to `propose`.
+**`tool_call`** applies the dispatch contract per requested call:
+
+1. validate arguments against the tool's own model;
+2. check the job's source and resource scope (an out-of-scope source is also recorded
+   as a security event);
+3. **replay** a recorded `(job_id, tool_call_id)` — before the budget check, so a
+   replay can never double-count a call;
+4. check the tool-call budget **before** dispatch;
+5. dispatch through the connector seam;
+6. validate the connector's answer against the tool's declared **result** model, and
+   enforce `max_tool_bytes` and `max_tool_rows`;
+7. redact, persist, and return a compact `ToolResultRef`.
+
+Every model-authored problem is a typed `error` result, and those errors are
+projected into the next prompt as data (`"<tool> FAILED: {error_code, message}"`) so
+the model can adapt instead of re-requesting blind. It clears `pending_tool_calls`
+and always returns to `propose`.
 
 ## 3. Graph, edges and loop bounds
 
@@ -70,16 +87,22 @@ exception. It clears `pending_tool_calls` and always returns to `propose`.
 | --- | --- |
 | `START → context` | always |
 | `context → propose` | an inventory was projected |
-| `context → END` | empty or missing inventory → `empty_inventory` |
+| `context → END` | empty inventory, missing inventory, or an unresolvable catalogue |
 | `propose → tool_call` | the model requested tools and the tool budget has head-room |
 | `propose → END` | a schema-valid draft, or a terminal typed failure |
 | `tool_call → propose` | always |
 
-Bounds: `max_tool_calls` and `max_model_calls` are checked **before** the work they
-bound and each ends the run with its own code (`tool_budget_exhausted`,
-`model_call_budget_exhausted`). `recursion_limit` is derived
-(`2·max_tool_calls + 2·max_model_calls + 12`, ×1.4, floored at
-`AgentBudgets.recursion_limit`) so the semantic budgets always fire first.
+Bounds, each checked **before** the work it bounds and each with its own code:
+`max_tool_calls` → `tool_budget_exhausted`, `max_model_calls` →
+`model_call_budget_exhausted`, `max_tokens` → `token_budget_exhausted`,
+`max_wall_clock_seconds` → `wall_clock_budget_exhausted`, `max_cost_usd` →
+`cost_budget_exhausted` (evaluated from a configured price; with no price the
+ceiling is reported as unevaluable rather than guessed), `max_tool_bytes` and
+`max_tool_rows` → a typed `budget_exhausted` tool result. `recursion_limit` is
+derived (`2·max_tool_calls + 2·max_model_calls + 12`, ×1.4, floored at
+`AgentBudgets.recursion_limit`) so the semantic budgets always fire first; a
+runtime that does hit it is mapped to `recursion_limit_exceeded` rather than
+escaping as a framework error.
 
 ## 4. Environment variables
 
@@ -97,9 +120,10 @@ bound and each ends the run with its own code (`tool_budget_exhausted`,
 `auto` uses `fake` when no provider variable is present. `live` without provider
 configuration raises a typed `model_configuration_error`. Startup output is
 `agent_runtime=<langgraph|local-fallback> model_mode=<fake|live> provider=<p> model=<m>`
-— the mode, provider and model, and never a secret. `log_resolved_mode()` reports a
-half-configured live deployment as a warning instead of crashing the process that
-merely imported the package.
+— the mode, provider and model, and never a secret. `init_agent(app)` is called from
+`create_app`, so the banner is emitted at process start; a half-configured live
+deployment is logged as a warning instead of crashing the process that imported the
+package.
 
 ## 5. Prompt boundary
 
@@ -110,19 +134,23 @@ connector payload or an ORM object into a prompt takes a deliberate type change
 rather than an oversight.
 
 The allow-list is: snapshot id, resource ids and kinds, field paths, types,
-nullability, repeating status, ≤3 samples per field, the ambiguity marker, the
-field status, the catalogue's table and column names and types, the recorded tool
-results, the frozen budgets, and `ModelDraft.model_json_schema()`. Field
-descriptions are deliberately **not** projected (`DC-1` is undecided).
+nullability, repeating status, ≤3 samples per field, the ambiguity marker, the field
+status, and the native type; for the catalogue, an opaque `catalog_ref` plus table
+and column names and types; for tool results, the redacted recorded payloads capped
+at three rows at any depth; plus the frozen budgets and `ModelDraft.model_json_schema()`.
+Field descriptions are deliberately **not** projected (`DC-1` is undecided).
 
-Never present: whole rows, database ids, connection strings, credentials, the
-client name, pre-existing mappings, the organization id, reviewer identity. The
-organization id is replaced by an opaque `job_id[:8]` reference; every
-source-derived string is emitted inside `<untrusted_source_data>` /
-`<untrusted_tool_data>`; credentials, DSNs, e-mail addresses and card-like runs are
-replaced with `[redacted]` at the tool layer before persistence **and** again at
-the projection boundary; oversized inputs degrade deterministically with explicit
-`… and N more` / `[…truncated]` markers.
+Never present: whole rows, database ids, connection strings, credentials, the client
+name, pre-existing mappings, the organization id, reviewer identity. The organization
+id is replaced by an opaque `job_id[:8]` reference; every source-derived string is
+emitted inside `<untrusted_source_data>` / `<untrusted_tool_data>`; credentials,
+DSNs, e-mail addresses and card-like runs are replaced with `[redacted]` at the tool
+layer before persistence **and** again at the projection boundary; oversized inputs
+degrade deterministically with explicit `… and N more` / `[…truncated]` markers.
+
+Rendering is single-pass. A source value containing `{{budgets}}` is emitted
+literally inside the untrusted block — it can neither crash the renderer nor splice
+another prompt block into itself.
 
 ## 6. Tests and verification
 
@@ -136,25 +164,27 @@ Written for this slice, under `tests/agent/`:
 
 | Module | Covers |
 | --- | --- |
-| `test_graph_shape.py` | exactly three nodes; the declared edges; recursive-limit derivation; LangGraph introspection when installed |
-| `test_fake_model_tool_loop.py` | one `sample_rows`/`profile_resource` call on `orders.lines[]`, then a schema-valid `ModelDraft`; refs not payloads; cold start vs catalogue reuse |
-| `test_budget_exhaustion.py` | tool, model and token budget exhaustion each with its own typed code; durable call count; row/byte caps; no framework error |
-| `test_repair_path.py` | one repair attempt, then `invalid_model_output`; refusal is not substituted; the state-write guard |
-| `test_duplicate_tool_replay.py` | replay by `(job_id, tool_call_id)` with ≤1 connector call; refusals are re-reported, not replayed; scope and argument errors |
+| `test_graph_shape.py` | exactly three nodes; the declared edges; the loop actually runs and terminates; adversarial draft text cannot change the route; recursion-limit derivation; LangGraph introspection when installed |
+| `test_fake_model_tool_loop.py` | one `sample_rows`/`profile_resource` call on `orders.lines[]`, then a schema-valid `ModelDraft`; refs not payloads; tools bound on the call; cold start vs catalogue reuse |
+| `test_budget_exhaustion.py` | tool, model, token, wall-clock and cost exhaustion, each with its own code; durable call count; row and byte caps; no framework error |
+| `test_repair_path.py` | one repair attempt, then `invalid_model_output`; refusal is not substituted; the write guard is wired into execution; empty inventory and unresolvable catalogue are typed; a render fault is typed |
+| `test_duplicate_tool_replay.py` | replay by `(job_id, tool_call_id)` with ≤1 connector call; refusals are re-reported, not replayed; scope, argument and result-contract errors |
 | `test_adapters_and_modes.py` | `auto`/`live`/`fake` resolution; startup banner has no secret; both adapters satisfy one contract and both end with a schema-valid draft |
-| `test_prompt_safety.py` | sentinel values, whole rows, descriptions, sample caps, page caps, untrusted-block containment, prompt digests |
+| `test_prompt_safety.py` | sentinel values, whole rows, descriptions, sample and row caps at any depth, page caps, untrusted-block containment, block-splice protection, typed tool errors reaching the prompt, prompt digests |
+| `test_compat.py` | the `StrEnum` fallback matches the standard library's `str`, `format`, f-string, JSON and ordering behaviour |
 
 ### Verification performed on the development machine
 
-- `python -m mypy --check-untyped-defs app/agent tests/agent` — clean (the
-  authoritative entrypoint is `python -m pytest tests`; mypy is a supplementary
-  check).
-- The 86 `tests/agent` cases were **executed** with the suite unmodified through a
+- `python -m mypy --check-untyped-defs app/agent tests/agent` — clean.
+  `pytest` and `mypy` are **not installable here** (see below), so mypy was run from
+  the system interpreter, which type-checks without importing the packages.
+- The 104 `tests/agent` cases were **executed** with the suite unmodified through a
   temporary pytest-compatible runner against Python 3.10 + pydantic 2.11.9:
-  `passed=86 failed=0 skipped=2`.
+  `passed=104 failed=0 skipped=2`. The runner was a local aid and was removed before
+  the commit.
 - `python -m pytest tests` **could not be run to completion**, because this machine
   has no network access and neither the 3.13 interpreter nor any reachable image has
-  `pydantic`, `flask` or `langgraph` installed. Every suite in the repository
+  `pydantic`, `flask` or `langgraph`. Every suite in the repository
   (`test_app.py`, `test_auth.py`, `test_api_schemas.py`, `test_contracts.py`) fails
   at collection for the same pre-existing reason. **This is a reported limitation,
   not a met gate.**
@@ -166,32 +196,39 @@ Written for this slice, under `tests/agent/`:
    runner so the nodes stay testable offline. The two assertions that inspect the
    *compiled LangGraph* structure are skipped when the package is absent; the node
    set and edges are asserted unconditionally against the declared shape
-   (`graph_shape()`), which is the same source `build_graph()` uses. Install
-   `langgraph>=1.2,<2` (added to `requirements.txt`) and the two tests run.
-2. **The live adapter is exercised against an SDK stub, not a real provider.** No
-   key, no network, no eval baseline. `LiveModel` sends `system`, `messages`, bound
-   tools with `tool_choice: auto`, and native structured output
-   (`output_format: json_schema`); those are the *intended* call shapes and remain
-   `[Unverified]` against the real SDK, which `plans/LANGGRAPH_HARNESS_PLAN.md`
-   already records as E-2/E-6.
+   (`graph_shape()`), which is the same source `build_graph()` uses. **Installing
+   `langgraph>=1.2,<2` (added to `requirements.txt`) moves the whole suite onto that
+   path, and the node call signature has not been executed against the real library**
+   — masters §5.6a's `Runtime[JobRuntime]` convention is the thing to verify first.
+2. **The live adapter is exercised against an SDK stub, not a real provider.** The
+   stub asserts the request shape the adapter builds (`system`, `messages`, bound
+   tools with `tool_choice: auto`, native `output_format` JSON schema), but whether
+   the installed SDK accepts that exact wire format is `[Unverified]` — E-2/E-6 in
+   `plans/LANGGRAPH_HARNESS_PLAN.md`.
 3. **No checkpointer.** `run_routing_job` invokes the graph once and returns; the
    harness gate's "resume from a checkpoint" half needs the Postgres saver that
    Person A's persistence unblocks. The gate's other half — start a job, complete a
-   tool call, persist a result, end with schema-valid output, with no real source
-   and no live provider — is met by `test_fake_model_tool_loop.py`.
-4. **Tool replay is in-memory.** `RoutingRepository` is the declared seam; Person A's
-   adapter replaces `InMemoryRoutingRepository` without changing this package.
+   tool call, persist a result, end with schema-valid output, with no real source and
+   no live provider — is met by `test_fake_model_tool_loop.py`.
+4. **Persistence is in-memory.** `RoutingRepository` is the declared seam, and it now
+   includes `create_job` and `record_model_call` as well as the reads, so Person A's
+   adapter supplies the durable model-call count the budget already consults. Until
+   it exists, the count is durable only within one process.
 5. **The fake model is deterministic, not intelligent.** It reuses a catalogue table
    id when the catalogue names one; it does not verify that every proposed attribute
-   exists in the reused table's columns. Catalogue reuse remains D2 P1 per
-   `D2-LG-3`.
-6. **`contracts.py` gained one import** (`from app.agent.compat import StrEnum`) so
-   the package imports on Python 3.10. The field set, validators and
-   `CONTRACT_VERSION` are unchanged; the file's contract surface is still Person C's.
+   exists in the reused table's columns. Catalogue reuse remains D2 P1 per `D2-LG-3`.
+6. **`contracts.py` gained one import** (`from app.agent.compat import StrEnum`) so the
+   package imports on Python 3.10. The field set, validators and `CONTRACT_VERSION`
+   are unchanged; the file's contract surface is still Person C's, and Gate 0 asks
+   the team to review any edit to it.
 7. **`propose` writes `status: "awaiting_review"`** when it accepts a draft, because
-   `US4.md` §4.2 gives `propose` the `status` write and the graph ends there.
-   Person D may prefer `running` until the package is persisted; that is a one-line
-   change in one node and does not affect routing, which never reads `status`.
+   `US4.md` §4.2 gives `propose` the `status` write and the graph ends there. Person D
+   may prefer `running` until the package is persisted; that is a one-line change in
+   one node and does not affect routing, which never reads `status`.
+8. **`max_cost_usd` needs a price.** `run_routing_job(cost_per_1k_tokens_usd=…)` is
+   the seam; there is no price table in this package, so with no price passed the
+   ceiling is reported as unevaluable rather than silently treated as infinite or as
+   zero.
 
 ## 8. Handoff
 
