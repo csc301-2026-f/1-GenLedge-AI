@@ -8,11 +8,11 @@ prompt instruction, so it is enforced by construction:
   `ToolResult` — never against the graph state, a `dict`, or `Any` — so passing a
   raw row, a connector payload or an ORM object into a prompt takes a deliberate
   type change instead of an oversight;
-* the projection allow-list is exactly: snapshot id, resource ids and kinds, field
-  paths, types, nullability, repeating status, at most three (redacted) samples per
-  field, the ambiguity marker, the field status, and the native type; for the
-  catalogue, an opaque `catalog_ref` plus table and column names and types. Field
-  descriptions are deliberately **not** projected (US4 §9.2 `DC-1`);
+* the projection allow-list is exactly: snapshot id, resource ids, **names**, kinds and
+  field counts, field paths, types, nullability, repeating status, at most three
+  (redacted) samples per field, the ambiguity marker, the field status, and the native
+  type; for the catalogue, an opaque `catalog_ref` plus table and column names and
+  types. Field descriptions are deliberately **not** projected (US4 §9.2 `DC-1`);
 * every source-derived string is emitted inside an `<untrusted_...>` block;
 * restricted values — credentials, DSNs, connection strings, e-mail addresses —
   are redacted by the tool layer before persistence and again defensively here.
@@ -46,6 +46,40 @@ MAX_PROJECTED_TOOL_ROWS = 3
 #: Per-block character cap. A result larger than this is truncated with a marker
 #: rather than growing the prompt without bound.
 MAX_PROJECTED_TEXT = 4000
+
+#: What a forged delimiter becomes. Visible, so a reviewer can see the source
+#: contained one, and inert, so it cannot close the block it sits inside.
+DELIMITER_MARKER = "[delimiter-removed]"
+_DELIMITER_TOKENS = (
+    "<untrusted_source_data>",
+    "</untrusted_source_data>",
+    "<untrusted_tool_data>",
+    "</untrusted_tool_data>",
+)
+
+
+def neutralise_delimiters(value: Any) -> Any:
+    """Stop source text from forging the untrusted-data delimiters.
+
+    The boundary is delimiter-based, so a sample or resource name containing
+    `</untrusted_source_data>` closes the block early and leaves the rest of the
+    source text sitting in the instruction region of the prompt — the one thing the
+    boundary exists to prevent. Every source-derived string passes through here before
+    it is rendered, which makes the delimiter count an invariant: exactly one open and
+    one close per block, whatever the source contains.
+    """
+
+    if isinstance(value, str):
+        for token in _DELIMITER_TOKENS:
+            if token in value:
+                value = value.replace(token, DELIMITER_MARKER)
+        return value
+    if isinstance(value, (list, tuple)):
+        return [neutralise_delimiters(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): neutralise_delimiters(item) for key, item in value.items()}
+    return value
+
 
 _VARIABLE = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 #: One capture group, so `re.split` yields alternating literal/name segments.
@@ -199,14 +233,20 @@ def project_inventory(inventory: Any) -> str:
     resources, marker = _bounded(list(inventory.resources), MAX_PROJECTED_RESOURCES, "resources")
     lines.append("resources:")
     for resource in resources:
-        lines.append(f"  - {resource.resource_id} (kind={resource.kind}, fields={resource.field_count})")
+        # The resource *name* is projected, not only its id: US4-AC6 has the model
+        # reason over names, and a connector's ids are often opaque (`tbl_47`).
+        name = neutralise_delimiters(redact_value(resource.name, "name"))
+        lines.append(
+            f"  - {resource.resource_id} (name={name}, kind={resource.kind}, "
+            f"fields={resource.field_count})"
+        )
     if marker:
         lines.append(marker.rstrip("\n"))
     lines.append("fields:")
     fields, marker = _bounded(list(inventory.fields), MAX_PROJECTED_FIELDS, "fields")
     for field in fields:
         path = _field_path(field.ref.resource_id, field.ref.field_path)
-        samples = [redact_value(value, field.ref.field_path) for value in field.samples[:3]]
+        samples = [neutralise_delimiters(redact_value(value, field.ref.field_path)) for value in field.samples[:3]]
         detail = [
             f"type={field.type.value if hasattr(field.type, 'value') else field.type}",
             f"nullable={field.nullable}",
@@ -214,9 +254,9 @@ def project_inventory(inventory: Any) -> str:
             f"status={field.status}",
         ]
         if field.ambiguity:
-            detail.append(f"ambiguity={redact_value(field.ambiguity, 'ambiguity')}")
+            detail.append(f"ambiguity={neutralise_delimiters(redact_value(field.ambiguity, 'ambiguity'))}")
         if field.native_type:
-            detail.append(f"native_type={field.native_type}")
+            detail.append(f"native_type={neutralise_delimiters(field.native_type)}")
         if samples:
             detail.append("samples=" + ", ".join(str(item) for item in samples))
         lines.append(f"  - {path} [{'; '.join(detail)}]")
@@ -249,11 +289,11 @@ def project_catalogue(catalogue: CatalogueView | None) -> str:
 
     if catalogue is None or not catalogue.tables:
         return "No existing warehouse catalogue. Propose a new model."
-    lines = [f"catalog_ref: {catalogue.catalog_ref}"]
+    lines = [f"catalog_ref: {neutralise_delimiters(catalogue.catalog_ref)}"]
     tables, marker = _bounded(list(catalogue.tables), MAX_PROJECTED_RESOURCES, "tables")
     for table in tables:
-        columns = ", ".join(f"{column.name} {column.type}" for column in table.columns)
-        lines.append(f"  - {table.table_id} ({table.name}): {columns}")
+        columns = ", ".join(f"{neutralise_delimiters(column.name)} {neutralise_delimiters(column.type)}" for column in table.columns)
+        lines.append(f"  - {neutralise_delimiters(table.table_id)} ({neutralise_delimiters(table.name)}): {columns}")
     if marker:
         lines.append(marker.rstrip("\n"))
     return "\n".join(lines)
@@ -277,13 +317,13 @@ def project_tool_results(results: list[ToolResult]) -> str:
             # in depth at the boundary that actually reaches the provider, so a
             # result recorded by a buggy or older writer still cannot leak a
             # credential.
-            payload = _cap_rows(redact_payload(result.payload), MAX_PROJECTED_TOOL_ROWS)
+            payload = neutralise_delimiters(_cap_rows(redact_payload(result.payload), MAX_PROJECTED_TOOL_ROWS))
             rendered = _bounded_text(json.dumps(payload, sort_keys=True, default=str))
             blocks.append(f"- {result.tool} (tool_call_id={result.tool_call_id}): {rendered}")
             continue
         failure = {
             "error_code": result.error_code,
-            "message": _bounded_text(str(result.message or "")),
+            "message": _bounded_text(str(neutralise_delimiters(result.message or ""))),
         }
         blocks.append(
             f"- {result.tool} (tool_call_id={result.tool_call_id}) FAILED: "

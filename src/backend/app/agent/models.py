@@ -400,6 +400,7 @@ class LiveModel:
         timeout_seconds: float = 300.0,
         max_retries: int = 2,
         api_key: str | None = None,
+        base_url: str | None = None,
     ) -> None:
         self.name = provider
         self.model_id = model
@@ -408,6 +409,10 @@ class LiveModel:
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self._api_key = api_key
+        #: Optional endpoint override. Anything that speaks the Anthropic Messages
+        #: API can be used — including a gateway that fronts another vendor's model —
+        #: which is what makes "the live path" testable without a specific vendor key.
+        self._base_url = base_url
         self._client: Any = None
 
     def _build_client(self) -> Any:
@@ -419,11 +424,14 @@ class LiveModel:
             ) from error
         if not self._api_key:
             raise ModelConfigurationError("no provider API key is configured")
-        return anthropic.Anthropic(
-            api_key=self._api_key,
-            timeout=self.timeout_seconds,
-            max_retries=self.max_retries,
-        )
+        options: dict[str, Any] = {
+            "api_key": self._api_key,
+            "timeout": self.timeout_seconds,
+            "max_retries": self.max_retries,
+        }
+        if self._base_url:
+            options["base_url"] = self._base_url
+        return anthropic.Anthropic(**options)
 
     def invoke(self, request: ModelRequest) -> ModelResponse:
         try:
@@ -596,7 +604,18 @@ def build_model_client(
         timeout_seconds=float(source.get("GENLEDGE_LLM_TIMEOUT_SECONDS", "300")),
         max_retries=int(source.get("GENLEDGE_LLM_MAX_RETRIES", "2")),
         api_key=api_key,
+        base_url=_base_url(source),
     )
+
+
+def _base_url(env: Mapping[str, str]) -> str | None:
+    """An explicit endpoint override, if the deployment sets one."""
+
+    for name in ("GENLEDGE_LLM_BASE_URL", "ANTHROPIC_BASE_URL"):
+        value = str(env.get(name, "")).strip()
+        if value:
+            return value
+    return None
 
 
 __all__ = [

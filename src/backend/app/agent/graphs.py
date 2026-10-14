@@ -47,6 +47,7 @@ END = "__end__"
 RECURSION_ERROR = "recursion_limit_exceeded"
 
 try:  # pragma: no cover - exercised by whichever branch the environment takes
+    from langgraph.errors import GraphRecursionError as _LGGraphRecursionError
     from langgraph.graph import END as _LG_END
     from langgraph.graph import START as _LG_START
     from langgraph.graph import StateGraph as _LGStateGraph
@@ -58,10 +59,16 @@ try:  # pragma: no cover - exercised by whichever branch the environment takes
     StateGraph: Any = _LGStateGraph
     #: The framework's `Runtime` class, or `None` on the fallback path.
     RuntimeClass: Any = _LGRuntime
+    #: The framework's recursion-limit error, re-exported so no other module imports
+    #: `langgraph` directly. `graphs.py` is the single seam.
+    GraphRecursionError: Any = _LGGraphRecursionError
 except ImportError:  # pragma: no cover
     GRAPH_RUNTIME_AVAILABLE = False
     StateGraph = None
     RuntimeClass = None
+
+    class GraphRecursionError(RuntimeError):  # type: ignore[no-redef]
+        """Placeholder so callers can map the error uniformly across runtimes."""
 
 
 class _SimpleRuntime:

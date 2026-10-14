@@ -26,6 +26,7 @@ from app.agent.graphs import (
     GRAPH_RUNTIME_AVAILABLE,
     RUNTIME_LANGGRAPH,
     START,
+    GraphRecursionError,
     LocalStateGraph,
     RecursionLimitExceeded,
     StateGraph,
@@ -41,13 +42,6 @@ from app.agent.tools import FakeConnector, ToolConnector
 logger = logging.getLogger(__name__)
 
 RECURSION_LIMIT_EXCEEDED = "recursion_limit_exceeded"
-
-try:  # pragma: no cover - depends on whether langgraph is installed
-    from langgraph.errors import GraphRecursionError
-except ImportError:  # pragma: no cover - the local runner has its own error type
-
-    class GraphRecursionError(RuntimeError):  # type: ignore[no-redef]
-        """Placeholder so the mapping below is uniform across runtimes."""
 
 DECLARED_NODES: tuple[str, ...] = (CONTEXT, PROPOSE, TOOL_CALL)
 DECLARED_EDGES: tuple[tuple[str, str], ...] = (

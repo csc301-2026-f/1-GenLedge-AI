@@ -440,9 +440,9 @@ class ToolDispatcher:
         try:
             raw = self.connector.call(request.name, payload, job_id)
         except ConnectorError as error:
-            return self._error(request, job_id, error.code, error.message)
+            return self._error(request, job_id, error.code, error.message, charge=True)
         except Exception as error:  # noqa: BLE001 - a connector fault is data, not a crash
-            return self._error(request, job_id, CONNECTOR_ERROR, str(error))
+            return self._error(request, job_id, CONNECTOR_ERROR, str(error), charge=True)
 
         # Boundary 4: validate the connector's answer *inside* the guarded block, so
         # a shape the harness did not declare is data rather than an exception.
@@ -456,9 +456,10 @@ class ToolDispatcher:
                 job_id,
                 CONNECTOR_ERROR,
                 f"{request.name} result does not match its contract: {_brief(error)}",
+                charge=True,
             )
         except ConnectorError as error:
-            return self._error(request, job_id, error.code, error.message)
+            return self._error(request, job_id, error.code, error.message, charge=True)
 
         redacted = {key: redact_value(value, key) for key, value in validated.model_dump().items()}
         size = payload_bytes(redacted)
@@ -469,6 +470,7 @@ class ToolDispatcher:
                 BUDGET_EXHAUSTED,
                 f"result of {size} bytes exceeds max_tool_bytes ({self.budgets.max_tool_bytes})",
                 persist=False,
+                charge=True,
             )
 
         rows = _rows_of(redacted)
@@ -479,6 +481,7 @@ class ToolDispatcher:
                 BUDGET_EXHAUSTED,
                 f"result of {len(rows)} rows exceeds max_tool_rows ({self.budgets.max_tool_rows})",
                 persist=False,
+                charge=True,
             )
 
         result = ToolResult(
@@ -517,7 +520,21 @@ class ToolDispatcher:
         message: str,
         *,
         persist: bool = True,
+        charge: bool = False,
     ) -> ToolOutcome:
+        """Build a typed error result.
+
+        `charge` decides whether the tool budget counts this attempt, and the rule is
+        the budget's whole point: **a call that reached the connector is charged, even
+        when it failed**. Otherwise a source that fails every read is free, and a model
+        that keeps asking for it never exhausts `max_tool_calls` — the loop bound
+        silently stops applying exactly when the loop is most likely to run away.
+
+        A refusal made *before* dispatch (bad arguments, out-of-scope source, no budget
+        left, nothing ran) is not charged, and is not persisted either: it is not
+        evidence about the source.
+        """
+
         result = ToolResult(
             result_ref=f"tool:{job_id}:{request.id}",
             job_id=job_id,
@@ -530,7 +547,7 @@ class ToolDispatcher:
         )
         if persist:
             self.repository.record_tool_result(result)
-        return ToolOutcome(result=result, replayed=False, charged=False)
+        return ToolOutcome(result=result, replayed=False, charged=charge)
 
 
 def _brief(error: ValidationError) -> str:

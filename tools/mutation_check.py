@@ -33,14 +33,32 @@ MUTATIONS = [
     (
         "the three-sample cap is removed",
         BACKEND / "app/agent/prompts.py",
-        "samples = [redact_value(value, field.ref.field_path) for value in field.samples[:3]]",
-        "samples = [redact_value(value, field.ref.field_path) for value in field.samples]  # MUTATED",
+        "        samples = [neutralise_delimiters(redact_value(value, field.ref.field_path)) for value in field.samples[:3]]",
+        "        samples = [neutralise_delimiters(redact_value(value, field.ref.field_path)) for value in field.samples]  # MUTATED",
     ),
     (
         "the model-call budget ignores the durable count",
         BACKEND / "app/agent/nodes.py",
         "    return max(durable, state.get(\"model_calls_used\", 0)) if durable else state.get(\"model_calls_used\", 0)",
         "    return state.get(\"model_calls_used\", 0)  # MUTATED: durable count ignored",
+    ),
+    (
+        "a failing tool call is not charged against the budget",
+        BACKEND / "app/agent/tools.py",
+        "        return ToolOutcome(result=result, replayed=False, charged=charge)",
+        "        return ToolOutcome(result=result, replayed=False, charged=False)  # MUTATED",
+    ),
+    (
+        "source text may forge the untrusted-data delimiters",
+        BACKEND / "app/agent/prompts.py",
+        "        name = neutralise_delimiters(redact_value(resource.name, \"name\"))",
+        "        name = redact_value(resource.name, \"name\")  # MUTATED",
+    ),
+    (
+        "the resource name is not projected at all",
+        BACKEND / "app/agent/prompts.py",
+        "            f\"  - {resource.resource_id} (name={name}, kind={resource.kind}, \"",
+        "            f\"  - {resource.resource_id} (kind={resource.kind}, \"  # MUTATED",
     ),
 ]
 

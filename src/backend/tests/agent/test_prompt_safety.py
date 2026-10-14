@@ -113,21 +113,30 @@ def _render(**overrides):
 
 
 def test_sentinel_values_never_appear_in_the_inventory_projection():
-    """A projection carries the declared allow-list and nothing else.
+    """The projection carries the allow-list and nothing else.
 
-    `order_id`'s declared sample value is a legitimate projection target; the
-    sentinels that must never appear are the restricted ones: the reviewer identity
-    in a description, the credential and DSN inside a sample, and the organization
-    id that is not part of the inventory shape at all.
+    Two categories are deliberately separated here, because conflating them was a bug
+    in an earlier version of this test:
+
+    * a **resource name** is a projection target — US4-AC6 has the model reason over
+      names, and a connector's ids are often opaque (`tbl_47`) — so `client_name` is
+      asserted *present*;
+    * a **field description**, a credential-like sample, a contact detail, a card-like
+      value and the organization id are not, and none may appear.
     """
 
     projection, _ = _render()
-    for name in ("password", "dsn", "client_name", "reviewer", "mapping", "organization_id"):
+    for name in ("password", "dsn", "reviewer", "mapping", "organization_id"):
         assert SENTINELS[name] not in projection, f"{name} leaked into the projection"
     # the card-like sample is replaced, not rendered
     assert CARD_NUMBER not in projection
     # the declared, non-restricted sample is rendered inside the block
     assert SENTINELS["row"] in projection
+    # the resource name is a legitimate projection target
+    assert SENTINELS["client_name"] in projection
+    # the field description is not, even though it carries the same kind of text
+    assert "Customer contact" not in projection
+    assert "password is" not in projection
 
 
 def test_whole_rows_are_never_projected():

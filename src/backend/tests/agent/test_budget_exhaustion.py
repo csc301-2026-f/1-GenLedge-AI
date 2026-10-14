@@ -16,7 +16,7 @@ from app.agent.errors import (
 from app.agent.graph import derived_recursion_limit, run_routing_job
 from app.agent.repositories import SNAPSHOT_ID, seeded_repository
 from app.agent.state import budget_exhausted
-from app.agent.tools import FakeConnector, ToolCallRequest, ToolDispatcher
+from app.agent.tools import ConnectorError, FakeConnector, ToolCallRequest, ToolDispatcher
 
 from .doubles import inventory, GreedyModel, ScriptedModel
 
@@ -208,7 +208,7 @@ def test_the_byte_cap_is_enforced_with_its_own_typed_result():
     assert outcome.result.status == "error"
     assert outcome.result.error_code == "budget_exhausted"
     assert "max_tool_bytes" in (outcome.result.message or "")
-    assert outcome.charged is False
+    assert outcome.charged is True, "the read happened, so it counts against the budget"
     assert repository.get_tool_result("job-bytes", "call-bytes") is None
 
 
@@ -231,7 +231,61 @@ def test_tool_row_and_byte_caps_are_typed_results_not_crashes():
     )
     assert outcome.result.status == "error"
     assert outcome.result.error_code == "budget_exhausted"
-    assert outcome.charged is False
+    assert outcome.charged is True, "the read happened, so it counts against the budget"
+
+
+def test_repeatedly_failing_tool_calls_still_exhaust_the_tool_budget():
+    """A source that fails every read must not make the loop bound free.
+
+    If a failed call were not charged, a model that keeps asking for an unreachable
+    tool would never exhaust `max_tool_calls`, and the graph's only bound on that loop
+    would stop applying exactly when the loop is most likely to run away.
+    """
+
+    connector = _AlwaysFailingConnector()
+    repository = seeded_repository()
+    budgets = AgentBudgets(max_tool_calls=2, max_model_calls=10)
+    dispatcher = ToolDispatcher(
+        connector=connector,
+        repository=repository,
+        inventory=inventory(),
+        budgets=budgets,
+    )
+
+    charged = 0
+    for index in range(5):
+        outcome = dispatcher.dispatch(
+            ToolCallRequest(
+                id=f"failing-{index}",
+                name="sample_rows",
+                arguments={"source_id": "source-orders-1", "resource_id": "orders.lines[]", "limit": 3},
+            ),
+            job_id="job-failing",
+            tool_calls_used=charged,
+        )
+        assert outcome.result.status == "error"
+        if outcome.charged:
+            charged += 1
+
+    assert charged == budgets.max_tool_calls, "the failing loop was bounded by the budget"
+    assert len(connector.calls) == budgets.max_tool_calls, "no call beyond the budget reached the source"
+    # the third attempt onward is refused before dispatch, and says why
+    refused = dispatcher.dispatch(
+        ToolCallRequest(id="failing-late", name="sample_rows", arguments={"source_id": "source-orders-1", "resource_id": "orders.lines[]"}),
+        job_id="job-failing",
+        tool_calls_used=charged,
+    )
+    assert refused.result.error_code == "budget_exhausted"
+    assert refused.charged is False
+
+
+class _AlwaysFailingConnector:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict, str]] = []
+
+    def call(self, name: str, arguments: dict, job_id: str) -> dict:
+        self.calls.append((name, dict(arguments), job_id))
+        raise ConnectorError("connector_error", "this source never answers")
 
 
 def test_recursion_limit_is_not_the_stopping_condition():

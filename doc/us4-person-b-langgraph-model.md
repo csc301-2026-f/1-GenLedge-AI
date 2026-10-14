@@ -181,40 +181,50 @@ Three commands, all checked in:
 python -m pytest            # from the repo root; pytest.ini sets testpaths
 python -m pytest tests      # from src/backend; the documented command
 python verify_us4_person_b.py     # requirement-level, independent of the suite
+python tools/mutation_check.py    # does the suite fail when it should?
 python run_agent_tests.py         # the suite on a machine without pytest
 ```
 
-- **`python -m pytest` — 137 passed**, with `langgraph 1.2.15` installed. This
-  exercises the **real `langgraph.StateGraph`**, not the fallback, including the two
-  structural introspection cases that skip when the library is absent. It also
-  includes `test_langgraph_actually_injects_the_run_scoped_runtime`, which asserts
-  the nodes receive the framework's injected runtime rather than a positional guess.
-- **`python -m pytest tests` from `src/backend` — 137 passed.** Same suite, the
+- **`python -m pytest` — 440 passed**, with `langgraph 1.2.15` installed. This
+  exercises the **real `langgraph.StateGraph`**, not the fallback. It includes
+  `test_langgraph_actually_injects_the_run_scoped_runtime` (the nodes receive the
+  framework's injected runtime, not a positional guess), the differential test that
+  compares both engines field by field, a fault-injection matrix, a per-field
+  boundary fuzz, 250 seeded property cases and an AST architecture scan.
+- **`python -m pytest tests` from `src/backend` — 440 passed.** Same suite, the
   invocation the task names.
 - **`verify_us4_person_b.py` — 17/17 requirement-level checks hold.** It asserts the
   requirements from the outside through the public entrypoints and prints, by name,
   what it does not verify. It needs only `pydantic`.
-- **`run_agent_tests.py` — `passed=104 failed=0 skipped=3`** on Python 3.10 without
-  `langgraph` (the three skips are the LangGraph-only cases). This is how the
-  fallback path stays exercised.
+- **`tools/mutation_check.py` — 7/7 mutations killed.** Seven load-bearing lines are
+  broken one at a time; the suite must notice each one. It found two real gaps while
+  being written.
+- **`run_agent_tests.py` — `passed=410 failed=0 skipped=0`** on Python 3.10 without
+  `langgraph`, which is how the fallback path stays exercised.
 - `compat.StrEnum` was compared against the real `enum.StrEnum` by running the same
   18 probes (`str`, `format`, format spec, f-string, `%s`, `json.dumps`, equality both
   ways, dict-key lookup, `hash`, `len`, sorting interleaved with plain strings,
   string methods, `in`, `repr`) under Python 3.13 (stdlib) and Python 3.10 (the
   fallback): **identical output on every probe**.
-- `python -m mypy --check-untyped-defs app/agent tests/agent` — clean.
+- `python -m mypy --check-untyped-defs app main.py tests/agent` — clean, resolving
+  the venv's real dependency stubs.
 
-**A defect this caught.** The first run against the real library failed every
-end-to-end case: LangGraph injects a parameter *named* `runtime` as a keyword, and
-only when it is visible in the callable's signature. The node-write guard had been
-wrapping each node in `*args, **kwargs`, which hid the parameter — so every node ran
-with no runtime at all. `guarded` now declares `runtime` itself and unwraps
-`.context`, and `runtime_for` makes both runtimes deliver it the same way.
+**Defects these techniques caught, after the unit suite was already green.** The first
+run against the real library failed every end-to-end case: LangGraph injects a
+parameter *named* `runtime` as a keyword, and only when it is visible in the
+callable's signature — the node-write guard's `*args, **kwargs` hid it, so every node
+ran with no runtime. The fault matrix then found that a **failed** tool call was not
+charged against `max_tool_calls`, making the loop bound free exactly when a source was
+broken. The boundary fuzz found the resource **name** was never projected. And the
+property tests found that a sample containing `</untrusted_source_data>` **closed the
+untrusted block early**, leaving the rest of the source text in the prompt's
+instruction region. Each has a regression test; see
+[`us4-person-b-verification.md`](us4-person-b-verification.md) for the full account.
 
 ## 7. Provider limitations and known gaps
 
 1. **`langgraph` is optional at runtime.** The graph is built against the real
-   `StateGraph` API and **verified against `langgraph 1.2.15`** (137 passed, with the
+   `StateGraph` API and **verified against `langgraph 1.2.15`** (440 passed, with the
    library's own `get_graph()` introspection). The fallback in `app/agent/graphs.py`
    exists so a checkout without the dependency still executes the same nodes; it is
    labelled, and `graph_runtime()` reports which one is live. The dependency is in

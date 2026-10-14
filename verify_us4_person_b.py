@@ -287,16 +287,20 @@ def _sentinels():
         tool_results=[],
         budgets=AgentBudgets(),
     )
+    # A resource *name* is deliberately projectable (US4-AC6 wants names), so the
+    # restricted categories are asserted individually rather than by blocking every
+    # field of the inventory.
     for label, value in (
         ("organization id", org),
         ("password", password),
         ("dsn", dsn),
         ("reviewer identity", reviewer),
-        ("client name", client),
         ("card number", card),
         ("field description", "contact"),
     ):
         assert value not in rendered.user, f"{label} leaked into the prompt"
+    assert f"orders {client}" in rendered.user, "the resource name is a projection target"
+    assert client not in rendered.user.replace(f"orders {client}", ""), "the name appears once"
     assert rendered.user.startswith("Job reference: org-sent"), rendered.user[:40]
 
 
