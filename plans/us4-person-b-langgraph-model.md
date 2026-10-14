@@ -81,15 +81,15 @@ Three commands, all checked in and all green:
 python -m pytest                  # from the repo root (pytest.ini sets testpaths)
 python -m pytest tests            # from src/backend, the documented invocation
 python verify_us4_person_b.py     # 17/17 requirement-level checks hold
-python run_agent_tests.py         # passed=104 failed=0 skipped=3 (no langgraph present)
+python run_agent_tests.py         # passed=423 failed=0 skipped=5 (no langgraph present)
 python -m mypy --check-untyped-defs app/agent tests/agent   # clean
 ```
 
-- **137 passed** with `langgraph 1.2.15` installed, from both the repository root and
+- **458 passed** with `langgraph 1.2.15` installed, from both the repository root and
   `src/backend`. This is the real `langgraph.StateGraph`, including the library's own
   `get_graph()` introspection and an assertion that the framework's injected runtime
   actually reaches the nodes.
-- **104 passed, 3 skipped** on Python 3.10 with no `langgraph`, which is how the
+- **423 passed, 5 skipped** on Python 3.10 with no `langgraph`, which is how the
   labelled fallback path stays exercised.
 - `verify_us4_person_b.py` asserts the requirements from the outside through the
   public entrypoints and names, at the end, what it cannot verify.

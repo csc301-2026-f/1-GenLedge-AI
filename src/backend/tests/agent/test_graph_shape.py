@@ -18,6 +18,19 @@ LANGGRAPH = pytest.mark.skipif(
     reason="langgraph is not installed; the labelled local runner is exercised instead",
 )
 
+#: `get_graph()` is LangGraph's own introspection, so these cases need LangGraph **and**
+#: need it to be the selected engine. `GENLEDGE_GRAPH_RUNTIME=local-fallback` selects the
+#: fallback on a machine that has the library, and then there is no `get_graph()` to
+#: call: skipping on availability alone made the documented command fail with an
+#: AttributeError instead of skipping.
+LANGGRAPH_ENGINE = pytest.mark.skipif(
+    not GRAPH_RUNTIME_AVAILABLE or graph_runtime() != "langgraph",
+    reason=(
+        "these cases introspect the compiled langgraph graph; "
+        f"the selected engine is {graph_runtime()!r}"
+    ),
+)
+
 
 def test_graph_declares_exactly_three_nodes():
     shape = graph_shape()
@@ -66,7 +79,7 @@ def test_compiled_graph_runs_the_loop_and_terminates():
     assert run.final_state["status"] == "awaiting_review"
 
 
-@LANGGRAPH
+@LANGGRAPH_ENGINE
 def test_compiled_langgraph_exposes_the_declared_nodes_and_edges():
     graph = build_graph()
     drawable = graph.get_graph()
@@ -87,7 +100,7 @@ def test_compiled_langgraph_exposes_the_declared_nodes_and_edges():
     }
 
 
-@LANGGRAPH
+@LANGGRAPH_ENGINE
 def test_compiled_graph_contains_no_extra_application_node():
     graph = build_graph()
     node_ids = set(graph.get_graph().nodes)

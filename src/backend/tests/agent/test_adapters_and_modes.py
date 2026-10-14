@@ -65,11 +65,31 @@ def _proposal_request() -> ModelRequest:
         (None, {}, "fake"),
         (None, {"GENLEDGE_LLM_API_KEY": "sk"}, "live"),
         (None, {"OPENAI_API_KEY": "sk"}, "live"),
-        (None, {"GENLEDGE_LLM_PROVIDER": "anthropic"}, "live"),
+        # An endpoint is configuration even without a key: the gateway may inject one.
+        (None, {"GENLEDGE_LLM_BASE_URL": "https://gw.example/v1"}, "live"),
+        # A provider *name* is not: nothing can authenticate with it, so `auto` must
+        # fall back rather than send every job into a configuration error.
+        (None, {"GENLEDGE_LLM_PROVIDER": "anthropic"}, "fake"),
+        ("auto", {"GENLEDGE_LLM_PROVIDER": "anthropic"}, "fake"),
     ],
 )
 def test_mode_resolution(requested, env, expected):
     assert resolve_model_mode(requested, env=env).mode == expected
+
+
+def test_auto_does_not_choose_live_without_something_to_authenticate_with():
+    """`auto` means "live only if it could work", not "live if a name is set".
+
+    Treating a provider name as configuration sent every job down the live path and
+    failed it with `model_configuration_error` — a fleet-wide outage from one harmless
+    variable. `live` explicitly still refuses, which is the loud path.
+    """
+
+    assert provider_configured({"GENLEDGE_LLM_PROVIDER": "anthropic"}) is False
+    assert resolve_model_mode("auto", env={"GENLEDGE_LLM_PROVIDER": "anthropic"}).mode == "fake"
+    # explicit `live` is a deliberate instruction, so it fails loudly instead
+    with pytest.raises(ModelConfigurationError):
+        resolve_model_mode("live", env={"GENLEDGE_LLM_PROVIDER": "anthropic"})
 
 
 def test_live_mode_without_provider_configuration_is_a_typed_error():

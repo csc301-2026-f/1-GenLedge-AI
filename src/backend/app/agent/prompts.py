@@ -33,7 +33,7 @@ from typing import Any, Mapping
 
 from app.agent.contracts import AgentBudgets, ModelDraft
 from app.agent.repositories import CatalogueView
-from app.agent.tools import ToolResult, redact_payload, redact_value
+from app.agent.tools import ToolResult, merge_path, redact_payload, redact_value
 
 PROMPTS_DIR = Path(__file__).with_name("prompts")
 SCHEMA_FIELD = "output_schema"
@@ -55,18 +55,33 @@ _DELIMITER_TOKENS = (
     "</untrusted_source_data>",
     "<untrusted_tool_data>",
     "</untrusted_tool_data>",
+    "<untrusted_catalogue_data>",
+    "</untrusted_catalogue_data>",
+    "<previous_response>",
+    "</previous_response>",
+)
+
+#: The three blocks the projection wraps. Named once so a test can assert the count is
+#: exactly one open and one close each, whatever the source contains.
+UNTRUSTED_BLOCKS = (
+    ("<untrusted_source_data>", "</untrusted_source_data>"),
+    ("<untrusted_catalogue_data>", "</untrusted_catalogue_data>"),
+    ("<untrusted_tool_data>", "</untrusted_tool_data>"),
 )
 
 
 def neutralise_delimiters(value: Any) -> Any:
-    """Stop source text from forging the untrusted-data delimiters.
+    """Stop source text from forging a prompt delimiter.
 
-    The boundary is delimiter-based, so a sample or resource name containing
-    `</untrusted_source_data>` closes the block early and leaves the rest of the
-    source text sitting in the instruction region of the prompt — the one thing the
-    boundary exists to prevent. Every source-derived string passes through here before
-    it is rendered, which makes the delimiter count an invariant: exactly one open and
-    one close per block, whatever the source contains.
+    Every delimiter in a prompt is a **fixed string the harness writes**. If a value
+    the harness interpolates contains one of those strings, and that value is not
+    neutralised, it closes — or opens — a block early and the text after it lands in the
+    prompt's instruction region, which is exactly what the boundary exists to prevent.
+
+    The tokens covered are all of them: the two untrusted-data blocks and the
+    `previous_response` quote in the repair prompt. A model can put `</previous_response>`
+    in its own answer, so that block is forgeable from the *model* side, not only the
+    source side.
     """
 
     if isinstance(value, str):
@@ -79,6 +94,20 @@ def neutralise_delimiters(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): neutralise_delimiters(item) for key, item in value.items()}
     return value
+
+
+def projected(value: Any, field_path: str = "") -> Any:
+    """The single chokepoint every source-derived value passes through.
+
+    Redaction and delimiter neutralisation were applied by hand at each render site,
+    and the two that were missed — `snapshot_id` and `resource_id` — were missed
+    precisely because a hand-applied rule has no chokepoint. Routing everything through
+    one function makes "did we forget a site?" answerable by reading one place, and
+    `test_every_projected_value_passes_the_chokepoint` asserts each site uses it.
+    """
+
+    return neutralise_delimiters(redact_value(value, field_path))
+
 
 
 _VARIABLE = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
@@ -227,17 +256,22 @@ def _bounded(items: list[Any], limit: int, label: str) -> tuple[list[Any], str]:
 
 
 def project_inventory(inventory: Any) -> str:
-    """The model-facing inventory: one line per field, ≤3 samples, no rows."""
+    """The model-facing inventory: one line per field, ≤3 samples, no rows.
 
-    lines = [f"snapshot_id: {inventory.snapshot_id}"]
+    Every value here goes through `projected()`. The `snapshot_id`, `resource_id` and
+    field path are as source-derived as a sample is — master §7.6 names "a malicious
+    field path" as a threat — so they are redacted and neutralised too.
+    """
+
+    lines = [f"snapshot_id: {projected(inventory.snapshot_id, 'snapshot_id')}"]
     resources, marker = _bounded(list(inventory.resources), MAX_PROJECTED_RESOURCES, "resources")
     lines.append("resources:")
     for resource in resources:
         # The resource *name* is projected, not only its id: US4-AC6 has the model
         # reason over names, and a connector's ids are often opaque (`tbl_47`).
-        name = neutralise_delimiters(redact_value(resource.name, "name"))
         lines.append(
-            f"  - {resource.resource_id} (name={name}, kind={resource.kind}, "
+            f"  - {projected(resource.resource_id, 'resource_id')} "
+            f"(name={projected(resource.name, 'name')}, kind={resource.kind}, "
             f"fields={resource.field_count})"
         )
     if marker:
@@ -245,8 +279,11 @@ def project_inventory(inventory: Any) -> str:
     lines.append("fields:")
     fields, marker = _bounded(list(inventory.fields), MAX_PROJECTED_FIELDS, "fields")
     for field in fields:
-        path = _field_path(field.ref.resource_id, field.ref.field_path)
-        samples = [neutralise_delimiters(redact_value(value, field.ref.field_path)) for value in field.samples[:3]]
+        path = _bounded_text(projected(_field_path(field.ref.resource_id, field.ref.field_path), "field_path"))
+        # A single sample is capped too: the block-level cap protects the total, this
+        # protects against one pathological value (a 100k-char string) crowding out
+        # every other field before the block cap is even reached.
+        samples = [_bounded_text(projected(value, field.ref.field_path)) for value in field.samples[:3]]
         detail = [
             f"type={field.type.value if hasattr(field.type, 'value') else field.type}",
             f"nullable={field.nullable}",
@@ -254,15 +291,15 @@ def project_inventory(inventory: Any) -> str:
             f"status={field.status}",
         ]
         if field.ambiguity:
-            detail.append(f"ambiguity={neutralise_delimiters(redact_value(field.ambiguity, 'ambiguity'))}")
+            detail.append(f"ambiguity={projected(field.ambiguity, 'ambiguity')}")
         if field.native_type:
-            detail.append(f"native_type={neutralise_delimiters(field.native_type)}")
+            detail.append(f"native_type={projected(field.native_type, 'native_type')}")
         if samples:
             detail.append("samples=" + ", ".join(str(item) for item in samples))
         lines.append(f"  - {path} [{'; '.join(detail)}]")
     if marker:
         lines.append(marker.rstrip("\n"))
-    return "\n".join(lines)
+    return _bounded_text("\n".join(lines))
 
 
 def _field_path(resource_id: str, field_path: str) -> str:
@@ -270,18 +307,13 @@ def _field_path(resource_id: str, field_path: str) -> str:
 
     A repeating resource is addressed as `orders.lines[]` and its fields as
     `lines[].sku`; the model must read `orders.lines[].sku`, not
-    `orders.lines[].lines[].sku`. The overlap is merged on a dot boundary and only
-    when the resource's own tail genuinely matches the field path's head.
+    `orders.lines[].lines[].sku`. Delegated to `tools.merge_path` so the argument
+    validator and the prompt cannot disagree about what a legal path looks like — a
+    naive `resource.field` join made the validator refuse the very spelling the prompt
+    displays.
     """
 
-    if field_path.startswith(resource_id + ".") or field_path == resource_id:
-        return field_path
-    resource_parts = resource_id.split(".")
-    field_parts = field_path.split(".")
-    for size in range(min(len(resource_parts), len(field_parts)), 0, -1):
-        if resource_parts[-size:] == field_parts[:size]:
-            return ".".join(resource_parts + field_parts[size:])
-    return f"{resource_id}.{field_path}"
+    return merge_path(resource_id, field_path)
 
 
 def project_catalogue(catalogue: CatalogueView | None) -> str:
@@ -289,14 +321,20 @@ def project_catalogue(catalogue: CatalogueView | None) -> str:
 
     if catalogue is None or not catalogue.tables:
         return "No existing warehouse catalogue. Propose a new model."
-    lines = [f"catalog_ref: {neutralise_delimiters(catalogue.catalog_ref)}"]
+    lines = [f"catalog_ref: {projected(catalogue.catalog_ref, 'catalog_ref')}"]
     tables, marker = _bounded(list(catalogue.tables), MAX_PROJECTED_RESOURCES, "tables")
     for table in tables:
-        columns = ", ".join(f"{neutralise_delimiters(column.name)} {neutralise_delimiters(column.type)}" for column in table.columns)
-        lines.append(f"  - {neutralise_delimiters(table.table_id)} ({neutralise_delimiters(table.name)}): {columns}")
+        columns = ", ".join(
+            f"{projected(column.name, 'column')} {projected(column.type, 'type')}"
+            for column in table.columns
+        )
+        lines.append(
+            f"  - {projected(table.table_id, 'table_id')} "
+            f"({projected(table.name, 'table_name')}): {columns}"
+        )
     if marker:
         lines.append(marker.rstrip("\n"))
-    return "\n".join(lines)
+    return _bounded_text("\n".join(lines))
 
 
 def project_tool_results(results: list[ToolResult]) -> str:
@@ -305,6 +343,10 @@ def project_tool_results(results: list[ToolResult]) -> str:
     Successes **and** typed errors are projected. A tool error is data the model has
     to adapt to (US4 §4.2, master §5.4 boundary 3), so dropping it would leave a live
     model re-requesting blind until its budget ran out.
+
+    The tool *name* and `tool_call_id` are projected too. The call id is
+    **model-authored**, and for an unknown tool the name is whatever the model asked
+    for, so both are forgeable and both pass through `projected()`.
     """
 
     usable = results[-MAX_PROJECTED_TOOL_RESULTS:]
@@ -312,21 +354,23 @@ def project_tool_results(results: list[ToolResult]) -> str:
         return "No tool results recorded yet."
     blocks = []
     for result in usable:
+        tool = projected(result.tool, "tool")
+        call_id = projected(result.tool_call_id, "tool_call_id")
         if result.status == "ok":
             # The tool layer redacts before persistence. This second pass is defence
             # in depth at the boundary that actually reaches the provider, so a
             # result recorded by a buggy or older writer still cannot leak a
             # credential.
-            payload = neutralise_delimiters(_cap_rows(redact_payload(result.payload), MAX_PROJECTED_TOOL_ROWS))
+            payload = projected(_cap_rows(redact_payload(result.payload), MAX_PROJECTED_TOOL_ROWS))
             rendered = _bounded_text(json.dumps(payload, sort_keys=True, default=str))
-            blocks.append(f"- {result.tool} (tool_call_id={result.tool_call_id}): {rendered}")
+            blocks.append(f"- {tool} (tool_call_id={call_id}): {rendered}")
             continue
         failure = {
             "error_code": result.error_code,
-            "message": _bounded_text(str(neutralise_delimiters(result.message or ""))),
+            "message": _bounded_text(str(projected(result.message or "", "message"))),
         }
         blocks.append(
-            f"- {result.tool} (tool_call_id={result.tool_call_id}) FAILED: "
+            f"- {tool} (tool_call_id={call_id}) FAILED: "
             f"{_bounded_text(json.dumps(failure, sort_keys=True))} "
             "Adapt to this result; do not repeat the same call."
         )
@@ -439,8 +483,12 @@ def repair_prompt_variables(
         budgets=budgets,
     )
     return {
+        # The previous answer is model-authored, so it can contain
+        # `</previous_response>` and close its own quote block. It is neutralised like
+        # any other untrusted value; `validation_errors` comes from Pydantic and not
+        # from the model, so it is not.
         "validation_errors": validation_errors,
-        "previous_response": _bounded_text(previous_response),
+        "previous_response": _bounded_text(str(projected(previous_response, "previous_response"))),
         "inventory": proposal["inventory"],
         "catalogue": proposal["catalogue"],
         "tool_results": proposal["tool_results"],

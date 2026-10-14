@@ -47,8 +47,18 @@ SNAPSHOT_DRIFTED = "snapshot_drifted"
 CONNECTOR_ERROR = "connector_error"
 
 REDACTION_MARKER = "[redacted]"
-_CREDENTIAL = re.compile(r"(password|passwd|secret|token|api[_-]?key|credential|dsn|postgres(ql)?://)", re.I)
-_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+#: Credential *words*, and any connection string. The scheme list is open-ended on
+#: purpose: `scheme://user:pass@host` is a DSN whoever makes it, and enumerating
+#: vendors meant `mysql://` and `mongodb+srv://` reached prompts unredacted.
+_CREDENTIAL = re.compile(
+    r"(password|passwd|secret|token|api[_-]?key|credential|dsn)"
+    r"|([a-z][a-z0-9+.\-]{1,20}://[^\s]*:[^\s]*@)"
+    r"|((?:mongodb(?:\+srv)?|redis|amqp|jdbc):[^\s]*@)",
+    re.I,
+)
+#: Unanchored: an address embedded in a sentence is still a contact detail, which is
+#: what the docstring below always claimed and the anchored pattern did not do.
+_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}")
 #: A card-like run of digits is never safe to project, whatever the field is called.
 _PAYMENT_CARD = re.compile(r"\b(?:\d[ -]?){12,18}\d\b")
 _SENSITIVE_FIELD = re.compile(r"(password|passwd|secret|token|api[_-]?key|credential|ssn|email)", re.I)
@@ -58,15 +68,19 @@ def redact_value(value: Any, field_path: str = "") -> Any:
     """Replace credential-like and contact-like values with a stable marker.
 
     Applied at the tool layer *before* persistence, so a restricted value is not
-    stored in a tool result at all — and therefore cannot be projected into a
-    prompt later. Structure is preserved; only the offending scalar is replaced.
-    Contact detection uses `search`, not `match`: an address embedded in a longer
-    sentence is still a contact detail.
+    stored in a tool result at all — and therefore cannot be projected into a prompt
+    later. Structure is preserved; only the offending scalar is replaced.
+
+    Detection is deliberately broad and `search`-based: any `scheme://user:pass@host`
+    connection string, any e-mail address anywhere in a longer string, any card-like
+    run of digits, and any value under a field whose name says it is sensitive. A
+    false positive costs a `[redacted]` marker in a prompt; a false negative costs a
+    credential.
     """
 
     if isinstance(value, str) and (
         _CREDENTIAL.search(value)
-        or _EMAIL.search(value.strip())
+        or _EMAIL.search(value)
         or _PAYMENT_CARD.search(value)
     ):
         return REDACTION_MARKER
@@ -87,6 +101,24 @@ def redact_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Redact a whole tool payload. Keys are treated as field paths."""
 
     return {str(key): redact_value(value, str(key)) for key, value in payload.items()}
+
+
+def merge_path(resource_id: str, field_path: str) -> str:
+    """Join a resource and field path without repeating an overlapping segment.
+
+    `orders.lines[]` + `lines[].sku` is `orders.lines[].sku`, not
+    `orders.lines[].lines[].sku`. The projection and the argument validator must agree
+    on this or a legal request is refused for naming a path the prompt itself shows.
+    """
+
+    if field_path == resource_id or field_path.startswith(resource_id + "."):
+        return field_path
+    resource_parts = resource_id.split(".")
+    field_parts = field_path.split(".")
+    for size in range(min(len(resource_parts), len(field_parts)), 0, -1):
+        if resource_parts[-size:] == field_parts[:size]:
+            return ".".join(resource_parts + field_parts[size:])
+    return f"{resource_id}.{field_path}"
 
 
 def _rows_of(payload: dict[str, Any]) -> list[Any] | None:
@@ -397,6 +429,22 @@ class ToolDispatcher:
     def allowed_resources(self) -> set[str]:
         return {field.ref.resource_id for field in self.inventory.fields}
 
+    def allowed_field_paths(self) -> set[str]:
+        """Every field path the snapshot discovered, in both forms a caller may use.
+
+        Both spellings are accepted because both are natural: the bare discovered path
+        (`lines[].sku`) and the resource-qualified one (`orders.lines[].sku`). The
+        qualified form is built with the same merge the projection uses — a naive
+        `resource.field` concatenation produced `orders.lines[].lines[].sku`, which
+        matched neither what a caller sends nor what the prompt shows.
+        """
+
+        paths: set[str] = set()
+        for field in self.inventory.fields:
+            paths.add(field.ref.field_path)
+            paths.add(merge_path(field.ref.resource_id, field.ref.field_path))
+        return paths
+
     # -- dispatch --------------------------------------------------------------
     def dispatch(self, request: ToolCallRequest, *, job_id: str, tool_calls_used: int) -> ToolOutcome:
         spec = TOOL_SPECS.get(request.name)
@@ -464,12 +512,14 @@ class ToolDispatcher:
         redacted = {key: redact_value(value, key) for key, value in validated.model_dump().items()}
         size = payload_bytes(redacted)
         if size > self.budgets.max_tool_bytes:
+            # Persisted: the read happened and this *is* evidence about the source, so a
+            # retry of the same `tool_call_id` must replay it rather than re-read a
+            # source that may have changed. The payload is empty, so the cap still holds.
             return self._error(
                 request,
                 job_id,
                 BUDGET_EXHAUSTED,
                 f"result of {size} bytes exceeds max_tool_bytes ({self.budgets.max_tool_bytes})",
-                persist=False,
                 charge=True,
             )
 
@@ -480,7 +530,6 @@ class ToolDispatcher:
                 job_id,
                 BUDGET_EXHAUSTED,
                 f"result of {len(rows)} rows exceeds max_tool_rows ({self.budgets.max_tool_rows})",
-                persist=False,
                 charge=True,
             )
 
@@ -499,18 +548,43 @@ class ToolDispatcher:
 
     # -- helpers ---------------------------------------------------------------
     def _scope_error(self, arguments: ToolArgumentModel) -> tuple[str, str] | None:
+        """Authorization and field-path validation, before any connector call.
+
+        Two controls, and both are master §7.6's: the job's snapshot must cover the
+        requested source and resource, **and** a requested field path must be one the
+        snapshot discovered. Without the second, `fields: ["x; DROP TABLE orders"]` was
+        a legal argument — the pattern check that would have caught it lives in
+        `contracts.Identifier`, which a free-form `list[str]` argument does not apply.
+        """
+
         source_id = getattr(arguments, "source_id", None)
         if source_id is not None and source_id not in self.allowed_sources():
             return UNAUTHORIZED_SOURCE, f"source {source_id!r} is not in this job's snapshot"
+        dumped = arguments.model_dump()
         resources = [
-            value
-            for key, value in arguments.model_dump().items()
-            if key == "resource_id" or key.endswith("_resource_id")
+            value for key, value in dumped.items() if key == "resource_id" or key.endswith("_resource_id")
         ]
         for resource_id in resources:
             if resource_id and resource_id not in self.allowed_resources():
                 return RESOURCE_NOT_FOUND, f"resource {resource_id!r} is not in this job's snapshot"
+        unknown = [path for path in self._requested_field_paths(dumped) if path not in self.allowed_field_paths()]
+        if unknown:
+            return INVALID_ARGUMENTS, (
+                f"field path(s) not in this job's snapshot: {', '.join(sorted(set(unknown))[:5])}"
+            )
         return None
+
+    @staticmethod
+    def _requested_field_paths(dumped: dict[str, Any]) -> list[str]:
+        """Every field path an argument names, from `fields` lists and `*_field_path`."""
+
+        paths: list[str] = []
+        for key, value in dumped.items():
+            if key == "fields" and isinstance(value, list):
+                paths.extend(str(item) for item in value)
+            elif key.endswith("_field_path") and value:
+                paths.append(str(value))
+        return paths
 
     def _error(
         self,

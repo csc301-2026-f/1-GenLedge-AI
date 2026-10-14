@@ -216,6 +216,75 @@ def test_a_budget_refusal_is_not_persisted_because_nothing_ran():
     assert repository.get_tool_result("job-refused", "fault-1") is None
 
 
+def test_a_field_path_outside_the_snapshot_is_refused_before_dispatch():
+    """Master §7.6's field-path control: a requested path must be one we discovered.
+
+    `fields` is a free-form `list[str]`, so the identifier pattern in
+    `contracts.FieldRef` never applied to it and `["x; DROP TABLE orders"]` was a legal
+    argument. It is refused now, before the connector is reached.
+    """
+
+    connector = FaultConnector("credentials_in_rows")
+    dispatcher, _ = _dispatcher(connector)
+
+    outcome = dispatcher.dispatch(
+        ToolCallRequest(
+            id="call-injection",
+            name="sample_rows",
+            arguments={
+                "source_id": SOURCE_ID,
+                "resource_id": "orders.lines[]",
+                "fields": ["lines[].sku", "x; DROP TABLE orders"],
+            },
+        ),
+        job_id="job-fieldpath",
+        tool_calls_used=0,
+    )
+
+    assert outcome.result.status == "error"
+    assert outcome.result.error_code == "invalid_arguments"
+    assert "x; DROP TABLE orders" in (outcome.result.message or "")
+    assert connector.calls == [], "an out-of-snapshot field must not reach the source"
+    assert outcome.charged is False
+
+
+def test_a_discovered_field_path_is_accepted_in_either_spelling():
+    """`lines[].sku` and `orders.lines[].sku` name the same discovered field."""
+
+    connector = FaultConnector("credentials_in_rows")
+    dispatcher, _ = _dispatcher(connector)
+
+    for index, fields in enumerate((["lines[].sku"], ["orders.lines[].sku"], ["lines[]"])):
+        outcome = dispatcher.dispatch(
+            ToolCallRequest(
+                id=f"call-ok-{index}",
+                name="sample_rows",
+                arguments={"source_id": SOURCE_ID, "resource_id": "orders.lines[]", "fields": fields},
+            ),
+            job_id="job-fieldpath-ok",
+            tool_calls_used=0,
+        )
+        assert outcome.result.status == "ok", outcome.result.message
+
+    # a compare_fields call validates both `*_field_path` arguments, not just one
+    outcome = dispatcher.dispatch(
+        ToolCallRequest(
+            id="call-compare",
+            name="compare_fields",
+            arguments={
+                "source_id": SOURCE_ID,
+                "left_resource_id": "orders",
+                "left_field_path": "order_id",
+                "right_resource_id": "customers",
+                "right_field_path": "not_in_snapshot",
+            },
+        ),
+        job_id="job-fieldpath-compare",
+        tool_calls_used=0,
+    )
+    assert outcome.result.error_code == "invalid_arguments"
+
+
 def test_an_oversize_result_is_a_budget_error_not_a_crash():
     connector = FaultConnector("oversize")
     dispatcher, _ = _dispatcher(connector, max_tool_bytes=500)

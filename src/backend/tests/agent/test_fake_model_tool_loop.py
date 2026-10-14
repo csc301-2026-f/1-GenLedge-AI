@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from app.agent.contracts import ModelDraft
+from app.agent.contracts import AgentBudgets, ModelDraft
 from app.agent.graph import run_routing_job
 from app.agent.models import (
     FAKE_TARGET_RESOURCE,
@@ -18,6 +18,8 @@ from app.agent.repositories import ORDER_LINES, SNAPSHOT_ID, seeded_repository
 from app.agent.tools import TOOL_NAMES, FakeConnector
 
 from .doubles import inventory
+
+SOURCE_ID = "source-orders-1"
 
 
 def _run(**kwargs):
@@ -67,6 +69,70 @@ def test_tool_result_is_recorded_once_and_referenced_not_inlined():
         assert ref.result_ref == recorded.result_ref
         assert not hasattr(ref, "payload")
     assert "rows" not in run.final_state
+
+
+def _lines_only_inventory():
+    from app.agent.contracts import FieldRef, InventoryField, InventoryView, ResourceSummary, SourceType
+
+    return InventoryView(
+        snapshot_id=SNAPSHOT_ID,
+        resources=[
+            ResourceSummary(resource_id=ORDER_LINES, name="orders.lines[]", kind="collection", field_count=2)
+        ],
+        fields=[
+            InventoryField(
+                ref=FieldRef(source_id=SOURCE_ID, resource_id=ORDER_LINES, field_path=path),
+                type=SourceType.TEXT if path.endswith("line_id") else SourceType.NUMBER,
+                nullable=False,
+                repeating=True,
+                samples=["1"],
+                description=None,
+                ambiguity=None,
+                status="stable",
+            )
+            for path in ("lines[].line_id", "lines[].quantity")
+        ],
+    )
+
+
+def test_build_fake_draft_survives_an_empty_attribute_set():
+    """The draft builder must not raise on a snapshot scoped to one repeating resource.
+
+    `orders.lines[]` is the very resource the fake model samples, so a lines-only
+    snapshot is the most natural narrow inventory there is. The orders table used to be
+    built unconditionally and its merge key took `items[0]`, so an empty attribute list
+    raised `IndexError` — an untyped crash where the contract promises a typed outcome.
+    Called directly, because through the graph the failure would be masked by an earlier
+    check and the mutation would survive.
+    """
+
+    from app.agent.models import build_fake_draft
+
+    draft = build_fake_draft(_lines_only_inventory(), None, None)
+
+    assert draft.tables, "a draft needs at least one table"
+    for table in draft.tables:
+        assert table.key, "every table has a merge key"
+        assert table.attributes
+    assert {table.id for table in draft.tables} == {"fact_order_lines"}
+
+
+def test_a_lines_only_inventory_runs_end_to_end_without_an_exception():
+    """The same inventory through the runner: a typed outcome either way."""
+
+    from app.agent.repositories import InMemoryRoutingRepository
+
+    repository = InMemoryRoutingRepository(inventories={SNAPSHOT_ID: _lines_only_inventory()})
+    run = run_routing_job(
+        job_id="job-lines-only",
+        source_snapshot_ids=[SNAPSHOT_ID],
+        repository=repository,
+        budgets=AgentBudgets(max_tool_calls=5, max_model_calls=5),
+    )
+
+    assert run.status in {"awaiting_review", "failed", "incomplete"}
+    if run.failure is not None:
+        assert run.failure.code
 
 
 def test_the_fake_draft_serialises_the_from_alias():

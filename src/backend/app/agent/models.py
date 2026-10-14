@@ -49,12 +49,24 @@ FAKE_MODEL_ID = "genledge-fake-routing-v1"
 FAKE_TOOL_CALL_ID = "fake-tool-call-1"
 FAKE_TARGET_RESOURCE = "orders.lines[]"
 
-PROVIDER_ENV_VARS = (
+#: Variables that *name* a provider. Presence alone is not configuration: a deployment
+#: that sets only `GENLEDGE_LLM_PROVIDER` has nothing to authenticate with, so treating
+#: it as configured sent `auto` to the live path and made **every** job fail with
+#: `model_configuration_error` instead of falling back to the fake model.
+PROVIDER_NAME_ENV_VARS = ("GENLEDGE_LLM_PROVIDER",)
+
+#: Variables that are configuration: something to authenticate with, or somewhere to
+#: send the request. Either is enough for `auto` to choose the live path.
+PROVIDER_CREDENTIAL_ENV_VARS = (
     "GENLEDGE_LLM_API_KEY",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
-    "GENLEDGE_LLM_PROVIDER",
+    "GENLEDGE_LLM_BASE_URL",
+    "ANTHROPIC_BASE_URL",
 )
+
+#: Every variable the mode resolver looks at, for diagnostics and error messages.
+PROVIDER_ENV_VARS = PROVIDER_CREDENTIAL_ENV_VARS + PROVIDER_NAME_ENV_VARS
 
 
 @dataclass(frozen=True)
@@ -210,20 +222,36 @@ def build_fake_draft(inventory: InventoryView, catalogue: CatalogueView | None, 
         for field in customer_fields
     ]
 
-    key_of = lambda items: [item.id for item in items if item.id.endswith("_id")][:1] or [items[0].id]  # noqa: E731
+    def key_of(items: list[Attribute]) -> list[str]:
+        """A merge key for an attribute set.
 
-    tables = [
-        Table(
-            id=order_table_id,
-            name=order_table_id,
-            kind="event",
-            grain="one row per source order",
-            key=key_of(attributes),
-            attributes=attributes,
-            relationships=[],
-            rationale="Preserves the source order grain, its identifiers and its merge key.",
+        Callers only reach here with attributes, because the table that would have an
+        empty set is not emitted at all — that was the actual B1-adjacent defect: the
+        orders table used to be built unconditionally and indexed `items[0]`, so a
+        snapshot scoped to just `orders.lines[]` raised `IndexError` out of
+        `run_routing_job`. The precondition is asserted rather than silently patched,
+        so a future caller that breaks it fails loudly here.
+        """
+
+        assert items, "a table is only emitted when it has attributes"
+
+        identifiers = [item.id for item in items if item.id.endswith("_id")]
+        return identifiers[:1] or [items[0].id]
+
+    tables: list[Table] = []
+    if attributes:
+        tables.append(
+            Table(
+                id=order_table_id,
+                name=order_table_id,
+                kind="event",
+                grain="one row per source order",
+                key=key_of(attributes),
+                attributes=attributes,
+                relationships=[],
+                rationale="Preserves the source order grain, its identifiers and its merge key.",
+            )
         )
-    ]
     if line_attributes:
         tables.append(
             Table(
@@ -231,24 +259,28 @@ def build_fake_draft(inventory: InventoryView, catalogue: CatalogueView | None, 
                 name="fact_order_lines",
                 kind="event",
                 grain="one row per order line",
-                key=["line_id"] if any(item.id == "line_id" for item in line_attributes) else [line_attributes[0].id],
+                key=key_of(line_attributes),
                 attributes=line_attributes,
-                relationships=[
-                    # `Relationship.from_ref` carries the wire alias `from`, a Python
-                    # keyword, so the arguments go through a typed mapping and are
-                    # unpacked. The wire shape is pinned by
-                    # `test_the_fake_draft_serialises_the_from_alias`.
-                    Relationship(
-                        **_RelationshipArgs(
-                            **{
-                                "from": f"fact_order_lines.{key_of(line_attributes)[0]}",
-                                "to_ref": f"{order_table_id}.{key_of(attributes)[0]}",
-                                "cardinality": "many_to_one",
-                                "evidence": _evidence(result, "orders.lines[]", "lines[].line_id"),
-                            }
+                relationships=(
+                    [
+                        # `Relationship.from_ref` carries the wire alias `from`, a
+                        # Python keyword, so the arguments go through a typed mapping
+                        # and are unpacked. The wire shape is pinned by
+                        # `test_the_fake_draft_serialises_the_from_alias`.
+                        Relationship(
+                            **_RelationshipArgs(
+                                **{
+                                    "from": f"fact_order_lines.{key_of(line_attributes)[0]}",
+                                    "to_ref": f"{order_table_id}.{key_of(attributes)[0]}",
+                                    "cardinality": "many_to_one",
+                                    "evidence": _evidence(result, "orders.lines[]", "lines[].line_id"),
+                                }
+                            )
                         )
-                    )
-                ],
+                    ]
+                    if attributes
+                    else []
+                ),
                 rationale="Expands the repeating lines[] structure into its own event table.",
             )
         )
@@ -530,10 +562,15 @@ class ResolvedModelMode:
 
 
 def provider_configured(env: Mapping[str, str] | None = None) -> bool:
-    """True when provider configuration exists. Presence only — never the value."""
+    """True when there is something to call the provider *with*. Presence only.
+
+    A provider *name* is not configuration — see `PROVIDER_NAME_ENV_VARS`. Requiring a
+    credential or an endpoint is what makes `auto` mean "use live only if it could
+    actually work", instead of routing every job into a guaranteed configuration error.
+    """
 
     source = os.environ if env is None else env
-    return any(str(source.get(name, "")).strip() for name in PROVIDER_ENV_VARS)
+    return any(str(source.get(name, "")).strip() for name in PROVIDER_CREDENTIAL_ENV_VARS)
 
 
 def resolve_model_mode(
@@ -589,13 +626,12 @@ def build_model_client(
     if resolved.mode == "fake":
         return FakeModel(inventory=inventory, catalogue=catalogue)
     source = os.environ if env is None else env
-    api_key = source.get("GENLEDGE_LLM_API_KEY") or None
-    if api_key is None:
-        for name in PROVIDER_ENV_VARS:
-            value = str(source.get(name, "")).strip()
-            if value and name.endswith("_API_KEY"):
-                api_key = value
-                break
+    api_key: str | None = None
+    for name in PROVIDER_CREDENTIAL_ENV_VARS:
+        value = str(source.get(name, "")).strip()
+        if value and (name.endswith("_API_KEY")):
+            api_key = value
+            break
     return LiveModel(
         provider=resolved.provider,
         model=resolved.model,

@@ -50,6 +50,64 @@ def test_tool_budget_exhaustion_is_typed_and_does_not_raise():
     assert run.final_state["model_calls_used"] <= budgets.max_model_calls
 
 
+def test_the_recursion_derivation_binds_above_the_floor():
+    """The derivation must be the binding term for large budgets, not dead arithmetic.
+
+    With the default budgets the floor wins (200 vs 184), so a mutation that reduced
+    the derivation to the floor alone survived every test. Large budgets make the
+    derivation the larger term, which is the configuration this function exists for.
+    """
+
+    huge = AgentBudgets(max_tool_calls=5_000, max_model_calls=5_000, recursion_limit=200)
+    limit = derived_recursion_limit(huge)
+    assert limit > huge.recursion_limit, "the derivation binds, not the floor"
+    assert limit > 2 * huge.max_tool_calls + 2 * huge.max_model_calls
+
+    # and the floor still wins when the derivation is smaller
+    tiny = AgentBudgets(max_tool_calls=1, max_model_calls=1, recursion_limit=10_000)
+    assert derived_recursion_limit(tiny) == 10_000
+
+
+def test_the_local_runner_backstop_is_mapped_to_a_typed_failure():
+    """The runtime's own recursion limit must not escape as a framework error."""
+
+    from app.agent.graph import _recursion_failure
+    from app.agent.repositories import SNAPSHOT_ID
+    from app.agent.state import initial_state
+
+    state = initial_state(
+        job_id="job-backstop",
+        source_snapshot_ids=[SNAPSHOT_ID],
+        budgets=AgentBudgets(),
+        model_mode="fake",
+    )
+    failed = _recursion_failure(state, "the runner stopped here")
+    assert failed["status"] == "failed"
+    assert failed["failure"] is not None
+    assert failed["failure"].code == "recursion_limit_exceeded"
+    assert failed["failure"].retryable is False
+
+
+def test_the_local_runner_stops_at_its_own_recursion_limit():
+    """`LocalGraphRunner`'s backstop is reachable and raises the mapped error."""
+
+    from app.agent.graphs import LocalStateGraph, RecursionLimitExceeded
+    from app.agent.state import RoutingJobState
+
+    builder = LocalStateGraph(RoutingJobState)
+
+    def loop(state, runtime=None):  # noqa: ARG001 - a node that never terminates
+        return {"job_id": "spinning"}
+
+    builder.add_node("spin", loop)
+    builder.add_edge("__start__", "spin")
+    builder.add_edge("spin", "spin")
+    graph = builder.compile()
+
+    with pytest.raises(RecursionLimitExceeded):
+        graph.invoke({"job_id": "spinning"}, config={"recursion_limit": 3})
+
+
 def test_a_cooperating_model_needs_less_than_its_budget():
     """One tool round finishes the fixture, so a small budget still succeeds."""
 
@@ -209,7 +267,22 @@ def test_the_byte_cap_is_enforced_with_its_own_typed_result():
     assert outcome.result.error_code == "budget_exhausted"
     assert "max_tool_bytes" in (outcome.result.message or "")
     assert outcome.charged is True, "the read happened, so it counts against the budget"
-    assert repository.get_tool_result("job-bytes", "call-bytes") is None
+    # persisted, so a retry of the same id replays this verdict instead of re-reading a
+    # source that may have changed -- the read is evidence about the source either way
+    assert repository.get_tool_result("job-bytes", "call-bytes") is not None
+    replay = dispatcher.dispatch(
+        ToolCallRequest(
+            id="call-bytes",
+            name="sample_rows",
+            arguments={"source_id": "source-orders-1", "resource_id": "orders.lines[]", "limit": 3},
+        ),
+        job_id="job-bytes",
+        tool_calls_used=1,
+    )
+    assert replay.replayed is True and replay.charged is False
+    connector = dispatcher.connector
+    assert isinstance(connector, FakeConnector)
+    assert len(connector.calls) == 1, "a capped result is not re-read"
 
 
 def test_tool_row_and_byte_caps_are_typed_results_not_crashes():

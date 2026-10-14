@@ -21,6 +21,7 @@ COST_BUDGET_EXHAUSTED = "cost_budget_exhausted"
 WALL_CLOCK_BUDGET_EXHAUSTED = "wall_clock_budget_exhausted"
 EMPTY_INVENTORY = "empty_inventory"
 CATALOGUE_NOT_FOUND = "catalogue_not_found"
+REPOSITORY_UNAVAILABLE = "repository_unavailable"
 PROMPT_RENDER_FAILED = "prompt_render_failed"
 INVALID_STATE_UPDATE = "invalid_state_update"
 

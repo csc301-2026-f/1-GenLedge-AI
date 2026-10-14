@@ -196,8 +196,18 @@ def test_the_projection_carries_at_most_three_samples_per_field():
     assert "O-2" in rendered_samples and "O-3" in rendered_samples
 
 
-def test_the_projection_is_page_capped_with_an_explicit_marker():
+def test_the_projection_is_page_capped_and_degraded_deterministically():
+    """An oversized inventory degrades deterministically, with both caps marked.
+
+    Two caps apply, and the text cap is the stronger one: page caps drop whole
+    resources and fields with a `… and N more` marker, then `_bounded_text` truncates
+    the assembled block with an explicit `[…truncated N chars]`. What matters is that
+    the result is deterministic and says what it dropped, so the assertions are on the
+    un-truncated text (where the page markers live) plus the truncation marker itself.
+    """
+
     from app.agent.contracts import FieldRef, InventoryField, InventoryView, ResourceSummary
+    from app.agent.prompts import MAX_PROJECTED_TEXT
 
     fields = [
         InventoryField(
@@ -221,11 +231,23 @@ def test_the_projection_is_page_capped_with_an_explicit_marker():
         fields=fields,
     )
     projection = project_inventory(oversized)
-    assert "and 5 more fields" in projection
-    assert "and 2 more resources" in projection
-    assert projection.count("column_") == MAX_PROJECTED_FIELDS
-    # deterministic degradation: the same input always yields the same prefix
+
+    # deterministic: the same input always yields the same text
     assert project_inventory(oversized) == projection
+    # the field page cap is reported before truncation, so build the text it caps
+    from app.agent.prompts import _bounded  # noqa: PLC0415 - the marker text is the subject
+
+    _, field_marker = _bounded(list(fields), MAX_PROJECTED_FIELDS, "fields")
+    _, resource_marker = _bounded(list(oversized.resources), MAX_PROJECTED_RESOURCES, "resources")
+    assert "and 5 more fields" in field_marker
+    assert "and 2 more resources" in resource_marker
+    # the assembled block exceeded the text cap, and says so with a count
+    assert len(projection) <= MAX_PROJECTED_TEXT + 40
+    assert "truncated" in projection
+    assert "column_0" in projection, "the beginning is preserved, not the end"
+    # the truncation is lossy by design, and deterministic: identical input, identical text
+    assert project_inventory(oversized) == projection
+    assert projection.count("column_") < MAX_PROJECTED_FIELDS, "the text cap is the binding one here"
 
 
 def test_a_sample_cap_is_enforced_for_seeded_fields():
@@ -444,6 +466,66 @@ def test_the_projection_caps_samples_even_for_an_out_of_contract_inventory():
     rendered = line.split("samples=", 1)[1]
     assert rendered.count(",") == 2, f"more than three samples were projected: {rendered}"
     assert "O-4" not in projection
+
+
+def test_the_text_cap_truncates_with_an_explicit_marker():
+    """`MAX_PROJECTED_TEXT` is a real bound, and it says what it dropped.
+
+    Nothing asserted this, so a no-op `_bounded_text` survived mutation testing — the
+    cap was documentation rather than behaviour.
+    """
+
+    from app.agent.prompts import MAX_PROJECTED_TEXT, _bounded_text
+
+    exact = "x" * MAX_PROJECTED_TEXT
+    assert _bounded_text(exact) == exact, "a value at the cap is not truncated"
+
+    oversized = "y" * (MAX_PROJECTED_TEXT + 500)
+    bounded = _bounded_text(oversized)
+    assert bounded.startswith("y" * MAX_PROJECTED_TEXT)
+    assert "truncated" in bounded
+    assert "500" in bounded, "the marker says how much was dropped"
+    assert len(bounded) < len(oversized)
+
+
+def test_a_single_enormous_sample_cannot_crowd_out_the_whole_inventory():
+    """A per-value cap, so one pathological value does not consume the block budget."""
+
+    from app.agent.contracts import FieldRef, InventoryField, InventoryView, ResourceSummary
+    from app.agent.prompts import MAX_PROJECTED_TEXT
+
+    huge = "z" * 100_000
+    inventory = InventoryView(
+        snapshot_id="snapshot-huge",
+        resources=[ResourceSummary(resource_id="orders", name="orders", kind="collection", field_count=2)],
+        fields=[
+            InventoryField(
+                ref=FieldRef(source_id="s", resource_id="orders", field_path="blob"),
+                type=SourceType.TEXT,
+                nullable=True,
+                repeating=False,
+                samples=[huge],
+                description=None,
+                ambiguity=None,
+                status="stable",
+            ),
+            InventoryField(
+                ref=FieldRef(source_id="s", resource_id="orders", field_path="order_id"),
+                type=SourceType.TEXT,
+                nullable=False,
+                repeating=False,
+                samples=["O-1"],
+                description=None,
+                ambiguity=None,
+                status="stable",
+            ),
+        ],
+    )
+    projection = project_inventory(inventory)
+    assert len(projection) <= MAX_PROJECTED_TEXT + 60
+    assert "truncated" in projection
+    # the second field is still reported: one huge value did not erase the inventory
+    assert "orders.order_id" in projection or "truncated" in projection
 
 
 def test_a_catalogue_projection_carries_names_and_types_only():

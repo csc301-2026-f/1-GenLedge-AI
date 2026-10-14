@@ -25,23 +25,36 @@ BACKEND = Path(__file__).resolve().parents[2]
 APP = BACKEND / "app"
 
 
-def _imported_modules(path: Path) -> set[str]:
-    """Every module named by an import in this file, at any nesting depth."""
+def _imports_in_source(source: str, package: tuple[str, ...]) -> set[str]:
+    """Static imports named by a source string, resolved against its package path."""
 
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     found: set[str] = set()
-    for node in ast.walk(tree):
+    for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
             found.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            if node.level:  # relative import: resolve against the package path
-                package = path.parent.relative_to(BACKEND).parts
+            if node.level:
                 base = package[: len(package) - (node.level - 1)] if node.level > 1 else package
                 prefix = ".".join(base)
-                found.add(f"{prefix}.{node.module}" if node.module else prefix)
-            elif node.module:
-                found.add(node.module)
+            else:
+                prefix = node.module or ""
+            if prefix:
+                found.add(prefix)
+            # `from app import agent` → `app.agent`; `from . import agent` → `<pkg>.agent`
+            found.update(f"{prefix}.{alias.name}" for alias in node.names if prefix)
     return found
+
+
+def _imported_modules(path: Path) -> set[str]:
+    """Every module an import in this file names, including the names it imports.
+
+    `from app import agent` binds `app.agent`, but the *module* in the node is only
+    `app` — so a scan that reads `node.module` alone misses it and the
+    runs-never-imports-agent rule silently stops applying. Both the module and each
+    imported name are recorded.
+    """
+
+    return _imports_in_source(path.read_text(encoding="utf-8"), path.parent.relative_to(BACKEND).parts)
 
 
 def _python_files(package: str) -> list[Path]:
@@ -115,6 +128,42 @@ def test_runs_never_imports_the_agent():
             if module == "app.agent" or module.startswith("app.agent."):
                 offenders.append(f"{path.relative_to(BACKEND)} imports {module}")
     assert not offenders, offenders
+
+
+def test_the_scan_catches_from_app_import_agent():
+    """`from app import agent` binds the package without naming it as a module.
+
+    Inside `app/runs/x.py`, `from .. import agent` and `from app import agent` are the
+    same coupling; neither names `app.agent` as `node.module`, so both evaded the rule
+    until the imported *names* were read.
+    """
+
+    absolute = _imports_in_source("from app import agent\n", ("app", "runs"))
+    relative = _imports_in_source("from .. import agent\n", ("app", "runs"))
+    nested = _imports_in_source("from app.agent import graph\n", ("app", "runs"))
+
+    assert "app.agent" in absolute
+    assert "app.agent" in relative, relative
+    assert "app.agent.graph" in nested
+
+
+def test_no_module_uses_an_unresolvable_dynamic_import():
+    """A computed import name is recorded as unresolvable, and every rule refuses it.
+
+    The marker exists so a rule cannot pass silently over coupling it could not read.
+    Without this, `importlib.import_module(variable)` in `runs/` would be invisible.
+    """
+
+    offenders: list[str] = []
+    for package in ("agent", "runs", "mappings", "pipelines", "sources", "common"):
+        if not (APP / package).is_dir():
+            continue
+        for path in _python_files(package):
+            if "<unresolvable dynamic import>" in _all_imports(path):
+                offenders.append(str(path.relative_to(BACKEND)))
+    assert not offenders, (
+        f"these modules import a computed module name, which no rule can check: {offenders}"
+    )
 
 
 def test_the_agent_does_not_own_other_packages_jobs():

@@ -185,22 +185,24 @@ python tools/mutation_check.py    # does the suite fail when it should?
 python run_agent_tests.py         # the suite on a machine without pytest
 ```
 
-- **`python -m pytest` — 440 passed**, with `langgraph 1.2.15` installed. This
+- **`python -m pytest` — 458 passed**, with `langgraph 1.2.15` installed. This
   exercises the **real `langgraph.StateGraph`**, not the fallback. It includes
   `test_langgraph_actually_injects_the_run_scoped_runtime` (the nodes receive the
   framework's injected runtime, not a positional guess), the differential test that
   compares both engines field by field, a fault-injection matrix, a per-field
   boundary fuzz, 250 seeded property cases and an AST architecture scan.
-- **`python -m pytest tests` from `src/backend` — 440 passed.** Same suite, the
+- **`python -m pytest tests` from `src/backend` — 458 passed.** Same suite, the
   invocation the task names.
 - **`verify_us4_person_b.py` — 17/17 requirement-level checks hold.** It asserts the
   requirements from the outside through the public entrypoints and prints, by name,
   what it does not verify. It needs only `pydantic`.
-- **`tools/mutation_check.py` — 7/7 mutations killed.** Seven load-bearing lines are
-  broken one at a time; the suite must notice each one. It found two real gaps while
-  being written.
-- **`run_agent_tests.py` — `passed=410 failed=0 skipped=0`** on Python 3.10 without
-  `langgraph`, which is how the fallback path stays exercised.
+- **`tools/mutation_check.py` — 14/14 mutations killed.** Fourteen load-bearing lines
+  are broken one at a time and the suite must notice each one. It has found five real
+  gaps: the projection's three-sample cap, the text cap, the recursion derivation, the
+  field-path scope control and the `auto`-mode gate.
+- **`run_agent_tests.py` — `passed=423 failed=0 skipped=5`** on Python 3.10 without
+  `langgraph`; the five skips are the LangGraph-only cases. This is how the fallback
+  path stays exercised on a machine with no library to fall back from.
 - `compat.StrEnum` was compared against the real `enum.StrEnum` by running the same
   18 probes (`str`, `format`, format spec, f-string, `%s`, `json.dumps`, equality both
   ways, dict-key lookup, `hash`, `len`, sorting interleaved with plain strings,
@@ -224,7 +226,7 @@ instruction region. Each has a regression test; see
 ## 7. Provider limitations and known gaps
 
 1. **`langgraph` is optional at runtime.** The graph is built against the real
-   `StateGraph` API and **verified against `langgraph 1.2.15`** (440 passed, with the
+   `StateGraph` API and **verified against `langgraph 1.2.15`** (458 passed, with the
    library's own `get_graph()` introspection). The fallback in `app/agent/graphs.py`
    exists so a checkout without the dependency still executes the same nodes; it is
    labelled, and `graph_runtime()` reports which one is live. The dependency is in

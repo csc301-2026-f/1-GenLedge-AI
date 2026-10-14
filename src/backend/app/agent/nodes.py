@@ -17,6 +17,7 @@ Node mechanics that are load-bearing rather than incidental:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -30,7 +31,9 @@ from app.agent.errors import (
     EMPTY_INVENTORY,
     MODEL_CALL_BUDGET_EXHAUSTED,
     MODEL_CONFIGURATION_ERROR,
+    MODEL_UNAVAILABLE,
     PROMPT_RENDER_FAILED,
+    REPOSITORY_UNAVAILABLE,
     TOKEN_BUDGET_EXHAUSTED,
     TOOL_BUDGET_EXHAUSTED,
     WALL_CLOCK_BUDGET_EXHAUSTED,
@@ -52,6 +55,8 @@ TOOL_CALL = "tool_call"
 AWAITING_REVIEW = "awaiting_review"
 
 NODE_NAMES: tuple[str, ...] = (CONTEXT, PROPOSE, TOOL_CALL)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -104,11 +109,23 @@ def context_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, 
             AgentFailure(EMPTY_INVENTORY, "the job names no source snapshot", retryable=False)
         )
 
-    inventory: InventoryView | None = None
-    for snapshot_id in snapshot_ids:
-        inventory = runtime.repository.get_inventory(snapshot_id)
-        if inventory is not None:
-            break
+    # A repository fault is a typed failure, not an escaping exception: master §9.1
+    # row 20 wants "node fails; job failed" for a persistence outage, and a traceback
+    # out of `run_routing_job` is not that.
+    try:
+        inventory: InventoryView | None = None
+        for snapshot_id in snapshot_ids:
+            inventory = runtime.repository.get_inventory(snapshot_id)
+            if inventory is not None:
+                break
+    except Exception as error:  # noqa: BLE001 - a store fault is data, not a crash
+        return _failure_update(
+            AgentFailure(
+                REPOSITORY_UNAVAILABLE,
+                f"the inventory could not be read: {type(error).__name__}: {error}",
+                retryable=True,
+            )
+        )
     if inventory is None:
         return _failure_update(
             AgentFailure(EMPTY_INVENTORY, "the frozen snapshot has no inventory", retryable=False)
@@ -126,7 +143,16 @@ def context_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, 
     # reviewer who asked for reuse must not be handed a cold-start proposal with no
     # signal that AC3's semantics flipped.
     requested_catalogue = state.get("catalogue_ref")
-    catalogue = runtime.repository.get_catalogue(requested_catalogue)
+    try:
+        catalogue = runtime.repository.get_catalogue(requested_catalogue)
+    except Exception as error:  # noqa: BLE001 - a store fault is data, not a crash
+        return _failure_update(
+            AgentFailure(
+                REPOSITORY_UNAVAILABLE,
+                f"the catalogue could not be read: {type(error).__name__}: {error}",
+                retryable=True,
+            )
+        )
     if requested_catalogue and catalogue is None:
         return _failure_update(
             AgentFailure(
@@ -274,9 +300,32 @@ def propose_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, 
         tools=tool_schemas(),
         results=tuple(runtime.tool_results),
     )
-    response = model.invoke(request)
+    # An adapter that raises is a typed failure, not an escaping exception. `LiveModel`
+    # returns typed error codes rather than raising, but a `ModelClient` is an
+    # interface: a second implementation, or a bug in the first, must not take the job
+    # down with a traceback (master §9.1 rows 4–7).
+    try:
+        response = model.invoke(request)
+    except Exception as error:  # noqa: BLE001 - an adapter fault is data, not a crash
+        failure = AgentFailure(
+            MODEL_UNAVAILABLE,
+            f"the model adapter raised {type(error).__name__}: {error}",
+            retryable=True,
+        )
+        update = _failure_update(failure)
+        update.update(
+            {
+                "model_calls_used": _budget_counter(state, runtime) + 1,
+                "messages": _messages(rendered, ModelResponse(error_code=failure.code)),
+                "prompt_ref": rendered.ref,
+            }
+        )
+        return update
     runtime.responses.append(response)
-    runtime.repository.record_model_call(state.get("job_id", ""), node=PROPOSE, tokens=response.tokens)
+    try:
+        runtime.repository.record_model_call(state.get("job_id", ""), node=PROPOSE, tokens=response.tokens)
+    except Exception as error:  # noqa: BLE001 - the call happened; the record is best effort
+        logger.warning("could not record the model call for %s: %s", state.get("job_id"), error)
     calls_used = _budget_counter(state, runtime)
     tokens_used = state.get("tokens_used", 0) + response.tokens
 
@@ -414,9 +463,16 @@ def _attempt_repair(
         repair=True,
         results=tuple(runtime.tool_results),
     )
-    response = model.invoke(request)
+    try:
+        response = model.invoke(request)
+    except Exception as error:  # noqa: BLE001 - an adapter fault is data, not a crash
+        logger.warning("the repair call for %s raised: %s", state.get("job_id"), error)
+        return None, 0, False
     runtime.responses.append(response)
-    runtime.repository.record_model_call(state.get("job_id", ""), node=PROPOSE, tokens=response.tokens)
+    try:
+        runtime.repository.record_model_call(state.get("job_id", ""), node=PROPOSE, tokens=response.tokens)
+    except Exception as error:  # noqa: BLE001 - the call happened; the record is best effort
+        logger.warning("could not record the repair call for %s: %s", state.get("job_id"), error)
     runtime.repairs_used += 1
     if response.error_code or response.tool_calls:
         return None, response.tokens, True
