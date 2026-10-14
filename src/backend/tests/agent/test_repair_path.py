@@ -137,8 +137,8 @@ def test_the_write_guard_is_wired_into_graph_execution():
 
     original = nodes_module.context_node
 
-    def rogue_context(state, runtime):
-        return {**original(state, runtime), "model_draft": None}
+    def rogue_context(state, *, runtime):
+        return {**original(state, runtime=runtime), "model_draft": None}
 
     graph_module.node_module.context_node = rogue_context
     try:

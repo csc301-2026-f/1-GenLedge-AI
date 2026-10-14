@@ -32,6 +32,7 @@ __all__ = [
     "RecursionLimitExceeded",
     "graph_runtime",
     "guarded",
+    "runtime_for",
 ]
 
 START = "__start__"
@@ -42,6 +43,7 @@ try:  # pragma: no cover - exercised by whichever branch the environment takes
     from langgraph.graph import END as _LG_END
     from langgraph.graph import START as _LG_START
     from langgraph.graph import StateGraph as _LGStateGraph
+    from langgraph.runtime import Runtime as _LGRuntime
 
     GRAPH_RUNTIME_AVAILABLE = True
     START = _LG_START
@@ -50,6 +52,29 @@ try:  # pragma: no cover - exercised by whichever branch the environment takes
 except ImportError:  # pragma: no cover
     GRAPH_RUNTIME_AVAILABLE = False
     StateGraph = None
+    _LGRuntime = None
+
+
+class _SimpleRuntime:
+    """A stand-in for LangGraph's `Runtime` carrying only the run-scoped payload."""
+
+    __slots__ = ("context",)
+
+    def __init__(self, context: Any) -> None:
+        self.context = context
+
+
+def runtime_for(context: Any) -> Any:
+    """Wrap a run-scoped payload the way the active runtime delivers it.
+
+    LangGraph hands nodes a `Runtime` whose `.context` is the object passed to
+    `invoke(context=...)`; the local runner delivers the payload directly. `guarded`
+    unwraps `.context` when it is present, so both reach the node identically.
+    """
+
+    if _LGRuntime is not None:
+        return _LGRuntime(context=context)
+    return _SimpleRuntime(context)
 
 
 def graph_runtime() -> str:
@@ -74,17 +99,27 @@ class RecursionLimitExceeded(RuntimeError):
 
 
 def guarded(node_name: str, action: Callable[..., Any]) -> Callable[..., Any]:
-    """Wrap a node so its partial update is checked against its declared writes.
+    """Adapt a node to the graph runtime and check its partial update.
 
-    Boundary 5 of `plans/LANGGRAPH_HARNESS_PLAN.md` §5.4: a node returning a key it
-    does not own is `invalid_state_update`, not a silent merge. The check runs here,
-    in the one place every runtime goes through, so a decorator cannot be forgotten.
+    Three jobs, because this is the one place every runtime goes through:
+
+    * **Injection.** LangGraph injects a parameter **named** `runtime` as a keyword,
+      and only if it can see that parameter in the callable's signature. Wrapping a
+      node in `*args, **kwargs` therefore silently breaks the injection — the node
+      runs without a runtime at all. This wrapper declares `runtime` itself so the
+      library finds it, and hands the wrapped node the run-scoped payload it expects
+      (`runtime.context`), not the framework object.
+    * **Boundary 5.** A node returning a key it does not own is `invalid_state_update`
+      (`plans/LANGGRAPH_HARNESS_PLAN.md` §5.4), not a silent merge.
+    * **Runtime portability.** `LocalGraphRunner` calls the same wrapper and passes a
+      plain payload, so a node cannot work on one runtime and break on the other.
     """
 
     from app.agent.state import validate_node_update  # noqa: PLC0415 - avoids a cycle at import
 
-    def wrapped(state: dict[str, Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
-        update = action(state, *args, **kwargs)
+    def wrapped(state: dict[str, Any], runtime: Any = None) -> dict[str, Any]:
+        payload = getattr(runtime, "context", runtime)
+        update = action(state, runtime=payload)
         if update:
             validate_node_update(node_name, dict(update))
         return update
@@ -168,7 +203,8 @@ class LocalGraphRunner:
             action = self.builder._nodes[node]
             parameters = inspect.signature(action).parameters
             if len(parameters) >= 2:
-                update = action(current, context)
+                # The runtime travels as a keyword, exactly as LangGraph delivers it.
+                update = action(current, runtime=runtime_for(context))
             else:
                 update = action(current)
             if update:

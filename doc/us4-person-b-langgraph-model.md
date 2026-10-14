@@ -173,53 +173,52 @@ Written for this slice, under `tests/agent/`:
 | `test_adapters_and_modes.py` | `auto`/`live`/`fake` resolution; startup banner has no secret; both adapters satisfy one contract and both end with a schema-valid draft |
 | `test_prompt_safety.py` | sentinel values, whole rows, descriptions, sample and row caps at any depth, page caps, untrusted-block containment, block-splice protection, typed tool errors reaching the prompt, prompt digests |
 | `test_compat.py` | the `StrEnum` fallback matches the standard library's `str`, `format`, f-string, JSON and ordering behaviour |
-### Verification performed on the development machine
+### Verification performed
 
-Two scripts are checked in so this is reproducible rather than a claim:
+Three commands, all checked in:
 
 ```text
+python -m pytest            # from the repo root; pytest.ini sets testpaths
+python -m pytest tests      # from src/backend; the documented command
 python verify_us4_person_b.py     # requirement-level, independent of the suite
-python run_agent_tests.py         # the tests/agent suite, when pytest is unavailable
-python -m pytest tests            # the authoritative command, on a complete install
+python run_agent_tests.py         # the suite on a machine without pytest
 ```
 
+- **`python -m pytest` — 137 passed**, with `langgraph 1.2.15` installed. This
+  exercises the **real `langgraph.StateGraph`**, not the fallback, including the two
+  structural introspection cases that skip when the library is absent. It also
+  includes `test_langgraph_actually_injects_the_run_scoped_runtime`, which asserts
+  the nodes receive the framework's injected runtime rather than a positional guess.
+- **`python -m pytest tests` from `src/backend` — 137 passed.** Same suite, the
+  invocation the task names.
 - **`verify_us4_person_b.py` — 17/17 requirement-level checks hold.** It asserts the
-  task's requirements from the outside through the public entrypoints (graph shape,
-  one tool call on `orders.lines[]`, one repair then `invalid_model_output`, tool and
-  model budget exhaustion, replay without a second connector call, mode resolution,
-  the secret-free banner, the sentinel boundary, the sample cap, block-splice
-  protection, typed tool errors reaching the prompt, and the "do not implement" list).
-  It needs only `pydantic`. Its final block prints, by name, the four things it does
-  **not** verify.
-- **`run_agent_tests.py` — `passed=104 failed=0 skipped=2`.** It runs the real test
-  bodies unmodified through a minimal pytest-compatible shim. The two skips are the
-  LangGraph-introspection cases; the harness prints them rather than hiding them.
-  It is a development aid: **`python -m pytest tests` remains the authoritative
-  command** and should be used wherever it runs.
-- `python -m mypy --check-untyped-defs app/agent tests/agent` — clean.
+  requirements from the outside through the public entrypoints and prints, by name,
+  what it does not verify. It needs only `pydantic`.
+- **`run_agent_tests.py` — `passed=104 failed=0 skipped=3`** on Python 3.10 without
+  `langgraph` (the three skips are the LangGraph-only cases). This is how the
+  fallback path stays exercised.
 - `compat.StrEnum` was compared against the real `enum.StrEnum` by running the same
   18 probes (`str`, `format`, format spec, f-string, `%s`, `json.dumps`, equality both
   ways, dict-key lookup, `hash`, `len`, sorting interleaved with plain strings,
   string methods, `in`, `repr`) under Python 3.13 (stdlib) and Python 3.10 (the
   fallback): **identical output on every probe**.
+- `python -m mypy --check-untyped-defs app/agent tests/agent` — clean.
 
-**What is still not verified:** `python -m pytest tests` cannot run here at all —
-there is no network access, and neither the 3.13 interpreter nor any reachable image
-has `pydantic`, `flask` or `langgraph`. Every suite in the repository (`test_app.py`,
-`test_auth.py`, `test_api_schemas.py`, `test_contracts.py`) fails at collection for
-that pre-existing reason. That is a reported limitation, not a met gate.
+**A defect this caught.** The first run against the real library failed every
+end-to-end case: LangGraph injects a parameter *named* `runtime` as a keyword, and
+only when it is visible in the callable's signature. The node-write guard had been
+wrapping each node in `*args, **kwargs`, which hid the parameter — so every node ran
+with no runtime at all. `guarded` now declares `runtime` itself and unwraps
+`.context`, and `runtime_for` makes both runtimes deliver it the same way.
 
 ## 7. Provider limitations and known gaps
 
-1. **`langgraph` is not installed here.** The graph code is written once against the
-   real `StateGraph` API; `app/agent/graphs.py` falls back to a labelled local
-   runner so the nodes stay testable offline. The two assertions that inspect the
-   *compiled LangGraph* structure are skipped when the package is absent; the node
-   set and edges are asserted unconditionally against the declared shape
-   (`graph_shape()`), which is the same source `build_graph()` uses. **Installing
-   `langgraph>=1.2,<2` (added to `requirements.txt`) moves the whole suite onto that
-   path, and the node call signature has not been executed against the real library**
-   — masters §5.6a's `Runtime[JobRuntime]` convention is the thing to verify first.
+1. **`langgraph` is optional at runtime.** The graph is built against the real
+   `StateGraph` API and **verified against `langgraph 1.2.15`** (137 passed, with the
+   library's own `get_graph()` introspection). The fallback in `app/agent/graphs.py`
+   exists so a checkout without the dependency still executes the same nodes; it is
+   labelled, and `graph_runtime()` reports which one is live. The dependency is in
+   `requirements.txt`.
 2. **The live adapter is exercised against an SDK stub, not a real provider.** The
    stub asserts the request shape the adapter builds (`system`, `messages`, bound
    tools with `tool_choice: auto`, native `output_format` JSON schema), but whether

@@ -75,24 +75,29 @@ Pass criteria and their outcomes:
 
 ### Verification results recorded
 
-Three commands, all checked in so the result is reproducible:
+Three commands, all checked in and all green:
 
 ```text
+python -m pytest                  # from the repo root (pytest.ini sets testpaths)
+python -m pytest tests            # from src/backend, the documented invocation
 python verify_us4_person_b.py     # 17/17 requirement-level checks hold
-python run_agent_tests.py         # passed=104 failed=0 skipped=2
-python -m pytest tests            # the authoritative command, on a complete install
+python run_agent_tests.py         # passed=104 failed=0 skipped=3 (no langgraph present)
 python -m mypy --check-untyped-defs app/agent tests/agent   # clean
 ```
 
-- **`verify_us4_person_b.py`** asserts the task's requirements from the outside
-  through the public entrypoints, independently of the suite, and ends by naming the
-  four things it does **not** verify. It needs only `pydantic`.
-- **`run_agent_tests.py`** runs the real test bodies through a minimal
-  pytest-compatible shim for machines that cannot install pytest. The two skips are
-  the LangGraph-introspection cases, and it prints them.
-- **`python -m pytest tests` cannot run here**: no network access, and no reachable
-  interpreter has `pydantic`, `flask` or `langgraph`. Every suite in the repository
-  fails at collection for that pre-existing reason, not because of this change.
+- **137 passed** with `langgraph 1.2.15` installed, from both the repository root and
+  `src/backend`. This is the real `langgraph.StateGraph`, including the library's own
+  `get_graph()` introspection and an assertion that the framework's injected runtime
+  actually reaches the nodes.
+- **104 passed, 3 skipped** on Python 3.10 with no `langgraph`, which is how the
+  labelled fallback path stays exercised.
+- `verify_us4_person_b.py` asserts the requirements from the outside through the
+  public entrypoints and names, at the end, what it cannot verify.
+
+**Defect the real-library run caught:** LangGraph injects a parameter *named*
+`runtime` as a keyword, and only when it is visible in the callable's signature. The
+node-write guard wrapped each node in `*args, **kwargs`, hiding it — so every node ran
+with no runtime. Fixed in `guarded`/`runtime_for`.
 
 A GLM 5.3 review of the first commit found one blocker (source data containing
 `{{...}}` could escape the renderer) and several majors; all are fixed and each has a

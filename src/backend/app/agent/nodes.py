@@ -94,7 +94,7 @@ def _budget_counter(state: RoutingJobState, runtime: GraphRuntime) -> int:
 # --- context -------------------------------------------------------------------
 
 
-def context_node(state: RoutingJobState, runtime: GraphRuntime) -> dict[str, Any]:
+def context_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, Any]:
     """Load the frozen inventory and the optional catalogue. No model call."""
 
     budgets = state["budgets"]
@@ -226,7 +226,7 @@ def _estimated_cost_usd(state: RoutingJobState, runtime: GraphRuntime) -> float 
     return (state.get("tokens_used", 0) / 1000.0) * price
 
 
-def propose_node(state: RoutingJobState, runtime: GraphRuntime) -> dict[str, Any]:
+def propose_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, Any]:
     """One structured model call per invocation, with one repair attempt."""
 
     budgets = state["budgets"]
@@ -440,7 +440,7 @@ def _messages(rendered: prompt_module.RenderedPrompt, response: ModelResponse) -
 # --- tool_call -----------------------------------------------------------------
 
 
-def tool_call_node(state: RoutingJobState, runtime: GraphRuntime) -> dict[str, Any]:
+def tool_call_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, Any]:
     """Authorize, budget, replay, dispatch, redact and persist each pending call."""
 
     dispatcher = runtime.dispatcher

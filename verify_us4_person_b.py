@@ -428,26 +428,43 @@ def _scope():
     )
 
 
-# --- the one requirement that cannot be checked here ----------------------------
+# --- what this script cannot check, reported honestly ---------------------------
 
-UNVERIFIED = [
-    (
-        "python -m pytest tests runs green",
-        "pydantic / flask / langgraph cannot be installed: this machine has no network access",
-    ),
-    (
-        "the graph runs on the real langgraph.StateGraph",
-        "langgraph is not installed; a labelled local runner stands in (see graph_runtime())",
-    ),
-    (
-        "the live adapter works against a real provider",
-        "no API key and no network; the request shape is asserted against an SDK stub only",
-    ),
-    (
-        "a job resumes from a checkpoint",
-        "no checkpointer: that half of the harness gate needs Person A's persistence",
-    ),
-]
+
+def _unverified() -> list[tuple[str, str]]:
+    from app.agent.graphs import GRAPH_RUNTIME_AVAILABLE, graph_runtime
+
+    items: list[tuple[str, str]] = []
+    if GRAPH_RUNTIME_AVAILABLE:
+        items.append(
+            (
+                "the graph was only exercised on one runtime",
+                "langgraph is importable AND the local fallback exists; run on a "
+                "checkout without langgraph to exercise the fallback",
+            )
+        )
+    else:
+        items.append(
+            (
+                "the graph does not run on the real langgraph.StateGraph",
+                f"langgraph is not installed; `graph_runtime()` reports {graph_runtime()!r}. "
+                "Install it and re-run: the node signature convention it injects "
+                "(`runtime` by keyword) is then enforced by the suite",
+            )
+        )
+    items.append(
+        (
+            "the live adapter has not talked to a real provider",
+            "no API key and no network; the request shape is asserted against an SDK stub only",
+        )
+    )
+    items.append(
+        (
+            "a job does not resume from a checkpoint",
+            "no checkpointer: that half of the harness gate needs Person A's persistence",
+        )
+    )
+    return items
 
 
 def main() -> int:
@@ -463,7 +480,7 @@ def main() -> int:
     print(f"{len(RESULTS) - failed}/{len(RESULTS)} checkable requirements hold")
     print()
     print("NOT verified by this script (stated plainly):")
-    for requirement, why in UNVERIFIED:
+    for requirement, why in _unverified():
         print(f"  - {requirement}\n      {why}")
     return 1 if failed else 0
 

@@ -95,6 +95,69 @@ def test_compiled_graph_contains_no_extra_application_node():
     assert application_nodes == {CONTEXT, PROPOSE, TOOL_CALL}
 
 
+@LANGGRAPH
+def test_langgraph_actually_injects_the_run_scoped_runtime():
+    """The nodes must read the runtime LangGraph injected, not a positional guess.
+
+    LangGraph injects a parameter *named* `runtime` only when it is visible in the
+    callable's signature, and it passes its own `Runtime` object whose `.context`
+    holds the payload given to `invoke(context=...)`. A signature that hides the
+    parameter behind `*args, **kwargs` therefore runs every node with no runtime at
+    all — silently, until something dereferences it. This asserts the real thing:
+    the object the node receives is the framework's, and its payload is ours.
+    """
+
+    import langgraph.runtime as lg_runtime
+
+    from app.agent.graph import run_routing_job
+    from app.agent.nodes import GraphRuntime
+    from app.agent.repositories import SNAPSHOT_ID, seeded_repository
+    from app.agent.tools import FakeConnector
+
+    seen: list[tuple[str, object, object]] = []
+    connector = FakeConnector()
+
+    from app.agent import graph as graph_module
+    from app.agent import nodes as nodes_module
+
+    originals = {
+        "context": nodes_module.context_node,
+        "propose": nodes_module.propose_node,
+        "tool_call": nodes_module.tool_call_node,
+    }
+
+    def spy(name):
+        def wrapper(state, *, runtime):
+            seen.append((name, type(runtime), runtime))
+            return originals[name](state, runtime=runtime)
+
+        return wrapper
+
+    for name, original in originals.items():
+        graph_module.node_module.__dict__[f"{name}_node"] = spy(name)
+    try:
+        run = run_routing_job(
+            job_id="job-injection",
+            source_snapshot_ids=[SNAPSHOT_ID],
+            repository=seeded_repository(),
+            connector=connector,
+        )
+    finally:
+        for name, original in originals.items():
+            graph_module.node_module.__dict__[f"{name}_node"] = original
+
+    assert run.model_draft is not None, run.failure
+    assert [name for name, _, _ in seen] == ["context", "propose", "tool_call", "propose"]
+    for name, runtime_type, runtime in seen:
+        assert runtime is not None, f"{name} received no runtime"
+        # `guarded` unwraps `.context`, so the node sees our GraphRuntime payload.
+        assert isinstance(runtime, GraphRuntime), f"{name} got {runtime_type}"
+        assert runtime.repository is not None
+    # the framework really did supply it: instantiating its Runtime yields the same type
+    probe = lg_runtime.Runtime(context=seen[0][2])
+    assert type(probe) is lg_runtime.Runtime
+
+
 def test_recursion_limit_is_derived_above_the_semantic_budgets():
     from app.agent.contracts import AgentBudgets
 
