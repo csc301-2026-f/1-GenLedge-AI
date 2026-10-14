@@ -398,6 +398,45 @@ def test_a_tool_error_reaches_the_next_propose_prompt_end_to_end():
     assert run.final_state["tool_results"][0].status == "error"
 
 
+def test_the_projection_caps_samples_even_for_an_out_of_contract_inventory():
+    """Defence in depth: the cap must hold for an inventory the contract would reject.
+
+    `InventoryField.samples` is `max_length=3`, so the projection's own `[:3]` is
+    normally unreachable — removing it changes nothing while every producer validates.
+    But the projection is the security boundary, and it should not depend on an
+    upstream validator having run: a row read straight from a database, a cached
+    artefact, or a differently-versioned loader can carry more. `model_construct`
+    builds exactly that, bypassing validation, and asserts the boundary still holds.
+    """
+
+    baseline = seeded_repository().get_inventory(SNAPSHOT_ID)
+    assert baseline is not None
+    first = baseline.fields[0]
+    smuggled = InventoryField.model_construct(
+        ref=first.ref,
+        type=first.type,
+        nullable=first.nullable,
+        repeating=first.repeating,
+        samples=[f"O-{index}" for index in range(1, 10)],
+        description=None,
+        ambiguity=None,
+        status=first.status,
+        native_type=None,
+    )
+    poisoned = InventoryView.model_construct(
+        snapshot_id=baseline.snapshot_id,
+        resources=list(baseline.resources),
+        fields=[smuggled, *list(baseline.fields[1:])],
+    )
+    assert len(poisoned.fields[0].samples) == 9, "the fixture really is out of contract"
+
+    projection = project_inventory(poisoned)
+    line = next(item for item in projection.splitlines() if "orders.order_id" in item)
+    rendered = line.split("samples=", 1)[1]
+    assert rendered.count(",") == 2, f"more than three samples were projected: {rendered}"
+    assert "O-4" not in projection
+
+
 def test_a_catalogue_projection_carries_names_and_types_only():
     catalogue = CatalogueView(
         catalog_ref="catalog-1",

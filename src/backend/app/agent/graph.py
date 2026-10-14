@@ -23,8 +23,9 @@ from app.agent.contracts import AgentBudgets, FailureInfo, InventoryView, ModelD
 from app.agent.errors import ModelConfigurationError
 from app.agent.graphs import (
     END,
-    START,
     GRAPH_RUNTIME_AVAILABLE,
+    RUNTIME_LANGGRAPH,
+    START,
     LocalStateGraph,
     RecursionLimitExceeded,
     StateGraph,
@@ -96,14 +97,17 @@ def graph_shape() -> GraphShape:
     )
 
 
-def build_graph() -> Any:
-    """Build and compile the three-node graph against whichever runtime is present.
+def build_graph(runtime: str | None = None) -> Any:
+    """Build and compile the three-node graph against the selected runtime.
 
-    Each node is wrapped by `graphs.guarded`, so a node that returns a state key it
-    does not declare fails as a state-guard error rather than merging silently.
+    `runtime` (or `GENLEDGE_GRAPH_RUNTIME`) picks `langgraph` or the labelled
+    `local-fallback`; `auto` prefers LangGraph when it is importable. Each node is
+    wrapped by `graphs.guarded`, so a node that returns a state key it does not
+    declare fails as a state-guard error rather than merging silently.
     """
 
-    builder = StateGraph(RoutingJobState) if GRAPH_RUNTIME_AVAILABLE else LocalStateGraph(RoutingJobState)
+    selected = graph_runtime(runtime)
+    builder = StateGraph(RoutingJobState) if selected == RUNTIME_LANGGRAPH else LocalStateGraph(RoutingJobState)
     builder.add_node(CONTEXT, guarded(CONTEXT, node_module.context_node))
     builder.add_node(PROPOSE, guarded(PROPOSE, node_module.propose_node))
     builder.add_node(TOOL_CALL, guarded(TOOL_CALL, node_module.tool_call_node))
@@ -139,6 +143,7 @@ def run_routing_job(
     mode: ResolvedModelMode | None = None,
     env: Mapping[str, str] | None = None,
     cost_per_1k_tokens_usd: float | None = None,
+    runtime: str | None = None,  # `langgraph` | `local-fallback` | `auto`
 ) -> RoutingRunResult:
     """Run one routing job end to end and return the terminal state.
 
@@ -146,7 +151,8 @@ def run_routing_job(
     which is what keeps a mid-job configuration change from extending a loop.
     `cost_per_1k_tokens_usd` is the price table `AgentBudgets.max_cost_usd` is
     evaluated against; with no price the ceiling is reported as unevaluable rather
-    than guessed.
+    than guessed. `runtime` selects the graph engine, so the same job can be run on
+    both and compared.
     """
 
     frozen_budgets = budgets or AgentBudgets()
@@ -161,7 +167,7 @@ def run_routing_job(
             break
     catalogue = repository.get_catalogue(catalogue_ref)
 
-    runtime = GraphRuntime(
+    job_runtime = GraphRuntime(
         repository=repository,
         connector=connector or FakeConnector(),
         inventory=inventory,
@@ -169,9 +175,9 @@ def run_routing_job(
         cost_per_1k_tokens_usd=cost_per_1k_tokens_usd,
     )
     if model is not None:
-        runtime.model = model
+        job_runtime.model = model
     elif inventory is not None and inventory.fields:
-        runtime.model = build_model_client(resolved, inventory=inventory, catalogue=catalogue, env=env)
+        job_runtime.model = build_model_client(resolved, inventory=inventory, catalogue=catalogue, env=env)
 
     job_state = initial_state(
         job_id=job_id,
@@ -181,18 +187,18 @@ def run_routing_job(
         catalogue_ref=catalogue_ref,
     )
     repository.create_job(job_id, source_snapshot_ids=list(source_snapshot_ids), catalogue_ref=catalogue_ref)
-    graph = build_graph()
-    final = _run_graph(graph, job_state, runtime, frozen_budgets)
+    graph = build_graph(runtime)
+    final = _run_graph(graph, job_state, job_runtime, frozen_budgets)
 
     failure = final.get("failure")
     return RoutingRunResult(
         final_state=final,
-        runtime=runtime,
+        runtime=job_runtime,
         mode=resolved,
         model_draft=final.get("model_draft"),
         failure=failure,
         status=str(final.get("status") or _terminal_status(failure)),
-        model_responses=list(runtime.responses),
+        model_responses=list(job_runtime.responses),
     )
 
 

@@ -20,18 +20,25 @@ counts supersteps.
 from __future__ import annotations
 
 import inspect
+import os
 import typing
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 __all__ = [
     "END",
     "GRAPH_RUNTIME_AVAILABLE",
+    "GRAPH_RUNTIME_ENV",
+    "RUNTIME_AUTO",
+    "RUNTIME_LANGGRAPH",
+    "RUNTIME_LOCAL",
     "START",
+    "VALID_RUNTIMES",
     "LocalGraphRunner",
     "LocalStateGraph",
     "RecursionLimitExceeded",
     "graph_runtime",
     "guarded",
+    "resolve_graph_runtime",
     "runtime_for",
 ]
 
@@ -79,10 +86,40 @@ def runtime_for(context: Any) -> Any:
     return _SimpleRuntime(context)
 
 
-def graph_runtime() -> str:
+#: Selects the runtime `build_graph()` compiles against. `auto` prefers LangGraph
+#: when it is importable. Setting `GENLEDGE_GRAPH_RUNTIME=local-fallback` runs the
+#: **same suite** through the fallback on a machine that has LangGraph installed, and
+#: setting it to `langgraph` refuses to fall back. Both exist so the two runtimes can
+#: be compared on equal terms instead of one of them only ever running on whichever
+#: machine happens to lack the dependency.
+GRAPH_RUNTIME_ENV = "GENLEDGE_GRAPH_RUNTIME"
+RUNTIME_AUTO = "auto"
+RUNTIME_LANGGRAPH = "langgraph"
+RUNTIME_LOCAL = "local-fallback"
+VALID_RUNTIMES = (RUNTIME_AUTO, RUNTIME_LANGGRAPH, RUNTIME_LOCAL)
+
+
+def resolve_graph_runtime(requested: str | None = None, *, env: Mapping[str, str] | None = None) -> str:
+    """Resolve which runtime the graph will be built against."""
+
+    source = os.environ if env is None else env
+    raw = (requested if requested is not None else source.get(GRAPH_RUNTIME_ENV, RUNTIME_AUTO)) or RUNTIME_AUTO
+    choice = raw.strip().lower()
+    if choice not in VALID_RUNTIMES:
+        raise ValueError(
+            f"{GRAPH_RUNTIME_ENV}={raw!r} is not one of {', '.join(VALID_RUNTIMES)}"
+        )
+    if choice == RUNTIME_LANGGRAPH and not GRAPH_RUNTIME_AVAILABLE:
+        raise ValueError("langgraph was requested but is not importable")
+    if choice == RUNTIME_AUTO:
+        return RUNTIME_LANGGRAPH if GRAPH_RUNTIME_AVAILABLE else RUNTIME_LOCAL
+    return choice
+
+
+def graph_runtime(requested: str | None = None, *, env: Mapping[str, str] | None = None) -> str:
     """Name the runtime in use: `langgraph` or the labelled local fallback."""
 
-    return "langgraph" if GRAPH_RUNTIME_AVAILABLE else "local-fallback"
+    return resolve_graph_runtime(requested, env=env)
 
 
 def _channel_reducer(annotation: Any) -> Callable[[Any, Any], Any] | None:

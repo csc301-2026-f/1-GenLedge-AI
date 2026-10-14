@@ -172,6 +172,82 @@ def test_declared_conditional_edges_cover_every_conditional_source():
     assert set(DECLARED_CONDITIONAL_EDGES[PROPOSE].values()) == {TOOL_CALL, END}
 
 
+@LANGGRAPH
+def test_both_runtimes_produce_the_same_run():
+    """Differential test: LangGraph and the fallback must agree, field by field.
+
+    This is the check a single-runtime suite cannot make. Without it the fallback is
+    only ever exercised on a machine that lacks LangGraph, so the two engines are
+    never compared — and a divergence appears as a bug in whichever engine a given
+    developer happens to have installed. Each run gets its own repository and
+    connector, so what is compared is behaviour, not shared state.
+    """
+
+    from app.agent.graph import run_routing_job
+    from app.agent.repositories import SNAPSHOT_ID, seeded_repository
+    from app.agent.tools import FakeConnector
+
+    def run_on(engine: str):
+        connector = FakeConnector()
+        return (
+            run_routing_job(
+                job_id="job-differential",
+                source_snapshot_ids=[SNAPSHOT_ID],
+                repository=seeded_repository(),
+                connector=connector,
+                runtime=engine,
+            ),
+            connector,
+        )
+
+    langgraph_run, langgraph_connector = run_on("langgraph")
+    local_run, local_connector = run_on("local-fallback")
+
+    assert langgraph_run.failure is None and local_run.failure is None
+
+    # same decisions
+    assert langgraph_run.status == local_run.status
+    assert langgraph_run.mode == local_run.mode
+    assert len(langgraph_connector.calls) == len(local_connector.calls) == 1
+    assert [call[0] for call in langgraph_connector.calls] == [call[0] for call in local_connector.calls]
+    assert [call[1] for call in langgraph_connector.calls] == [call[1] for call in local_connector.calls]
+
+    # same counters
+    for counter in ("tool_calls_used", "model_calls_used", "tokens_used", "revision_count"):
+        assert langgraph_run.final_state[counter] == local_run.final_state[counter], counter
+
+    # same tool-result refs, same inventory reference, same draft byte for byte
+    assert [ref.model_dump() for ref in langgraph_run.final_state["tool_results"]] == [
+        ref.model_dump() for ref in local_run.final_state["tool_results"]
+    ]
+    assert langgraph_run.final_state["inventory_ref"] == local_run.final_state["inventory_ref"]
+    assert langgraph_run.model_draft is not None and local_run.model_draft is not None
+    assert langgraph_run.model_draft.model_dump_json() == local_run.model_draft.model_dump_json()
+
+
+@LANGGRAPH
+def test_the_engine_is_selectable_so_both_runtimes_are_reachable():
+    """Otherwise the fallback only ever runs where LangGraph is absent."""
+
+    from app.agent.graph import build_graph
+    from app.agent.graphs import (
+        GRAPH_RUNTIME_ENV,
+        LocalGraphRunner,
+        graph_runtime,
+        resolve_graph_runtime,
+    )
+
+    assert graph_runtime("local-fallback") == "local-fallback"
+    assert graph_runtime("langgraph") == "langgraph"
+    assert graph_runtime("auto") == "langgraph"  # langgraph is importable in this run
+    assert resolve_graph_runtime(env={GRAPH_RUNTIME_ENV: "local-fallback"}) == "local-fallback"
+    with pytest.raises(ValueError, match="not one of"):
+        resolve_graph_runtime("carrier-pigeon")
+
+    assert isinstance(build_graph("local-fallback"), LocalGraphRunner)
+    assert not isinstance(build_graph("langgraph"), LocalGraphRunner)
+
+
 def test_the_router_ignores_adversarial_text_in_a_draft():
     """No predicate reads a model-authored string, so injection cannot route."""
 
