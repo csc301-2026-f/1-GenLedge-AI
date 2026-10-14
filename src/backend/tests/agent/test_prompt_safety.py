@@ -370,7 +370,7 @@ def test_a_tool_error_reaches_the_next_propose_prompt_end_to_end():
     from app.agent.models import ModelResponse
     from app.agent.tools import ConnectorError
 
-    from .doubles import inventory, ScriptedModel
+    from .doubles import ScriptedModel
 
     class _FailingConnector:
         def __init__(self) -> None:

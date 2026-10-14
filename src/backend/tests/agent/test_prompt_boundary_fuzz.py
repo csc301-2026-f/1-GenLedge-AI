@@ -17,7 +17,6 @@ asserts the fuzz touches the whole declared field set.
 
 from __future__ import annotations
 
-import re
 
 from app.agent.contracts import (
     AgentBudgets,

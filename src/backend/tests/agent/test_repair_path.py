@@ -17,7 +17,6 @@ BUDGETS = AgentBudgets(max_tool_calls=5, max_model_calls=5)
 
 
 def _valid_draft_json() -> str:
-    repository = seeded_repository()
     return build_fake_draft(inventory(), None, None).model_dump_json()
 
 

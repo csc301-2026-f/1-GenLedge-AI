@@ -13,8 +13,6 @@ from app.agent.graph import (
 from app.agent.graphs import END, GRAPH_RUNTIME_AVAILABLE, START, graph_runtime
 from app.agent.nodes import CONTEXT, PROPOSE, TOOL_CALL
 
-from .doubles import inventory
-
 LANGGRAPH = pytest.mark.skipif(
     not GRAPH_RUNTIME_AVAILABLE,
     reason="langgraph is not installed; the labelled local runner is exercised instead",
