@@ -212,7 +212,8 @@ def _run_graph(graph: Any, job_state: RoutingJobState, runtime: GraphRuntime, bu
 
     The semantic budgets are derived to fire first, so reaching the recursion limit
     is a derivation bug. It is still reported as `recursion_limit_exceeded` with the
-    counter snapshot rather than escaping as a framework error (master §9.1 row 15).
+    accumulated counters rather than escaping as a framework error (master §9.1
+    row 15).
     """
 
     config = {
@@ -222,26 +223,26 @@ def _run_graph(graph: Any, job_state: RoutingJobState, runtime: GraphRuntime, bu
     try:
         return graph.invoke(job_state, context=runtime, config=config)
     except RecursionLimitExceeded:
-        failed = dict(job_state)
-        failed["failure"] = FailureInfo(
-            code=RECURSION_LIMIT_EXCEEDED,
-            message=(
-                "the graph reached its derived recursion limit; the semantic budgets "
-                "should have fired first"
-            ),
-            retryable=False,
+        return _recursion_failure(
+            job_state,
+            "the graph reached its derived recursion limit; the semantic budgets should "
+            "have fired first",
         )
-        failed["status"] = "failed"
-        return failed  # type: ignore[return-value]
     except GraphRecursionError:
-        failed = dict(job_state)
-        failed["failure"] = FailureInfo(
-            code=RECURSION_LIMIT_EXCEEDED,
-            message="the graph runtime stopped the run at its recursion limit",
-            retryable=False,
-        )
-        failed["status"] = "failed"
-        return failed  # type: ignore[return-value]
+        return _recursion_failure(job_state, "the graph runtime stopped the run at its recursion limit")
+
+
+def _recursion_failure(job_state: RoutingJobState, message: str) -> RoutingJobState:
+    # A partial terminal state, deliberately: the counters accumulated so far are
+    # the diagnostic, and `total=False` makes every key optional.
+    failed: RoutingJobState = dict(job_state)
+    failed["failure"] = FailureInfo(
+        code=RECURSION_LIMIT_EXCEEDED,
+        message=message,
+        retryable=False,
+    )
+    failed["status"] = "failed"
+    return failed
 
 
 def startup_banner(

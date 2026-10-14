@@ -196,13 +196,13 @@ def _budget_stop(state: RoutingJobState, runtime: GraphRuntime, budgets: AgentBu
 def _elapsed_seconds(state: RoutingJobState) -> float | None:
     """Seconds since the run's start marker, or `None` when it is not recorded."""
 
-    started = runtime_started_at(state)
+    started = _started_at(state)
     if started is None:
         return None
     return (datetime.now(timezone.utc) - started).total_seconds()
 
 
-def runtime_started_at(state: RoutingJobState) -> datetime | None:
+def _started_at(state: RoutingJobState) -> datetime | None:
     raw = state.get("started_at")
     if not raw:
         return None
