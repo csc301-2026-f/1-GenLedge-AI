@@ -18,7 +18,7 @@ from app.agent.repositories import SNAPSHOT_ID, seeded_repository
 from app.agent.state import budget_exhausted
 from app.agent.tools import FakeConnector, ToolCallRequest, ToolDispatcher
 
-from .doubles import GreedyModel, ScriptedModel
+from .doubles import inventory, GreedyModel, ScriptedModel
 
 ALL_BUDGETS_EXHAUSTED = {
     "tool_calls": TOOL_BUDGET_EXHAUSTED,
@@ -193,7 +193,7 @@ def test_the_byte_cap_is_enforced_with_its_own_typed_result():
     dispatcher = ToolDispatcher(
         connector=FakeConnector(),
         repository=repository,
-        inventory=repository.get_inventory(SNAPSHOT_ID),
+        inventory=inventory(),
         budgets=AgentBudgets(max_tool_bytes=40),
     )
     outcome = dispatcher.dispatch(
@@ -217,7 +217,7 @@ def test_tool_row_and_byte_caps_are_typed_results_not_crashes():
     dispatcher = ToolDispatcher(
         connector=FakeConnector(),
         repository=repository,
-        inventory=repository.get_inventory(SNAPSHOT_ID),
+        inventory=inventory(),
         budgets=AgentBudgets(max_tool_rows=1),
     )
     outcome = dispatcher.dispatch(

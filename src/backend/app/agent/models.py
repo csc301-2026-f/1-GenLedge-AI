@@ -20,12 +20,13 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Protocol
+from typing import Any, Literal, Mapping, Protocol, TypedDict
 
 from pydantic import ValidationError
 
 from app.agent.contracts import (
     Attribute,
+    Disposition,
     EvidenceRef,
     InventoryView,
     ModelDraft,
@@ -132,6 +133,22 @@ def parse_model_draft(text: str) -> tuple[ModelDraft | None, str | None]:
 # --- fake model ----------------------------------------------------------------
 
 
+#: Arguments for `Relationship`, keyed by its **wire aliases**. `Relationship.from_ref`
+#: is aliased to `from`, a Python keyword, so the value can only be supplied by
+#: unpacking a mapping; naming that mapping's type keeps the unpacking type-checked
+#: instead of widening every field to `object`. The functional form is required
+#: because the `class` syntax cannot express a keyword-named key.
+_RelationshipArgs = TypedDict(
+    "_RelationshipArgs",
+    {
+        "from": str,
+        "to_ref": str,
+        "cardinality": Literal["one_to_one", "one_to_many", "many_to_one", "many_to_many"],
+        "evidence": list[EvidenceRef],
+    },
+)
+
+
 def _evidence(result: ToolResult | None, resource_id: str, field_path: str) -> list[EvidenceRef]:
     profile_ref = None
     if result is not None:
@@ -217,13 +234,19 @@ def build_fake_draft(inventory: InventoryView, catalogue: CatalogueView | None, 
                 key=["line_id"] if any(item.id == "line_id" for item in line_attributes) else [line_attributes[0].id],
                 attributes=line_attributes,
                 relationships=[
+                    # `Relationship.from_ref` carries the wire alias `from`, a Python
+                    # keyword, so the arguments go through a typed mapping and are
+                    # unpacked. The wire shape is pinned by
+                    # `test_the_fake_draft_serialises_the_from_alias`.
                     Relationship(
-                        **{
-                            "from": f"fact_order_lines.{key_of(line_attributes)[0]}",
-                            "to_ref": f"{order_table_id}.{key_of(attributes)[0]}",
-                            "cardinality": "many_to_one",
-                            "evidence": _evidence(result, "orders.lines[]", "lines[].line_id"),
-                        }
+                        **_RelationshipArgs(
+                            **{
+                                "from": f"fact_order_lines.{key_of(line_attributes)[0]}",
+                                "to_ref": f"{order_table_id}.{key_of(attributes)[0]}",
+                                "cardinality": "many_to_one",
+                                "evidence": _evidence(result, "orders.lines[]", "lines[].line_id"),
+                            }
+                        )
                     )
                 ],
                 rationale="Expands the repeating lines[] structure into its own event table.",
@@ -258,7 +281,7 @@ def build_fake_draft(inventory: InventoryView, catalogue: CatalogueView | None, 
         SourceCoverage(
             field_path=field.ref.field_path,
             resource_id=field.ref.resource_id,
-            disposition="represented",
+            disposition=Disposition.REPRESENTED,
             reason=f"Represented in {_owning_table(field.ref.resource_id, order_table_id)}.",
         )
         for field in inventory.fields
@@ -269,7 +292,7 @@ def build_fake_draft(inventory: InventoryView, catalogue: CatalogueView | None, 
             SourceCoverage(
                 field_path="lines[]",
                 resource_id="orders.lines[]",
-                disposition="represented",
+                disposition=Disposition.REPRESENTED,
                 reason="Expanded into fact_order_lines rather than flattened onto the order.",
             )
         )
@@ -389,7 +412,7 @@ class LiveModel:
 
     def _build_client(self) -> Any:
         try:
-            import anthropic  # noqa: PLC0415 - optional dependency, resolved at call time
+            import anthropic  # type: ignore[import-not-found]  # noqa: PLC0415 - optional dependency
         except ImportError as error:
             raise ModelConfigurationError(
                 "the anthropic SDK is not installed; install it or set GENLEDGE_MODEL_MODE=fake"

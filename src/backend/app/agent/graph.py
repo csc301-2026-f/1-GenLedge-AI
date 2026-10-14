@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 from app.agent import nodes as node_module
 from app.agent.contracts import AgentBudgets, FailureInfo, InventoryView, ModelDraft
@@ -233,9 +233,11 @@ def _run_graph(graph: Any, job_state: RoutingJobState, runtime: GraphRuntime, bu
 
 
 def _recursion_failure(job_state: RoutingJobState, message: str) -> RoutingJobState:
-    # A partial terminal state, deliberately: the counters accumulated so far are
-    # the diagnostic, and `total=False` makes every key optional.
-    failed: RoutingJobState = dict(job_state)
+    # A partial terminal state, deliberately: the counters accumulated so far are the
+    # diagnostic, and `total=False` makes every key optional. The state is a
+    # `TypedDict` channel container built at runtime, so the copy is cast rather than
+    # re-validated key by key.
+    failed = cast("RoutingJobState", dict(job_state))
     failed["failure"] = FailureInfo(
         code=RECURSION_LIMIT_EXCEEDED,
         message=message,

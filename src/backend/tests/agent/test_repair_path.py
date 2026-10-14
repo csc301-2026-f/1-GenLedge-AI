@@ -11,15 +11,14 @@ from app.agent.models import ModelResponse, build_fake_draft, parse_model_draft
 from app.agent.repositories import SNAPSHOT_ID, empty_inventory_repository, seeded_repository
 from app.agent.state import NODE_WRITES, validate_node_update
 
-from .doubles import ScriptedModel
+from .doubles import inventory, ScriptedModel
 
 BUDGETS = AgentBudgets(max_tool_calls=5, max_model_calls=5)
 
 
 def _valid_draft_json() -> str:
     repository = seeded_repository()
-    inventory = repository.get_inventory(SNAPSHOT_ID)
-    return build_fake_draft(inventory, None, None).model_dump_json()
+    return build_fake_draft(inventory(), None, None).model_dump_json()
 
 
 def _run(model, *, budgets: AgentBudgets = BUDGETS):

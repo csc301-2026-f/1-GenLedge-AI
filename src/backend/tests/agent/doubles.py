@@ -10,8 +10,17 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from app.agent.contracts import ToolCallRequest
+from app.agent.contracts import InventoryView, ToolCallRequest
 from app.agent.models import ModelRequest, ModelResponse
+from app.agent.repositories import SNAPSHOT_ID, seeded_repository
+
+
+def inventory() -> InventoryView:
+    """The seeded fixture inventory, asserted non-optional for type checkers."""
+
+    found = seeded_repository().get_inventory(SNAPSHOT_ID)
+    assert found is not None
+    return found
 
 
 class ScriptedModel:

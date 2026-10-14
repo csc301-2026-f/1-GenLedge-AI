@@ -20,6 +20,7 @@ from app.agent.contracts import (
     InventoryField,
     InventoryView,
     ResourceSummary,
+    SourceType,
     ToolCallRequest,
 )
 from app.agent.prompts import (
@@ -36,6 +37,8 @@ from app.agent.prompts import (
 )
 from app.agent.repositories import CatalogueColumn, CatalogueTable, CatalogueView, SNAPSHOT_ID, seeded_repository
 from app.agent.tools import ToolResult
+
+from .doubles import inventory
 
 SOURCE_ORDERS = "source-orders-1"
 
@@ -66,7 +69,7 @@ def _poisoned_inventory() -> InventoryView:
         fields=[
             InventoryField(
                 ref=FieldRef(source_id="source-orders-1", resource_id="orders", field_path="order_id"),
-                type="text",
+                type=SourceType.TEXT,
                 nullable=False,
                 repeating=False,
                 samples=[SENTINELS["row"], "O-2", "O-3"],
@@ -76,7 +79,7 @@ def _poisoned_inventory() -> InventoryView:
             ),
             InventoryField(
                 ref=FieldRef(source_id="source-orders-1", resource_id="orders", field_path="card_number"),
-                type="text",
+                type=SourceType.TEXT,
                 nullable=True,
                 repeating=False,
                 samples=[CARD_NUMBER],
@@ -86,7 +89,7 @@ def _poisoned_inventory() -> InventoryView:
             ),
             InventoryField(
                 ref=FieldRef(source_id="source-orders-1", resource_id="orders", field_path="note"),
-                type="text",
+                type=SourceType.TEXT,
                 nullable=True,
                 repeating=False,
                 samples=[f"dsn={SENTINELS['dsn']}"],
@@ -151,7 +154,7 @@ def test_a_prompt_sentinel_cannot_splice_a_prompt_block():
         fields=[
             InventoryField(
                 ref=FieldRef(source_id="source-orders-1", resource_id="orders", field_path="note"),
-                type="text",
+                type=SourceType.TEXT,
                 nullable=True,
                 repeating=False,
                 samples=[injected],
@@ -190,7 +193,7 @@ def test_the_projection_is_page_capped_with_an_explicit_marker():
     fields = [
         InventoryField(
             ref=FieldRef(source_id="s", resource_id="orders", field_path=f"column_{index}"),
-            type="text",
+            type=SourceType.TEXT,
             nullable=True,
             repeating=False,
             samples=["x"],
@@ -217,7 +220,7 @@ def test_the_projection_is_page_capped_with_an_explicit_marker():
 
 
 def test_a_sample_cap_is_enforced_for_seeded_fields():
-    projection = project_inventory(seeded_repository().get_inventory(SNAPSHOT_ID))
+    projection = project_inventory(inventory())
     assert "SKU-2" in projection  # only two seeded line samples exist
     assert projection.count("samples=") >= 5
 
@@ -245,7 +248,7 @@ def test_the_organization_id_never_reaches_a_prompt():
 def test_every_source_derived_value_sits_inside_an_untrusted_block():
     rendered = render_proposal_prompt(
         job_id="job-1",
-        inventory=seeded_repository().get_inventory(SNAPSHOT_ID),
+        inventory=inventory(),
         catalogue=None,
         tool_results=[],
         budgets=AgentBudgets(),
@@ -257,7 +260,7 @@ def test_every_source_derived_value_sits_inside_an_untrusted_block():
 
 
 def test_a_nested_resource_path_is_not_double_prefixed():
-    projection = project_inventory(seeded_repository().get_inventory(SNAPSHOT_ID))
+    projection = project_inventory(inventory())
     assert "orders.lines[].sku" in projection
     assert "orders.lines[].lines[]" not in projection
     assert "customers.name" in projection
@@ -280,7 +283,7 @@ def test_tool_results_are_rendered_as_untrusted_data_and_bounded():
     )
     rendered = render_proposal_prompt(
         job_id="job-1",
-        inventory=seeded_repository().get_inventory(SNAPSHOT_ID),
+        inventory=inventory(),
         catalogue=None,
         tool_results=[result],
         budgets=AgentBudgets(),
@@ -313,7 +316,7 @@ def test_nested_row_lists_are_capped_at_any_depth():
     )
     rendered = render_proposal_prompt(
         job_id="job-1",
-        inventory=seeded_repository().get_inventory(SNAPSHOT_ID),
+        inventory=inventory(),
         catalogue=None,
         tool_results=[result],
         budgets=AgentBudgets(),
@@ -338,7 +341,7 @@ def test_a_tool_error_is_projected_so_the_model_can_adapt():
     )
     rendered = render_proposal_prompt(
         job_id="job-1",
-        inventory=seeded_repository().get_inventory(SNAPSHOT_ID),
+        inventory=inventory(),
         catalogue=None,
         tool_results=[result],
         budgets=AgentBudgets(),
@@ -358,7 +361,7 @@ def test_a_tool_error_reaches_the_next_propose_prompt_end_to_end():
     from app.agent.models import ModelResponse
     from app.agent.tools import ConnectorError
 
-    from .doubles import ScriptedModel
+    from .doubles import inventory, ScriptedModel
 
     class _FailingConnector:
         def __init__(self) -> None:

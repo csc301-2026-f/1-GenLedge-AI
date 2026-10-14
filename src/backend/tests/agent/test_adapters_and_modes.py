@@ -8,7 +8,7 @@ import types
 
 import pytest
 
-from app.agent.contracts import AgentBudgets, ModelDraft
+from app.agent.contracts import AgentBudgets, InventoryView, ModelDraft
 from app.agent.errors import MODEL_CONFIGURATION_ERROR, ModelConfigurationError
 from app.agent.graph import log_resolved_mode, run_routing_job, startup_banner
 from app.agent.models import (
@@ -27,9 +27,11 @@ from app.agent.models import (
 from app.agent.prompts import render_proposal_prompt
 from app.agent.repositories import SNAPSHOT_ID, seeded_repository
 
+from .doubles import inventory
 
-def _inventory():
-    return seeded_repository().get_inventory(SNAPSHOT_ID)
+
+def _inventory() -> InventoryView:
+    return inventory()
 
 
 def _proposal_request() -> ModelRequest:
@@ -288,6 +290,7 @@ def test_live_adapter_maps_a_provider_exception_to_a_typed_code(stub_anthropic, 
     module.Anthropic = lambda **kwargs: _Boom()  # type: ignore[attr-defined]
     response = LiveModel(api_key="sk-test").invoke(_proposal_request())
     assert response.error_code == "model_unavailable"
+    assert response.error_message is not None
     assert "connection reset" in response.error_message
 
 
@@ -295,6 +298,7 @@ def test_live_adapter_without_the_sdk_is_a_typed_configuration_error(monkeypatch
     monkeypatch.setitem(sys.modules, "anthropic", None)
     response = LiveModel(api_key="sk-test").invoke(_proposal_request())
     assert response.error_code == MODEL_CONFIGURATION_ERROR
+    assert response.error_message is not None
     assert "anthropic" in response.error_message
 
 

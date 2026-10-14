@@ -49,10 +49,12 @@ try:  # pragma: no cover - exercised by whichever branch the environment takes
     START = _LG_START
     END = _LG_END
     StateGraph: Any = _LGStateGraph
+    #: The framework's `Runtime` class, or `None` on the fallback path.
+    RuntimeClass: Any = _LGRuntime
 except ImportError:  # pragma: no cover
     GRAPH_RUNTIME_AVAILABLE = False
     StateGraph = None
-    _LGRuntime = None
+    RuntimeClass = None
 
 
 class _SimpleRuntime:
@@ -72,8 +74,8 @@ def runtime_for(context: Any) -> Any:
     unwraps `.context` when it is present, so both reach the node identically.
     """
 
-    if _LGRuntime is not None:
-        return _LGRuntime(context=context)
+    if RuntimeClass is not None:
+        return RuntimeClass(context=context)
     return _SimpleRuntime(context)
 
 

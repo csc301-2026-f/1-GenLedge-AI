@@ -13,7 +13,7 @@ fixture (requirement: `orders`, `orders.lines[]`, `customers`, an ambiguous
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import Field
 
@@ -23,6 +23,7 @@ from app.agent.contracts import (
     InventoryField,
     InventoryView,
     ResourceSummary,
+    SourceType,
     StrictModel,
     ToolResultRef,
 )
@@ -147,11 +148,11 @@ class InMemoryRoutingRepository:
 def _field(
     *,
     field_path: str,
-    type: str,
+    type: SourceType,
     nullable: bool,
     repeating: bool,
     samples: list[str],
-    status: str = "stable",
+    status: Literal["stable", "new", "unknown"] = "stable",
     ambiguity: str | None = None,
     native_type: str | None = None,
     description: str | None = None,
@@ -174,27 +175,27 @@ def seeded_inventory() -> InventoryView:
     """The frozen synthetic orders fixture (`D2-PF-2`) as an `InventoryView`."""
 
     fields = [
-        _field(field_path="order_id", type="text", nullable=False, repeating=False, samples=["O-1001", "O-1002"], description="Source order identifier."),
-        _field(field_path="customer_id", type="text", nullable=False, repeating=False, samples=["C-77", "C-78"]),
+        _field(field_path="order_id", type=SourceType.TEXT, nullable=False, repeating=False, samples=["O-1001", "O-1002"], description="Source order identifier."),
+        _field(field_path="customer_id", type=SourceType.TEXT, nullable=False, repeating=False, samples=["C-77", "C-78"]),
         _field(
             field_path="order_date",
-            type="date",
+            type=SourceType.DATE,
             nullable=True,
             repeating=False,
             samples=["03/04/2026", "11/12/2026"],
             ambiguity="date_format_ambiguous",
             native_type="varchar(10)",
         ),
-        _field(field_path="total", type="number", nullable=True, repeating=False, samples=["120.50", "89.99"], native_type="numeric(12,2)"),
-        _field(field_path="lines[]", type="json", nullable=True, repeating=True, samples=[], status="new", native_type="array"),
-        _field(field_path="lines[].line_id", type="text", nullable=False, repeating=True, samples=["1", "2"], resource_id=ORDER_LINES),
-        _field(field_path="lines[].sku", type="text", nullable=True, repeating=True, samples=["SKU-1", "SKU-2"], resource_id=ORDER_LINES),
-        _field(field_path="lines[].quantity", type="number", nullable=True, repeating=True, samples=["2", "5"], resource_id=ORDER_LINES),
-        _field(field_path="lines[].unit_price", type="number", nullable=True, repeating=True, samples=["10.25", "6.00"], resource_id=ORDER_LINES),
-        _field(field_path="customer_id", type="text", nullable=False, repeating=False, samples=["C-77", "C-78"], resource_id=CUSTOMERS),
-        _field(field_path="name", type="text", nullable=True, repeating=False, samples=["Ada L.", "Grace H."], description="Customer display name.", resource_id=CUSTOMERS),
-        _field(field_path="email", type="text", nullable=True, repeating=False, samples=["ada@example.com"], resource_id=CUSTOMERS),
-        _field(field_path="signup_date", type="timestamp", nullable=True, repeating=False, samples=["2025-01-04T09:00:00Z"], resource_id=CUSTOMERS),
+        _field(field_path="total", type=SourceType.NUMBER, nullable=True, repeating=False, samples=["120.50", "89.99"], native_type="numeric(12,2)"),
+        _field(field_path="lines[]", type=SourceType.JSON, nullable=True, repeating=True, samples=[], status="new", native_type="array"),
+        _field(field_path="lines[].line_id", type=SourceType.TEXT, nullable=False, repeating=True, samples=["1", "2"], resource_id=ORDER_LINES),
+        _field(field_path="lines[].sku", type=SourceType.TEXT, nullable=True, repeating=True, samples=["SKU-1", "SKU-2"], resource_id=ORDER_LINES),
+        _field(field_path="lines[].quantity", type=SourceType.NUMBER, nullable=True, repeating=True, samples=["2", "5"], resource_id=ORDER_LINES),
+        _field(field_path="lines[].unit_price", type=SourceType.NUMBER, nullable=True, repeating=True, samples=["10.25", "6.00"], resource_id=ORDER_LINES),
+        _field(field_path="customer_id", type=SourceType.TEXT, nullable=False, repeating=False, samples=["C-77", "C-78"], resource_id=CUSTOMERS),
+        _field(field_path="name", type=SourceType.TEXT, nullable=True, repeating=False, samples=["Ada L.", "Grace H."], description="Customer display name.", resource_id=CUSTOMERS),
+        _field(field_path="email", type=SourceType.TEXT, nullable=True, repeating=False, samples=["ada@example.com"], resource_id=CUSTOMERS),
+        _field(field_path="signup_date", type=SourceType.TIMESTAMP, nullable=True, repeating=False, samples=["2025-01-04T09:00:00Z"], resource_id=CUSTOMERS),
     ]
     resources = [
         ResourceSummary(resource_id=ORDERS, name="orders", kind="collection", field_count=5),

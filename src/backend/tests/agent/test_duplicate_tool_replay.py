@@ -13,6 +13,8 @@ from app.agent.tools import (
     ToolDispatcher,
 )
 
+from .doubles import inventory
+
 SOURCE_ID = "source-orders-1"
 
 
@@ -20,7 +22,7 @@ def _dispatcher(repository, connector, **budgets) -> ToolDispatcher:
     return ToolDispatcher(
         connector=connector,
         repository=repository,
-        inventory=repository.get_inventory(SNAPSHOT_ID),
+        inventory=inventory(),
         budgets=AgentBudgets(**budgets),
     )
 

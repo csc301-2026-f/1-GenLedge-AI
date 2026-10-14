@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from app.agent.contracts import ModelDraft
 from app.agent.graph import run_routing_job
 from app.agent.models import (
@@ -14,6 +16,8 @@ from app.agent.models import (
 )
 from app.agent.repositories import ORDER_LINES, SNAPSHOT_ID, seeded_repository
 from app.agent.tools import TOOL_NAMES, FakeConnector
+
+from .doubles import inventory
 
 
 def _run(**kwargs):
@@ -63,6 +67,34 @@ def test_tool_result_is_recorded_once_and_referenced_not_inlined():
         assert ref.result_ref == recorded.result_ref
         assert not hasattr(ref, "payload")
     assert "rows" not in run.final_state
+
+
+def test_the_fake_draft_serialises_the_from_alias():
+    """The relationship's `from` alias must survive the round trip.
+
+    `Relationship.from_ref` is aliased to `from`, which is a Python keyword, so the
+    fake draft builds the relationship through a typed mapping and unpacks it. Pydantic
+    refuses a positional call and mypy refuses an untyped unpack, so this pins the one
+    place those two constraints meet: the wire key must be `from`, and the model must
+    read it back.
+    """
+
+    from app.agent.contracts import Relationship
+    from app.agent.models import _RelationshipArgs, build_fake_draft
+
+    draft = build_fake_draft(inventory(), None, None)
+    relationships = [rel for table in draft.tables for rel in table.relationships]
+    assert relationships, "the repeating structure produces at least one relationship"
+
+    payload = relationships[0].model_dump(by_alias=True)
+    assert "from" in payload, payload
+    assert "from_ref" not in payload, payload
+    assert Relationship.model_validate(payload).from_ref == payload["from"]
+
+    # the typed mapping binds the alias key, not the field name
+    assert set(_RelationshipArgs.__annotations__) == {"from", "to_ref", "cardinality", "evidence"}
+    serialised = json.loads(draft.model_dump_json(by_alias=True))
+    assert serialised["tables"], serialised
 
 
 def test_the_draft_is_schema_valid_and_harness_owned_fields_are_assigned():
