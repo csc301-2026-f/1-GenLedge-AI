@@ -75,16 +75,24 @@ Pass criteria and their outcomes:
 
 ### Verification results recorded
 
-- **`python -m pytest tests` could not be run to completion on this machine.** There
-  is no network access, and neither the Python 3.13 interpreter nor any reachable
-  image has `pydantic`, `flask` or `langgraph`. Every suite in the repository fails
-  at collection for that pre-existing reason, not because of this change.
-- The 104 `tests/agent` cases were **executed unmodified** through a temporary
-  pytest-compatible harness against Python 3.10 + pydantic 2.11.9:
-  `passed=104 failed=0 skipped=2` (the two skips are the LangGraph-introspection
-  cases). The harness was a local verification aid and was removed before the
-  commit.
-- `python -m mypy --check-untyped-defs app/agent tests/agent` — clean.
+Three commands, all checked in so the result is reproducible:
+
+```text
+python verify_us4_person_b.py     # 17/17 requirement-level checks hold
+python run_agent_tests.py         # passed=104 failed=0 skipped=2
+python -m pytest tests            # the authoritative command, on a complete install
+python -m mypy --check-untyped-defs app/agent tests/agent   # clean
+```
+
+- **`verify_us4_person_b.py`** asserts the task's requirements from the outside
+  through the public entrypoints, independently of the suite, and ends by naming the
+  four things it does **not** verify. It needs only `pydantic`.
+- **`run_agent_tests.py`** runs the real test bodies through a minimal
+  pytest-compatible shim for machines that cannot install pytest. The two skips are
+  the LangGraph-introspection cases, and it prints them.
+- **`python -m pytest tests` cannot run here**: no network access, and no reachable
+  interpreter has `pydantic`, `flask` or `langgraph`. Every suite in the repository
+  fails at collection for that pre-existing reason, not because of this change.
 
 A GLM 5.3 review of the first commit found one blocker (source data containing
 `{{...}}` could escape the renderer) and several majors; all are fixed and each has a

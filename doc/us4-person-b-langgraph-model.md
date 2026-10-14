@@ -120,10 +120,11 @@ escaping as a framework error.
 `auto` uses `fake` when no provider variable is present. `live` without provider
 configuration raises a typed `model_configuration_error`. Startup output is
 `agent_runtime=<langgraph|local-fallback> model_mode=<fake|live> provider=<p> model=<m>`
-— the mode, provider and model, and never a secret. `init_agent(app)` is called from
-`create_app`, so the banner is emitted at process start; a half-configured live
-deployment is logged as a warning instead of crashing the process that imported the
-package.
+— the mode, provider and model, and never a secret. `main.py` calls `init_agent(app)`
+once, so the banner is emitted at process start; a half-configured live deployment is
+logged as a warning instead of crashing the process. `app/__init__.py` deliberately
+does **not** import `app.agent` or Flask at module scope, so importing the harness
+never requires a web framework.
 
 ## 5. Prompt boundary
 
@@ -174,24 +175,39 @@ Written for this slice, under `tests/agent/`:
 | `test_compat.py` | the `StrEnum` fallback matches the standard library's `str`, `format`, f-string, JSON and ordering behaviour |
 ### Verification performed on the development machine
 
+Two scripts are checked in so this is reproducible rather than a claim:
+
+```text
+python verify_us4_person_b.py     # requirement-level, independent of the suite
+python run_agent_tests.py         # the tests/agent suite, when pytest is unavailable
+python -m pytest tests            # the authoritative command, on a complete install
+```
+
+- **`verify_us4_person_b.py` — 17/17 requirement-level checks hold.** It asserts the
+  task's requirements from the outside through the public entrypoints (graph shape,
+  one tool call on `orders.lines[]`, one repair then `invalid_model_output`, tool and
+  model budget exhaustion, replay without a second connector call, mode resolution,
+  the secret-free banner, the sentinel boundary, the sample cap, block-splice
+  protection, typed tool errors reaching the prompt, and the "do not implement" list).
+  It needs only `pydantic`. Its final block prints, by name, the four things it does
+  **not** verify.
+- **`run_agent_tests.py` — `passed=104 failed=0 skipped=2`.** It runs the real test
+  bodies unmodified through a minimal pytest-compatible shim. The two skips are the
+  LangGraph-introspection cases; the harness prints them rather than hiding them.
+  It is a development aid: **`python -m pytest tests` remains the authoritative
+  command** and should be used wherever it runs.
 - `python -m mypy --check-untyped-defs app/agent tests/agent` — clean.
-  `pytest` and `mypy` are **not installable here** (see below), so mypy was run from
-  the system interpreter, which type-checks without importing the packages.
 - `compat.StrEnum` was compared against the real `enum.StrEnum` by running the same
   18 probes (`str`, `format`, format spec, f-string, `%s`, `json.dumps`, equality both
   ways, dict-key lookup, `hash`, `len`, sorting interleaved with plain strings,
   string methods, `in`, `repr`) under Python 3.13 (stdlib) and Python 3.10 (the
   fallback): **identical output on every probe**.
-- The 104 `tests/agent` cases were **executed** with the suite unmodified through a
-  temporary pytest-compatible runner against Python 3.10 + pydantic 2.11.9:
-  `passed=104 failed=0 skipped=2`. The runner was a local aid and was removed before
-  the commit.
-- `python -m pytest tests` **could not be run to completion**, because this machine
-  has no network access and neither the 3.13 interpreter nor any reachable image has
-  `pydantic`, `flask` or `langgraph`. Every suite in the repository
-  (`test_app.py`, `test_auth.py`, `test_api_schemas.py`, `test_contracts.py`) fails
-  at collection for the same pre-existing reason. **This is a reported limitation,
-  not a met gate.**
+
+**What is still not verified:** `python -m pytest tests` cannot run here at all —
+there is no network access, and neither the 3.13 interpreter nor any reachable image
+has `pydantic`, `flask` or `langgraph`. Every suite in the repository (`test_app.py`,
+`test_auth.py`, `test_api_schemas.py`, `test_contracts.py`) fails at collection for
+that pre-existing reason. That is a reported limitation, not a met gate.
 
 ## 7. Provider limitations and known gaps
 
