@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "sha256": {
+    "propose@1": "bf11205b00a481c8f1fabdfd40da8024b3925d94df0be335268be4b225fae57c",
+    "repair@1": "a2b0b144937ad25b012bdf2caeb11abc7fd2be8d88beb035cec654f8c7302f59",
+    "shared_system@1": "989d10edd421486af0c2c400e3aa7147c0e3eaa3d9fc727e4a2e843481e213ee"
+  }
+}

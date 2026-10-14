@@ -1,0 +1,363 @@
+"""Versioned prompts, the projection allow-list, and the untrusted-data wrapper.
+
+This module is the **only** path from the process to a model prompt.
+`plans/user-stories/US4.md` §5.1 states the boundary as a requirement rather than a
+prompt instruction, so it is enforced by construction:
+
+* the projection functions are typed against `InventoryView`, `CatalogueView` and
+  `ToolResult` — never against the graph state, a `dict`, or `Any` — so passing a
+  raw row, a connector payload or an ORM object into a prompt takes a deliberate
+  type change instead of an oversight;
+* the projection allow-list is exactly: snapshot id, resource ids and kinds, field
+  paths, types, nullability, repeating status, at most three (redacted) samples per
+  field, the ambiguity marker, and the field status. Field descriptions are
+  deliberately **not** projected (US4 §9.2 `DC-1`);
+* every source-derived string is emitted inside an `<untrusted_...>` block;
+* restricted values — credentials, DSNs, connection strings, e-mail addresses —
+  are redacted by the tool layer before persistence and again defensively here.
+
+Rendering is strict: a variable declared in the front-matter that is absent from
+the render map, or a placeholder with no declaration, is an error rather than a
+silently empty string.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+
+from app.agent.contracts import AgentBudgets, ModelDraft
+from app.agent.repositories import CatalogueView
+from app.agent.tools import ToolResult, redact_payload, redact_value
+
+PROMPTS_DIR = Path(__file__).with_name("prompts")
+SCHEMA_FIELD = "output_schema"
+#: Page cap for the inventory block. A larger inventory degrades deterministically
+#: with an explicit marker rather than growing the prompt without bound.
+MAX_PROJECTED_FIELDS = 200
+MAX_PROJECTED_RESOURCES = 50
+MAX_PROJECTED_TOOL_RESULTS = 5
+MAX_PROJECTED_TOOL_ROWS = 3
+#: Per-block character cap. A result larger than this is truncated with a marker
+#: rather than growing the prompt without bound.
+MAX_PROJECTED_TEXT = 4000
+
+_VARIABLE = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
+_FRONT_MATTER = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.S)
+
+
+class PromptError(RuntimeError):
+    """A prompt could not be loaded or rendered as declared."""
+
+
+@dataclass(frozen=True)
+class PromptSpec:
+    prompt_id: str
+    version: int
+    variables: tuple[str, ...]
+    contract: str
+    template: str
+
+    @property
+    def ref(self) -> str:
+        return f"{self.prompt_id}@{self.version}"
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.template.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class RenderedPrompt:
+    """A prompt ready for a model call, with its provenance attached."""
+
+    system: str
+    user: str
+    ref: str
+    sha256: str
+
+    def digest(self) -> str:
+        return hashlib.sha256(f"{self.system}\n--\n{self.user}".encode("utf-8")).hexdigest()
+
+
+def _parse_front_matter(text: str, path: Path) -> tuple[dict[str, Any], str]:
+    match = _FRONT_MATTER.match(text)
+    if match is None:
+        raise PromptError(f"{path.name} has no front-matter block")
+    header: dict[str, Any] = {}
+    for line in match.group(1).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            header.setdefault("_list", []).append(stripped[2:].strip())
+            continue
+        key, _, value = stripped.partition(":")
+        header[key.strip()] = value.strip()
+    return header, text[match.end():]
+
+
+def load_prompt(prompt_id: str) -> PromptSpec:
+    """Load and validate one prompt file against its own front-matter."""
+
+    path = PROMPTS_DIR / f"{prompt_id}.md"
+    if not path.is_file():
+        raise PromptError(f"unknown prompt {prompt_id!r}")
+    header, body = _parse_front_matter(path.read_text(encoding="utf-8"), path)
+    declared = tuple(header.get("_list", ()))
+    found = set(_VARIABLE.findall(body))
+    declared_set = set(declared)
+    missing = declared_set - found
+    undeclared = found - declared_set
+    if missing or undeclared:
+        raise PromptError(
+            f"{prompt_id}.md front-matter and placeholders disagree: "
+            f"declared-but-unused={sorted(missing)} used-but-undeclared={sorted(undeclared)}"
+        )
+    try:
+        version = int(str(header.get("version", "")))
+    except ValueError as error:
+        raise PromptError(f"{prompt_id}.md has a non-numeric version") from error
+    return PromptSpec(
+        prompt_id=str(header.get("id", prompt_id)),
+        version=version,
+        variables=declared,
+        contract=str(header.get("contract", "none")),
+        template=body,
+    )
+
+
+def manifest() -> dict[str, str]:
+    """`id@version -> sha256` for every checked-in prompt.
+
+    The digest is of the whole file, so a silent edit to an instruction or to the
+    front-matter both show up. `prompts/manifest.json` holds the reviewed values;
+    a mismatch is caught by `tests/agent/test_prompt_safety.py`.
+    """
+
+    digests: dict[str, str] = {}
+    for path in sorted(PROMPTS_DIR.glob("*.md")):
+        spec = load_prompt(path.stem)
+        digests[spec.ref] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digests
+
+
+def render(prompt_id: str, variables: Mapping[str, Any]) -> RenderedPrompt:
+    """Render a prompt strictly: every declared variable must be supplied."""
+
+    spec = load_prompt(prompt_id)
+    supplied = set(variables)
+    declared = set(spec.variables)
+    missing = declared - supplied
+    extra = supplied - declared
+    if missing or extra:
+        raise PromptError(
+            f"render map for {spec.ref} does not match its declaration: "
+            f"missing={sorted(missing)} extra={sorted(extra)}"
+        )
+    body = spec.template
+    for name in spec.variables:
+        body = body.replace("{{" + name + "}}", str(variables[name]))
+    if _VARIABLE.search(body):
+        raise PromptError(f"{spec.ref} still contains an unrendered placeholder")
+    return RenderedPrompt(
+        system=load_prompt("shared_system").template.strip(),
+        user=body.strip(),
+        ref=spec.ref,
+        sha256=hashlib.sha256(body.encode("utf-8")).hexdigest(),
+    )
+
+
+# --- projection allow-list -----------------------------------------------------
+
+
+def _bounded(items: list[Any], limit: int, label: str) -> tuple[list[Any], str]:
+    if len(items) <= limit:
+        return items, ""
+    return items[:limit], f"    ... and {len(items) - limit} more {label}\n"
+
+
+def project_inventory(inventory: Any) -> str:
+    """The model-facing inventory: one line per field, ≤3 samples, no rows."""
+
+    lines = [f"snapshot_id: {inventory.snapshot_id}"]
+    resources, marker = _bounded(list(inventory.resources), MAX_PROJECTED_RESOURCES, "resources")
+    lines.append("resources:")
+    for resource in resources:
+        lines.append(f"  - {resource.resource_id} (kind={resource.kind}, fields={resource.field_count})")
+    if marker:
+        lines.append(marker.rstrip("\n"))
+    lines.append("fields:")
+    fields, marker = _bounded(list(inventory.fields), MAX_PROJECTED_FIELDS, "fields")
+    for field in fields:
+        path = _field_path(field.ref.resource_id, field.ref.field_path)
+        samples = [redact_value(value, field.ref.field_path) for value in field.samples[:3]]
+        detail = [
+            f"type={field.type.value if hasattr(field.type, 'value') else field.type}",
+            f"nullable={field.nullable}",
+            f"repeating={field.repeating}",
+            f"status={field.status}",
+        ]
+        if field.ambiguity:
+            detail.append(f"ambiguity={redact_value(field.ambiguity, 'ambiguity')}")
+        if field.native_type:
+            detail.append(f"native_type={field.native_type}")
+        if samples:
+            detail.append("samples=" + ", ".join(str(item) for item in samples))
+        lines.append(f"  - {path} [{'; '.join(detail)}]")
+    if marker:
+        lines.append(marker.rstrip("\n"))
+    return "\n".join(lines)
+
+
+def _field_path(resource_id: str, field_path: str) -> str:
+    """Render a dotted path, merging a resource and field path that already overlap.
+
+    A repeating resource is addressed as `orders.lines[]` and its fields as
+    `lines[].sku`; the model must read `orders.lines[].sku`, not
+    `orders.lines[].lines[].sku`. The overlap is merged on a dot boundary and only
+    when the resource's own tail genuinely matches the field path's head.
+    """
+
+    if field_path.startswith(resource_id + ".") or field_path == resource_id:
+        return field_path
+    resource_parts = resource_id.split(".")
+    field_parts = field_path.split(".")
+    for size in range(min(len(resource_parts), len(field_parts)), 0, -1):
+        if resource_parts[-size:] == field_parts[:size]:
+            return ".".join(resource_parts + field_parts[size:])
+    return f"{resource_id}.{field_path}"
+
+
+def project_catalogue(catalogue: CatalogueView | None) -> str:
+    """Table and column names and types only, or the cold-start sentence."""
+
+    if catalogue is None or not catalogue.tables:
+        return "No existing warehouse catalogue. Propose a new model."
+    lines = [f"catalog_ref: {catalogue.catalog_ref}"]
+    tables, marker = _bounded(list(catalogue.tables), MAX_PROJECTED_RESOURCES, "tables")
+    for table in tables:
+        columns = ", ".join(f"{column.name} {column.type}" for column in table.columns)
+        lines.append(f"  - {table.table_id} ({table.name}): {columns}")
+    if marker:
+        lines.append(marker.rstrip("\n"))
+    return "\n".join(lines)
+
+
+def project_tool_results(results: list[ToolResult]) -> str:
+    """Recorded tool results, redacted again and bounded, as compact JSON."""
+
+    usable = [result for result in results if result.status == "ok"][-MAX_PROJECTED_TOOL_RESULTS:]
+    if not usable:
+        return "No tool results recorded yet."
+    blocks = []
+    for result in usable:
+        # The tool layer redacts before persistence. This second pass is defence in
+        # depth at the boundary that actually reaches the provider, so a result
+        # recorded by a buggy or older writer still cannot leak a credential.
+        payload = redact_payload(result.payload)
+        rows = payload.get("rows")
+        if isinstance(rows, list) and len(rows) > MAX_PROJECTED_TOOL_ROWS:
+            payload = {**payload, "rows": rows[:MAX_PROJECTED_TOOL_ROWS], "rows_truncated": len(rows)}
+        rendered = _bounded_text(json.dumps(payload, sort_keys=True, default=str))
+        blocks.append(f"- {result.tool} (tool_call_id={result.tool_call_id}): {rendered}")
+    return "\n".join(blocks)
+
+
+def _bounded_text(text: str) -> str:
+    if len(text) <= MAX_PROJECTED_TEXT:
+        return text
+    return text[:MAX_PROJECTED_TEXT] + f" […truncated {len(text) - MAX_PROJECTED_TEXT} chars]"
+
+
+def project_budgets(budgets: AgentBudgets) -> str:
+    """One line per budget. No provider name, no key, no price table."""
+
+    return "\n".join(
+        [
+            f"max_model_calls={budgets.max_model_calls}",
+            f"max_tool_calls={budgets.max_tool_calls}",
+            f"max_tokens={budgets.max_tokens}",
+            f"max_tool_rows={budgets.max_tool_rows}",
+            f"max_tool_bytes={budgets.max_tool_bytes}",
+        ]
+    )
+
+
+def project_output_schema(contract: str) -> str:
+    """The output schema, generated from the contract rather than hand-written."""
+
+    if contract == "ModelDraft":
+        return _schema_text(ModelDraft.model_json_schema())
+    if contract == SCHEMA_FIELD:
+        return _schema_text(ModelDraft.model_json_schema())
+    raise PromptError(f"no schema is registered for contract {contract!r}")
+
+
+def _schema_text(schema: dict[str, Any]) -> str:
+    return json.dumps(schema, indent=2, sort_keys=True)
+
+
+def job_ref(job_id: str) -> str:
+    """An opaque job reference: a prefix of the id, never the organization id."""
+
+    return job_id[:8]
+
+
+def proposal_prompt_variables(
+    *,
+    job_id: str,
+    inventory: Any,
+    catalogue: CatalogueView | None,
+    tool_results: list[ToolResult],
+    budgets: AgentBudgets,
+) -> dict[str, str]:
+    """The complete render map for `propose`. Adding a key means editing its test."""
+
+    return {
+        "job_ref": job_ref(job_id),
+        "inventory": project_inventory(inventory),
+        "catalogue": project_catalogue(catalogue),
+        "tool_results": project_tool_results(tool_results),
+        "budgets": project_budgets(budgets),
+        "output_schema": project_output_schema("ModelDraft"),
+    }
+
+
+def render_proposal_prompt(**kwargs: Any) -> RenderedPrompt:
+    return render("propose", proposal_prompt_variables(**kwargs))
+
+
+def render_repair_prompt(*, validation_errors: str) -> RenderedPrompt:
+    return render(
+        "repair",
+        {
+            "validation_errors": validation_errors,
+            "output_schema": project_output_schema("ModelDraft"),
+        },
+    )
+
+
+__all__ = [
+    "MAX_PROJECTED_FIELDS",
+    "PROMPTS_DIR",
+    "PromptError",
+    "PromptSpec",
+    "RenderedPrompt",
+    "job_ref",
+    "load_prompt",
+    "manifest",
+    "project_budgets",
+    "project_catalogue",
+    "project_inventory",
+    "project_output_schema",
+    "project_tool_results",
+    "proposal_prompt_variables",
+    "render",
+    "render_proposal_prompt",
+    "render_repair_prompt",
+]
