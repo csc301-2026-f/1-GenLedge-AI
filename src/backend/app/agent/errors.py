@@ -54,3 +54,16 @@ class ModelUnavailableError(AgentFailure):
 class InvalidModelOutputError(AgentFailure):
     def __init__(self, message: str) -> None:
         super().__init__(INVALID_MODEL_OUTPUT, message, retryable=False)
+
+
+class InvalidStateUpdateError(AgentFailure):
+    """A node returned a state key its `US4.md` §4.2 `Writes` list does not own.
+
+    Raised by the node-write guard and mapped to a typed job failure by the runner,
+    so a programming error in a node ends the job as `invalid_state_update` instead
+    of escaping `run_routing_job` as an untyped `ValueError`
+    (`plans/LANGGRAPH_HARNESS_PLAN.md` §5.4 boundary 5, §9.1 row 2).
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(INVALID_STATE_UPDATE, message, retryable=False)

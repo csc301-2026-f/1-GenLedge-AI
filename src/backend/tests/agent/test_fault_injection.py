@@ -249,12 +249,18 @@ def test_a_field_path_outside_the_snapshot_is_refused_before_dispatch():
 
 
 def test_a_discovered_field_path_is_accepted_in_either_spelling():
-    """`lines[].sku` and `orders.lines[].sku` name the same discovered field."""
+    """`lines[].sku` and `orders.lines[].sku` name the same discovered field.
+
+    `lines[]` is deliberately **not** accepted for `resource_id="orders.lines[]"`: it is
+    the repeating array recorded against `orders`, so it belongs to another resource.
+    Field-path scope is per-resource (`M1`), and the union of every discovered path was
+    what allowed a field of one resource to be read under another's name.
+    """
 
     connector = FaultConnector("credentials_in_rows")
     dispatcher, _ = _dispatcher(connector)
 
-    for index, fields in enumerate((["lines[].sku"], ["orders.lines[].sku"], ["lines[]"])):
+    for index, fields in enumerate((["lines[].sku"], ["orders.lines[].sku"])):
         outcome = dispatcher.dispatch(
             ToolCallRequest(
                 id=f"call-ok-{index}",
@@ -265,6 +271,33 @@ def test_a_discovered_field_path_is_accepted_in_either_spelling():
             tool_calls_used=0,
         )
         assert outcome.result.status == "ok", outcome.result.message
+
+    # the same field is `orders`' repeating array, not a field of `orders.lines[]`
+    cross = dispatcher.dispatch(
+        ToolCallRequest(
+            id="call-cross",
+            name="sample_rows",
+            arguments={"source_id": SOURCE_ID, "resource_id": "orders.lines[]", "fields": ["lines[]"]},
+        ),
+        job_id="job-fieldpath-ok",
+        tool_calls_used=0,
+    )
+    assert cross.result.status == "error"
+    assert cross.result.error_code == "invalid_arguments"
+
+    # the same hole through the other argument spelling: a `profile_resource` request
+    # must not be able to name another resource's field either
+    cross_profile = dispatcher.dispatch(
+        ToolCallRequest(
+            id="call-cross-profile",
+            name="profile_resource",
+            arguments={"source_id": SOURCE_ID, "resource_id": "orders", "fields": ["lines[].sku"]},
+        ),
+        job_id="job-fieldpath-ok",
+        tool_calls_used=0,
+    )
+    assert cross_profile.result.status == "error"
+    assert cross_profile.result.error_code == "invalid_arguments"
 
     # a compare_fields call validates both `*_field_path` arguments, not just one
     outcome = dispatcher.dispatch(

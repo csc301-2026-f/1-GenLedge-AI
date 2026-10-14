@@ -1,4 +1,4 @@
-# US4 Person B — LangGraph Routing Workflow
+# US4 Person B - LangGraph Routing Workflow
 
 Finalized plan and handoff for the Person B slice of US4 on branch
 `us4/person-b-langgraph-model` (base `us4/integration`).
@@ -7,9 +7,9 @@ Authoritative references:
 
 - `plans/user-stories/US4.md` §4 (graph), §5 (contracts, prompt boundary), §8 (tests)
 - `plans/us4-four-person-task-split.md` §"Person B", §"Integration Gates"
-- `plans/LANGGRAPH_HARNESS_PLAN.md` §5–§9
+- `plans/LANGGRAPH_HARNESS_PLAN.md` §5-§9
 - `doc/agent-harness-architecture.md` (harness gate, line 238)
-- `src/backend/app/agent/contracts.py` (frozen contracts — imported, never redefined)
+- `src/backend/app/agent/contracts.py` (frozen contracts - imported, never redefined)
 
 ## 1. What was built
 
@@ -19,7 +19,7 @@ propose -> (tool_call | END)
 tool_call -> propose
 ```
 
-Three nodes, exactly. No human node, no revision loop, no validation node — the
+Three nodes, exactly. No human node, no revision loop, no validation node - the
 deterministic work after the graph is Person C's and Person D's.
 
 | Module | Responsibility | Key interfaces |
@@ -33,13 +33,13 @@ deterministic work after the graph is Person C's and Person D's.
 | `app/agent/models.py` | `ModelClient` protocol, `FakeModel`, `LiveModel`, mode resolution | `resolve_model_mode`, `build_model_client`, `startup_banner` |
 | `app/agent/nodes.py` | `context`, `propose`, `tool_call` and the routers | `context_node`, `propose_node`, `tool_call_node`, `route_after_*` |
 | `app/agent/graph.py` | Compile, run, budgets, startup banner | `build_graph`, `run_routing_job`, `graph_shape` |
-| `app/agent/compat.py` | `StrEnum` on Python 3.10 | `StrEnum` |
+| `app/agent/compat.py` | A `StrEnum` shim for a Python 3.10 floor. **No longer used by the agent package** — `contracts.py` was restored to the frozen `from enum import StrEnum`, so nothing in `app/agent` imports this except its own test (`tests/agent/test_compat.py`). Retained because that test is another contributor's and still passes. | `StrEnum` |
 
 ## 2. Node behaviour, as implemented
 
 **`context`** loads the frozen inventory for `source_snapshot_ids` and the optional
 catalogue (`None` = cold start). No model call. An empty or missing inventory is a
-typed `empty_inventory` failure routed straight to `END` — never an empty proposal.
+typed `empty_inventory` failure routed straight to `END` - never an empty proposal.
 A `catalogue_ref` that cannot be resolved is a typed `catalogue_not_found` failure:
 a reviewer who asked for reuse is not silently handed a cold-start proposal. It
 builds the `ToolDispatcher` for the run.
@@ -68,7 +68,7 @@ executes a tool. Order of operations:
 1. validate arguments against the tool's own model;
 2. check the job's source and resource scope (an out-of-scope source is also recorded
    as a security event);
-3. **replay** a recorded `(job_id, tool_call_id)` — before the budget check, so a
+3. **replay** a recorded `(job_id, tool_call_id)` - before the budget check, so a
    replay can never double-count a call;
 4. check the tool-call budget **before** dispatch;
 5. dispatch through the connector seam;
@@ -120,7 +120,7 @@ escaping as a framework error.
 `auto` uses `fake` when no provider variable is present. `live` without provider
 configuration raises a typed `model_configuration_error`. Startup output is
 `agent_runtime=<langgraph|local-fallback> model_mode=<fake|live> provider=<p> model=<m>`
-— the mode, provider and model, and never a secret. `main.py` calls `init_agent(app)`
+- the mode, provider and model, and never a secret. `main.py` calls `init_agent(app)`
 once, so the banner is emitted at process start; a half-configured live deployment is
 logged as a warning instead of crashing the process. `app/__init__.py` deliberately
 does **not** import `app.agent` or Flask at module scope, so importing the harness
@@ -130,7 +130,7 @@ never requires a web framework.
 
 `app/agent/prompts.py` is the only path from the process to a prompt. The
 projection functions are typed against `InventoryView`, `CatalogueView` and
-`ToolResult` — never the graph state, a `dict`, or `Any` — so passing a raw row, a
+`ToolResult` - never the graph state, a `dict`, or `Any` - so passing a raw row, a
 connector payload or an ORM object into a prompt takes a deliberate type change
 rather than an oversight.
 
@@ -150,7 +150,7 @@ layer before persistence **and** again at the projection boundary; oversized inp
 degrade deterministically with explicit `… and N more` / `[…truncated]` markers.
 
 Rendering is single-pass. A source value containing `{{budgets}}` is emitted
-literally inside the untrusted block — it can neither crash the renderer nor splice
+literally inside the untrusted block - it can neither crash the renderer nor splice
 another prompt block into itself.
 
 ## 6. Tests and verification
@@ -175,83 +175,112 @@ Written for this slice, under `tests/agent/`:
 | `test_compat.py` | the `StrEnum` fallback matches the standard library's `str`, `format`, f-string, JSON and ordering behaviour |
 ### Verification performed
 
-Three commands, all checked in:
-
 ```text
-python -m pytest            # from the repo root; pytest.ini sets testpaths
-python -m pytest tests      # from src/backend; the documented command
+cd src/backend
+..\..\.venv\Scripts\python.exe -m pytest tests       # the documented command
 python verify_us4_person_b.py     # requirement-level, independent of the suite
-python tools/mutation_check.py    # does the suite fail when it should?
+python tools/mutation_check.py    # does the suite fail when it should? (throwaway copy)
 python run_agent_tests.py         # the suite on a machine without pytest
 ```
 
-- **`python -m pytest` — 458 passed**, with `langgraph 1.2.15` installed. This
-  exercises the **real `langgraph.StateGraph`**, not the fallback. It includes
-  `test_langgraph_actually_injects_the_run_scoped_runtime` (the nodes receive the
-  framework's injected runtime, not a positional guess), the differential test that
-  compares both engines field by field, a fault-injection matrix, a per-field
-  boundary fuzz, 250 seeded property cases and an AST architecture scan.
-- **`python -m pytest tests` from `src/backend` — 458 passed.** Same suite, the
-  invocation the task names.
-- **`verify_us4_person_b.py` — 17/17 requirement-level checks hold.** It asserts the
-  requirements from the outside through the public entrypoints and prints, by name,
-  what it does not verify. It needs only `pydantic`.
-- **`tools/mutation_check.py` — 14/14 mutations killed.** Fourteen load-bearing lines
-  are broken one at a time and the suite must notice each one. It has found five real
-  gaps: the projection's three-sample cap, the text cap, the recursion derivation, the
-  field-path scope control and the `auto`-mode gate.
-- **`run_agent_tests.py` — `passed=423 failed=0 skipped=5`** on Python 3.10 without
-  `langgraph`; the five skips are the LangGraph-only cases. This is how the fallback
-  path stays exercised on a machine with no library to fall back from.
-- `compat.StrEnum` was compared against the real `enum.StrEnum` by running the same
-  18 probes (`str`, `format`, format spec, f-string, `%s`, `json.dumps`, equality both
-  ways, dict-key lookup, `hash`, `len`, sorting interleaved with plain strings,
-  string methods, `in`, `repr`) under Python 3.13 (stdlib) and Python 3.10 (the
-  fallback): **identical output on every probe**.
-- `python -m mypy --check-untyped-defs app main.py tests/agent` — clean, resolving
-  the venv's real dependency stubs.
+Numbers produced by an earlier cycle, kept only as a record - **re-run them, do not cite
+them**: `458 passed` with `langgraph 1.2.15`; `423 passed, 5 skipped` on Python 3.10 with
+no `langgraph`; `verify_us4_person_b.py` 17/17, now 19/19 including the two contract
+checks; `14/14` mutations killed, now 31 mutations on an isolated copy. The test counts
+are a liability to quote because this branch no longer reproduces them from a clean tree
+without the venv on `PATH`; the commands above are the claim, not the numbers.
 
-**Defects these techniques caught, after the unit suite was already green.** The first
-run against the real library failed every end-to-end case: LangGraph injects a
-parameter *named* `runtime` as a keyword, and only when it is visible in the
-callable's signature — the node-write guard's `*args, **kwargs` hid it, so every node
-ran with no runtime. The fault matrix then found that a **failed** tool call was not
-charged against `max_tool_calls`, making the loop bound free exactly when a source was
-broken. The boundary fuzz found the resource **name** was never projected. And the
-property tests found that a sample containing `</untrusted_source_data>` **closed the
-untrusted block early**, leaving the rest of the source text in the prompt's
-instruction region. Each has a regression test; see
-[`us4-person-b-verification.md`](us4-person-b-verification.md) for the full account.
+- `verify_us4_person_b.py` asserts the requirements from the outside through the
+  public entrypoints and names, at the end, what it cannot verify.
+- `tools/mutation_check.py` copies the current implementation - uncommitted work
+  included - into a temporary directory, runs the copy once unmutated, then breaks one
+  load-bearing line at a time and requires the suite to notice. It never writes to the
+  development tree, so a kill cannot leave a mutation behind; it verifies each restore
+  and fingerprints the tree before and after. Signal handlers are installed but are not
+  the guarantee, and the docs no longer imply otherwise: on Windows a `SIGTERM` is an
+  outright termination and no handler runs.
 
 ## 7. Provider limitations and known gaps
 
+> **Remediation applied after a third review. Read this block before the list below.**
+> The third review was of the *working tree*, not the commits, and the tree was broken:
+> `tools/mutation_check.py` mutated the real checkout and was killed before its restore,
+> leaving `if True:  # MUTATED` in `app/agent/prompts.py`. The suite was red (4 failed,
+> 454 passed) and the "458 passed / 14-14 mutations" claims below were unreproducible
+> from the delivery. Also fixed in that cycle: typed storage failures in `propose`,
+> `tool_call` **and the runner's own pre-graph reads** (`get_inventory`, `get_catalogue`,
+> `create_job`); a harness-checked replay identity, so a reused `tool_call_id` can no
+> longer return another call's payload; a tool-round bound, so a model re-requesting one
+> id can no longer loop unchecked - note that at the shipped defaults
+> `max_tool_calls=40` exceeds `max_model_calls=20`, and since every tool round costs a
+> model call the **model** budget is the binding bound there, with the round bound
+> stopping the loop in the tighter configurations the tests use; replayed references are
+> no longer duplicated; pre-dispatch refusals are no longer persisted; redaction covers
+> non-string scalars, phone/address/identifier patterns, credential-shaped keys, and a
+> restricted key's whole subtree; a bad node write is a typed `invalid_state_update`
+> rather than an escaping `ValueError`; and the live adapter sends `output_config.format`
+> instead of the stale `output_format`.
+>
+> **A second review of that cycle then found three more defects, fixed here:** the
+> nested-credential redaction leak the rework itself introduced; thirteen stale
+> mutation-battery anchors, which let the tool print "all mutations killed" and exit 0
+> while testing none of the redaction, replay or scope fixes; and the three runner-level
+> store faults.
+>
+> `doc/us4-person-b-verification.md` carries the full record, including what remains
+> unverified - notably that the mutation battery has **no verified run** in this
+> environment, and that no provider call has ever been made. The itemised gaps below are
+> the ones that survive.
+
 1. **`langgraph` is optional at runtime.** The graph is built against the real
-   `StateGraph` API and **verified against `langgraph 1.2.15`** (458 passed, with the
+   `StateGraph` API and **verified against `langgraph 1.2.15`** (with the
    library's own `get_graph()` introspection). The fallback in `app/agent/graphs.py`
    exists so a checkout without the dependency still executes the same nodes; it is
    labelled, and `graph_runtime()` reports which one is live. The dependency is in
-   `requirements.txt`.
+   `requirements.txt`. **Known limitation:** on the fallback path nothing asserts the
+   built graph's node or edge set - `graph_shape()` returns declared constants, and only
+   the two LangGraph-gated tests introspect the compiled graph. Adding a fourth node
+   would therefore pass the whole suite under `GENLEDGE_GRAPH_RUNTIME=local-fallback`.
 2. **The live adapter is exercised against an SDK stub, not a real provider.** The
    stub asserts the request shape the adapter builds (`system`, `messages`, bound
-   tools with `tool_choice: auto`, native `output_format` JSON schema), but whether
-   the installed SDK accepts that exact wire format is `[Unverified]` — E-2/E-6 in
+   tools with `tool_choice: auto`, native `output_config.format` JSON schema). The stub
+   accepts any keyword it is handed, so it cannot tell a correct parameter name from a
+   stale one - that is exactly how `output_format` survived until now. `anthropic` is
+   declared in `requirements.txt` but **not installed here**, no credential and no
+   endpoint are configured, and `tools/live_provider_check.py` has never run. Whether a
+   provider accepts the payload is `[Unverified]` - E-2/E-6 in
    `plans/LANGGRAPH_HARNESS_PLAN.md`.
 3. **No checkpointer.** `run_routing_job` invokes the graph once and returns; the
    harness gate's "resume from a checkpoint" half needs the Postgres saver that
-   Person A's persistence unblocks. The gate's other half — start a job, complete a
+   Person A's persistence unblocks. The gate's other half - start a job, complete a
    tool call, persist a result, end with schema-valid output, with no real source and
-   no live provider — is met by `test_fake_model_tool_loop.py`.
-4. **Persistence is in-memory.** `RoutingRepository` is the declared seam, and it now
+   no live provider - is met by `test_fake_model_tool_loop.py`.
+4. **Persistence is in-memory.** `RoutingRepository` is the declared seam, and it
    includes `create_job` and `record_model_call` as well as the reads, so Person A's
    adapter supplies the durable model-call count the budget already consults. Until
-   it exists, the count is durable only within one process.
+   it exists, the count is durable only within one process. Note the consequence the
+   remediation tests surface: because the count is durable and job-scoped, running the
+   *same* `job_id` twice consumes the budget twice, and the second run is correctly
+   refused rather than replaying.
 5. **The fake model is deterministic, not intelligent.** It reuses a catalogue table
    id when the catalogue names one; it does not verify that every proposed attribute
    exists in the reused table's columns. Catalogue reuse remains D2 P1 per `D2-LG-3`.
-6. **`contracts.py` gained one import** (`from app.agent.compat import StrEnum`) so the
-   package imports on Python 3.10. The field set, validators and `CONTRACT_VERSION`
-   are unchanged; the file's contract surface is still Person C's, and Gate 0 asks
-   the team to review any edit to it.
+6. **`contracts.py` is unmodified.** An earlier revision of this branch swapped its
+   `from enum import StrEnum` for `from app.agent.compat import StrEnum`, so the module
+   would import on a Python 3.10 floor. The team decided the frozen contract is not to be
+   modified, so that import was **restored** and the file is now byte-identical to the
+   blob on `us4/integration` (line-ending differences aside, since `core.autocrlf=true`
+   checks the file out with CRLF on Windows). `verify_us4_person_b.py` asserts that
+   identity against the working tree, so an uncommitted edit is caught too, and it fails
+   if the delta-declaration list it used to carry is ever repopulated.
+
+   **Consequence to be aware of:** `enum.StrEnum` is Python 3.11+, so `contracts.py` now
+   requires 3.11+ — the 3.10 floor that `app/agent/compat.py` was written for no longer
+   applies to this package. The suite runs on the venv's Python 3.12 and passes. On 3.10
+   the failure is an immediate `ImportError` of a documented name on any import of
+   `app.agent.contracts`, not silent misbehaviour. `app/agent/compat.py` and its test
+   remain in the tree and still pass: `test_compat.py` imports the shim directly, so it is
+   not dead code, but nothing in the agent package depends on it any more.
 7. **`propose` writes `status: "awaiting_review"`** when it accepts a draft, because
    `US4.md` §4.2 gives `propose` the `status` write and the graph ends there. Person D
    may prefer `running` until the package is persisted; that is a one-line change in
@@ -259,7 +288,13 @@ instruction region. Each has a regression test; see
 8. **`max_cost_usd` needs a price.** `run_routing_job(cost_per_1k_tokens_usd=…)` is
    the seam; there is no price table in this package, so with no price passed the
    ceiling is reported as unevaluable rather than silently treated as infinite or as
-   zero.
+   zero. Likewise `max_revisions`, `model_node_timeout_seconds` and
+   `tool_node_timeout_seconds` are declared in the frozen budget surface and read
+   nowhere; the connector call has no timeout of its own.
+9. **`GENLEDGE_LLM_EFFORT` is read and stored but never sent.** The provider documents
+   effort as a request control whose home has moved between top level and
+   `output_config`; sending it is a behaviour change that cannot be validated without a
+   provider, so it is left unsent and recorded here instead of guessed at.
 
 ## 8. Handoff
 

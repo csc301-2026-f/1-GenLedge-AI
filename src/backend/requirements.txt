@@ -1,3 +1,9 @@
 Flask>=3.1,<4
 pydantic>=2.7,<3
 langgraph>=1.2,<2
+# The live model adapter's SDK. Required only for `GENLEDGE_MODEL_MODE=live`; the
+# default `auto` resolves to the deterministic fake when no provider credential or
+# endpoint is configured, and `app/agent/models.py` imports this lazily so the fake
+# path runs without it. The floor is the release that moved structured output to
+# `output_config.format`; the adapter codes against that surface.
+anthropic>=0.77,<1

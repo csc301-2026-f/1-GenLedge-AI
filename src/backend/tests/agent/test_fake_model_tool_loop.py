@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from app.agent.contracts import AgentBudgets, ModelDraft
+from app.agent.contracts import AgentBudgets, ModelDraft, ToolCallRequest
 from app.agent.graph import run_routing_job
 from app.agent.models import (
     FAKE_TARGET_RESOURCE,
@@ -15,7 +15,7 @@ from app.agent.models import (
     provider_configured,
 )
 from app.agent.repositories import ORDER_LINES, SNAPSHOT_ID, seeded_repository
-from app.agent.tools import TOOL_NAMES, FakeConnector
+from app.agent.tools import TOOL_NAMES, FakeConnector, ToolDispatcher
 
 from .doubles import inventory
 
@@ -186,25 +186,46 @@ def test_the_loop_is_exactly_context_propose_tool_call_propose():
 
 
 def test_replaying_the_same_job_reuses_the_recorded_result_with_one_connector_call():
+    """A re-run against a warm store replays the recorded evidence *and uses it*.
+
+    The point of the replay cache is that a resumed job does not re-read the source. The
+    recorded result therefore has to reach the prompt as well as the connector count: a
+    replayed call that is dropped from the state leaves the prompt saying "No tool results
+    recorded yet", the model re-asks, and the job dies on the model budget instead of
+    finishing with the evidence it already had.
+    """
+
     repository = seeded_repository()
     connector = FakeConnector()
+    budgets = AgentBudgets(max_tool_calls=4, max_model_calls=4)
+
     first = run_routing_job(
         job_id="job-replay-1",
         source_snapshot_ids=[SNAPSHOT_ID],
         repository=repository,
         connector=connector,
+        budgets=budgets,
     )
     assert first.failure is None
-    # the repository still holds the recorded result, so a second run replays it
+    assert len(connector.calls) == 1
+
     replay = run_routing_job(
         job_id="job-replay-1",
         source_snapshot_ids=[SNAPSHOT_ID],
         repository=repository,
         connector=connector,
+        budgets=budgets,
     )
-    assert replay.failure is None
+
+    assert replay.failure is None, f"the replayed run failed: {replay.failure}"
+    assert replay.status == "awaiting_review"
+    assert replay.model_draft is not None
     assert len(connector.calls) == 1, "a replayed call must not hit the connector again"
+    assert replay.final_state["tool_results"], "the replayed result must reach the state"
     assert replay.final_state["tool_results"][0].replayed is True
+    assert replay.final_state["tool_results"][0].tool_call_id == FAKE_TOOL_CALL_ID
+    # the model saw the recorded evidence rather than being told there was none
+    assert len(replay.model_responses) == 2, "one tool round, then the draft"
 
 
 def test_cold_start_proposes_new_tables():

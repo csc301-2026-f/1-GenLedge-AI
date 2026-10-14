@@ -43,7 +43,14 @@ from app.agent.errors import (
 from app.agent.models import ModelClient, ModelRequest, ModelResponse, parse_model_draft
 from app.agent.repositories import CatalogueView, RoutingRepository
 from app.agent.state import RoutingJobState
-from app.agent.tools import FakeConnector, ToolConnector, ToolDispatcher, ToolResult, tool_schemas
+from app.agent.tools import (
+    STORAGE_FAILED,
+    FakeConnector,
+    ToolConnector,
+    ToolDispatcher,
+    ToolResult,
+    tool_schemas,
+)
 
 CONTEXT = "context"
 PROPOSE = "propose"
@@ -53,6 +60,11 @@ TOOL_CALL = "tool_call"
 #: `propose` write `status`; this is the terminal value it writes when the model
 #: answers with a draft and the graph ends.
 AWAITING_REVIEW = "awaiting_review"
+
+#: How many result references stay on the state. The store keeps every row, so this
+#: bounds checkpoint growth without losing the audit trail; the prompt projection caps
+#: what it reads at `prompts.MAX_PROJECTED_TOOL_RESULTS` regardless.
+MAX_RETAINED_TOOL_RESULTS = 20
 
 NODE_NAMES: tuple[str, ...] = (CONTEXT, PROPOSE, TOOL_CALL)
 
@@ -84,16 +96,61 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _failure_update(error: AgentFailure | FailureInfo) -> dict[str, Any]:
+def _failure_update(
+    error: AgentFailure | FailureInfo, state: RoutingJobState | None = None
+) -> dict[str, Any]:
+    """A terminal update: the failure, the status, and the rounds the run spent.
+
+    `tool_rounds_used` is written by every failure because it is a declared write of both
+    `propose` and `tool_call`, and leaving it out of one branch is exactly the drift the
+    node-write guard exists to catch. It carries the **accumulated** value, not zero: a
+    zeroed counter hides how long the loop actually ran, which is the one diagnostic a
+    budget failure has to offer.
+    """
+
     failure = error.to_failure_info() if isinstance(error, AgentFailure) else error
-    return {"failure": failure, "status": "failed", "updated_at": _now()}
+    rounds = state_module.accumulated_rounds(state) if state is not None else 0
+    return {
+        "failure": failure,
+        "status": "failed",
+        "tool_rounds_used": rounds,
+        "updated_at": _now(),
+    }
 
 
 def _budget_counter(state: RoutingJobState, runtime: GraphRuntime) -> int:
-    """The model-call count that governs the budget: the durable record wins."""
+    """The model-call count that governs the budget: the durable record wins.
 
-    durable = runtime.repository.get_model_call_count(state.get("job_id", ""))
+    A control-store fault is a typed failure, not an escaping exception — the same
+    rule `context` applies to its reads. `AgentFailure` is raised and caught by the
+    callers, which are all inside a node.
+    """
+
+    try:
+        durable = runtime.repository.get_model_call_count(state.get("job_id", ""))
+    except Exception as error:  # noqa: BLE001 - a store fault is data, not a crash
+        raise AgentFailure(
+            REPOSITORY_UNAVAILABLE,
+            f"the durable model-call count could not be read: {type(error).__name__}: {error}",
+            retryable=True,
+        ) from error
     return max(durable, state.get("model_calls_used", 0)) if durable else state.get("model_calls_used", 0)
+
+
+def _record_model_call(runtime: GraphRuntime, state: RoutingJobState, response: ModelResponse | None) -> None:
+    """Record one provider call durably. Best effort, but never silently skipped.
+
+    The durable row count is the model budget's authority (`repositories.py`), so a
+    call that happened must be recorded even when the adapter raised: an unrecorded
+    call is a call a crash loop can spend again.
+    """
+
+    try:
+        runtime.repository.record_model_call(
+            state.get("job_id", ""), node=PROPOSE, tokens=response.tokens if response else 0
+        )
+    except Exception as error:  # noqa: BLE001 - the call happened; the record is best effort
+        logger.warning("could not record the model call for %s: %s", state.get("job_id"), error)
 
 
 # --- context -------------------------------------------------------------------
@@ -253,18 +310,50 @@ def _estimated_cost_usd(state: RoutingJobState, runtime: GraphRuntime) -> float 
 
 
 def propose_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, Any]:
-    """One structured model call per invocation, with one repair attempt."""
+    """One structured model call per invocation, with one repair attempt.
 
+    Every storage read this node performs is wrapped: a control-store fault becomes a
+    typed `repository_unavailable` failure, never a traceback out of
+    `run_routing_job` (`nodes.context_node` applies the same rule to its reads).
+    """
+
+    try:
+        return _propose(state, runtime=runtime)
+    except AgentFailure as error:
+        return _failure_update(error, state)
+    except Exception as error:  # noqa: BLE001 - the node boundary owns typed failures
+        return _failure_update(
+            AgentFailure(
+                REPOSITORY_UNAVAILABLE,
+                f"propose failed on a {type(error).__name__}: {error}",
+                retryable=True,
+            ),
+            state,
+        )
+
+
+def _propose(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, Any]:
     budgets = state["budgets"]
+
+    # `tool_call -> propose` is an unconditional edge, so `propose` runs even when the
+    # round it just left failed terminally. A recorded failure is final: re-deciding it
+    # here used to clear the failure (and reset the tool-round counter), which re-armed
+    # the loop and made `max_tool_calls` unable to stop a model that kept re-requesting
+    # one `tool_call_id`.
+    existing = state.get("failure")
+    if existing is not None:
+        return _failure_update(existing, state)
+
     inventory = runtime.inventory
     if inventory is None:
         return _failure_update(
-            AgentFailure(EMPTY_INVENTORY, "context did not load an inventory", retryable=False)
+            AgentFailure(EMPTY_INVENTORY, "context did not load an inventory", retryable=False),
+            state,
         )
 
     stop = _budget_stop(state, runtime, budgets)
     if stop is not None:
-        return _failure_update(stop)
+        return _failure_update(stop, state)
 
     model = runtime.model
     if model is None:
@@ -273,7 +362,8 @@ def propose_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, 
                 MODEL_CONFIGURATION_ERROR,
                 "no model client was configured for this run",
                 retryable=False,
-            )
+            ),
+            state,
         )
 
     try:
@@ -287,7 +377,8 @@ def propose_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, 
     except prompt_module.PromptError as error:
         # A rendering fault is a typed job failure. It must never escape the graph.
         return _failure_update(
-            AgentFailure(PROMPT_RENDER_FAILED, f"prompt rendering failed: {error}", retryable=False)
+            AgentFailure(PROMPT_RENDER_FAILED, f"prompt rendering failed: {error}", retryable=False),
+            state,
         )
     request = ModelRequest(
         node=PROPOSE,
@@ -312,26 +403,28 @@ def propose_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, 
             f"the model adapter raised {type(error).__name__}: {error}",
             retryable=True,
         )
-        update = _failure_update(failure)
+        # The provider was called, even though it raised. Recording it durably is what
+        # keeps the budget authority honest across a crash: an unrecorded call is a call
+        # a crash loop can spend again, which is the opposite of what the module claims.
+        _record_model_call(runtime, state, None)
+        update = _failure_update(failure, state)
         update.update(
             {
-                "model_calls_used": _budget_counter(state, runtime) + 1,
+                "model_calls_used": _budget_counter(state, runtime),
                 "messages": _messages(rendered, ModelResponse(error_code=failure.code)),
                 "prompt_ref": rendered.ref,
             }
         )
         return update
     runtime.responses.append(response)
-    try:
-        runtime.repository.record_model_call(state.get("job_id", ""), node=PROPOSE, tokens=response.tokens)
-    except Exception as error:  # noqa: BLE001 - the call happened; the record is best effort
-        logger.warning("could not record the model call for %s: %s", state.get("job_id"), error)
+    _record_model_call(runtime, state, response)
     calls_used = _budget_counter(state, runtime)
     tokens_used = state.get("tokens_used", 0) + response.tokens
 
     if response.error_code:
         update = _failure_update(
-            AgentFailure(response.error_code, response.error_message or response.error_code)
+            AgentFailure(response.error_code, response.error_message or response.error_code),
+            state,
         )
         update.update(
             {
@@ -352,11 +445,14 @@ def propose_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, 
                     TOOL_BUDGET_EXHAUSTED,
                     f"tool call budget exhausted ({budgets.max_tool_calls})",
                     retryable=False,
-                )
+                ),
+                state,
             )
         else:
             update = {
                 "pending_tool_calls": list(response.tool_calls),
+                # A new tool round begins; `tool_call` increments and bounds the total.
+                "tool_rounds_used": state.get("tool_rounds_used", 0),
                 "status": "running",
                 "failure": None,
             }
@@ -389,7 +485,8 @@ def propose_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, 
         if repaired is None:
             after = " after one repair attempt" if attempted else " (no repair was attempted)"
             update = _failure_update(
-                InvalidModelOutputError(f"model output failed the contract{after}: {contract_error}")
+                InvalidModelOutputError(f"model output failed the contract{after}: {contract_error}"),
+                state,
             )
             update.update(
                 {
@@ -410,6 +507,8 @@ def propose_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, 
         "revision_count": revision,
         "model_calls_used": calls_used,
         "tokens_used": tokens_used,
+        # The draft ends the run, so the round counter is closed here.
+        "tool_rounds_used": 0,
         "messages": _messages(rendered, response),
         "prompt_ref": rendered.ref,
         # `propose -> END`: the run is over, and a reviewable draft exists.
@@ -466,13 +565,15 @@ def _attempt_repair(
     try:
         response = model.invoke(request)
     except Exception as error:  # noqa: BLE001 - an adapter fault is data, not a crash
+        # The provider was called. Reporting `attempted=False` here told the reviewer
+        # "no repair was attempted" while two requests had gone out, and left the call
+        # out of the durable count.
         logger.warning("the repair call for %s raised: %s", state.get("job_id"), error)
-        return None, 0, False
+        _record_model_call(runtime, state, None)
+        runtime.repairs_used += 1
+        return None, 0, True
     runtime.responses.append(response)
-    try:
-        runtime.repository.record_model_call(state.get("job_id", ""), node=PROPOSE, tokens=response.tokens)
-    except Exception as error:  # noqa: BLE001 - the call happened; the record is best effort
-        logger.warning("could not record the repair call for %s: %s", state.get("job_id"), error)
+    _record_model_call(runtime, state, response)
     runtime.repairs_used += 1
     if response.error_code or response.tool_calls:
         return None, response.tokens, True
@@ -496,8 +597,36 @@ def _messages(rendered: prompt_module.RenderedPrompt, response: ModelResponse) -
 # --- tool_call -----------------------------------------------------------------
 
 
+def _tool_call_failure(error: AgentFailure | FailureInfo, state: RoutingJobState) -> dict[str, Any]:
+    """A terminal `tool_call` update that also closes the pending round.
+
+    Clearing `pending_tool_calls` is load-bearing, not tidiness. The routers decide from
+    state, and `route_after_propose` sends the run back to `tool_call` whenever
+    `pending_tool_calls` is non-empty — so a failure that left the requests in place was
+    re-routed into another round, the round counter was reset by the next `propose`, and
+    the tool budget never actually stopped the loop (it just failed four rounds and
+    restarted).
+    """
+
+    update = _failure_update(error, state)
+    update["pending_tool_calls"] = []
+    return update
+
+
 def tool_call_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, Any]:
-    """Authorize, budget, replay, dispatch, redact and persist each pending call."""
+    """Authorize, budget, replay, dispatch, redact and persist each pending call.
+
+    The step contract is `US4.md` §4.2. Two properties are load-bearing here:
+
+    * **the tool budget is enforced on rounds, not only on connector reads.** A model
+      that keeps re-requesting a `tool_call_id` it already used gets a free replay,
+      which would leave `max_tool_calls` unable to stop a loop at all; charging the
+      round makes the configured budget the bound it claims to be, while a genuine
+      *retry* of the same call still replays its recorded result and returns it.
+    * **a storage fault is a typed failure, not a traceback.** Every repository
+      interaction goes through the dispatcher or a guard, so a control-store outage
+      ends the job as `repository_unavailable` instead of escaping the graph.
+    """
 
     dispatcher = runtime.dispatcher
     pending = list(state.get("pending_tool_calls", []))
@@ -505,19 +634,97 @@ def tool_call_node(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str
         return {"pending_tool_calls": [], "updated_at": _now()}
 
     used = state.get("tool_calls_used", 0)
+    rounds = state.get("tool_rounds_used", 0) + 1
+    if rounds > state["budgets"].max_tool_calls:
+        # Charged connector reads are not the only thing `max_tool_calls` bounds: a
+        # replayed call is free, so a model that keeps re-requesting the same
+        # `tool_call_id` would otherwise loop until `max_model_calls` while the tool
+        # budget never fired. The round is the bound.
+        return _tool_call_failure(
+            AgentFailure(
+                TOOL_BUDGET_EXHAUSTED,
+                f"tool call budget exhausted ({state['budgets'].max_tool_calls}); "
+                "the run spent its tool rounds without producing a proposal",
+                retryable=False,
+            ),
+            state,
+        )
+    if used >= state["budgets"].max_tool_calls:
+        # Every remaining read is over budget: no dispatch, no partial batch.
+        return _tool_call_failure(
+            AgentFailure(
+                TOOL_BUDGET_EXHAUSTED,
+                f"tool call budget exhausted ({state['budgets'].max_tool_calls})",
+                retryable=False,
+            ),
+            state,
+        )
+
     refs: list[ToolResultRef] = []
-    for request in pending:
-        outcome = dispatcher.dispatch(request, job_id=state.get("job_id", ""), tool_calls_used=used)
-        if outcome.charged:
-            used += 1
-        # Errors are kept too: they are the typed data the model has to adapt to, and
-        # the projection is where they become prompt text.
-        runtime.tool_results.append(outcome.result)
-        refs.append(outcome.ref)
+    seen_call_ids: set[str] = set()
+    #: Refs already on the state. Within one run the reducer is `operator.add`, so a
+    #: replayed call must not append a second copy; a re-run against a warm store starts
+    #: with an empty list, and there the recorded result *is* the evidence the prompt needs.
+    seen_refs = {ref.result_ref for ref in state.get("tool_results", [])}
+    try:
+        for request in pending:
+            outcome = dispatcher.dispatch(
+                request,
+                job_id=state.get("job_id", ""),
+                # `used` is the count of *charged* calls so far, and it advances inside this
+                # loop. Passing an index instead counted refused requests as if they had
+                # spent budget, so a batch whose first entry was refused pre-dispatch got
+                # its second, valid entry refused with `budget_exhausted` while nothing had
+                # reached the connector.
+                tool_calls_used=used,
+                seen_call_ids=seen_call_ids,
+            )
+            if outcome.charged:
+                used += 1
+            if outcome.result.error_code == STORAGE_FAILED:
+                # The result could not be recorded, so there is no evidence row and no
+                # replay key. Continuing would build a proposal on a tool call the
+                # system cannot account for.
+                return _tool_call_failure(
+                    AgentFailure(REPOSITORY_UNAVAILABLE, outcome.result.message or "storage failed",
+                                 retryable=True),
+                    state,
+                )
+            if outcome.replayed and outcome.ref.result_ref in seen_refs:
+                # The ref is already on this state, so `operator.add` must not see it twice.
+                # The *payload* still has to be reachable: the prompt projects the last
+                # `MAX_PROJECTED_TOOL_RESULTS` results, so an older replay dropped entirely
+                # would be invisible, the model would re-ask, and the run would die on a
+                # budget instead of using evidence it had already fetched. Moving it to the
+                # end keeps both properties.
+                runtime.tool_results = [
+                    item for item in runtime.tool_results if item.result_ref != outcome.ref.result_ref
+                ] + [outcome.result]
+                continue
+            # Errors are kept too: they are the typed data the model has to adapt to, and
+            # the projection is where they become prompt text. So are replays whose ref is
+            # not on this state yet — dropping them made the prompt say "No tool results
+            # recorded yet", the model re-asked for the same call, and a resumed job died
+            # on the model budget instead of using the evidence it had just fetched.
+            runtime.tool_results.append(outcome.result)
+            refs.append(outcome.ref)
+            seen_refs.add(outcome.ref.result_ref)
+    except AgentFailure as error:
+        return _tool_call_failure(error, state)
+    except Exception as error:  # noqa: BLE001 - a store fault is data, not a crash
+        return _tool_call_failure(
+            AgentFailure(
+                REPOSITORY_UNAVAILABLE,
+                f"tool dispatch failed on a {type(error).__name__}: {error}",
+                retryable=True,
+            ),
+            state,
+        )
 
     return {
-        "tool_results": refs,
+        "tool_results": refs[-MAX_RETAINED_TOOL_RESULTS:],
         "tool_calls_used": used,
+        "tool_rounds_used": rounds,
         "pending_tool_calls": [],
         "messages": [
             {"role": "tool", "tool_call_ids": [request.id for request in pending]},

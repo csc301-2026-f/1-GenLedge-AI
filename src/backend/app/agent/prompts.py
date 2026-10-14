@@ -103,7 +103,8 @@ def projected(value: Any, field_path: str = "") -> Any:
     and the two that were missed — `snapshot_id` and `resource_id` — were missed
     precisely because a hand-applied rule has no chokepoint. Routing everything through
     one function makes "did we forget a site?" answerable by reading one place, and
-    `test_every_projected_value_passes_the_chokepoint` asserts each site uses it.
+    `test_no_forgery_vector_can_close_a_block` and the per-field fuzz in
+`test_prompt_boundary_fuzz.py` are what assert each site uses it.
     """
 
     return neutralise_delimiters(redact_value(value, field_path))
@@ -282,8 +283,15 @@ def project_inventory(inventory: Any) -> str:
         path = _bounded_text(projected(_field_path(field.ref.resource_id, field.ref.field_path), "field_path"))
         # A single sample is capped too: the block-level cap protects the total, this
         # protects against one pathological value (a 100k-char string) crowding out
-        # every other field before the block cap is even reached.
-        samples = [_bounded_text(projected(value, field.ref.field_path)) for value in field.samples[:3]]
+        # every other field before the block cap is even reached. The path is the
+        # field-path argument as well as the value's own name, so a field whose *name*
+        # says what it holds (`customers.email`) has its samples replaced too — a
+        # redaction rule that only looked at the value would still project
+        # `ada@example.com` as the sample of a field called `email`.
+        samples = [
+            _bounded_text(projected(value, f"{field.ref.field_path} {field.ref.resource_id}"))
+            for value in field.samples[:3]
+        ]
         detail = [
             f"type={field.type.value if hasattr(field.type, 'value') else field.type}",
             f"nullable={field.nullable}",
@@ -366,7 +374,10 @@ def project_tool_results(results: list[ToolResult]) -> str:
             blocks.append(f"- {tool} (tool_call_id={call_id}): {rendered}")
             continue
         failure = {
-            "error_code": result.error_code,
+            # `error_code` is `str | None` on an unconstrained model, so it is a
+            # source-derived token like any other and goes through the same chokepoint
+            # as the tool name and call id above.
+            "error_code": projected(result.error_code, "error_code"),
             "message": _bounded_text(str(projected(result.message or "", "message"))),
         }
         blocks.append(

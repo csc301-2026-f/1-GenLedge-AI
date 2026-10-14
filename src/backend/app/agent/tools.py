@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Protocol
+from typing import Annotated, Any, Protocol
 
-from pydantic import Field, ValidationError
+from pydantic import Field, StringConstraints, ValidationError
 
 from app.agent.contracts import AgentBudgets, InventoryView, StrictModel, ToolCallRequest, ToolResultRef
 
@@ -39,12 +39,15 @@ TOOL_NAMES: tuple[str, ...] = (
 #: Result envelope codes. Model-authored problems are errors the model reads;
 #: `unauthorized_source` is additionally a security event.
 INVALID_ARGUMENTS = "invalid_arguments"
+INVALID_TOOL_REQUEST = "invalid_tool_request"
 UNAUTHORIZED_SOURCE = "unauthorized_source"
 RESOURCE_NOT_FOUND = "resource_not_found"
 UNSUPPORTED = "unsupported"
 BUDGET_EXHAUSTED = "budget_exhausted"
 SNAPSHOT_DRIFTED = "snapshot_drifted"
 CONNECTOR_ERROR = "connector_error"
+REPLAY_MISMATCH = "replay_mismatch"
+STORAGE_FAILED = "storage_failed"
 
 REDACTION_MARKER = "[redacted]"
 #: Credential *words*, and any connection string. The scheme list is open-ended on
@@ -61,46 +64,154 @@ _CREDENTIAL = re.compile(
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}")
 #: A card-like run of digits is never safe to project, whatever the field is called.
 _PAYMENT_CARD = re.compile(r"\b(?:\d[ -]?){12,18}\d\b")
-_SENSITIVE_FIELD = re.compile(r"(password|passwd|secret|token|api[_-]?key|credential|ssn|email)", re.I)
+#: A credential literal used *as a key* (`{"sk-live-...": ...}`) matches no field name
+#: and, on its own, no credential word. The well-known vendor prefixes are what make it
+#: recognisable.
+_SECRET_SHAPED = re.compile(
+    r"\b(?:sk|pk|rk|ak|ghp|gho|github_pat|xox[abprs])[-_][A-Za-z0-9_\-]{8,}"
+    r"|\b(?:AKIA|ASIA)[0-9A-Z]{12,}\b"
+    r"|\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.",
+)
+#: Contact details and personal identifiers — `plans/us4-four-person-task-split.md`
+#: line 184's "phone, address, identifiers" categories. Unanchored and
+#: separator-tolerant, because a phone number inside a free-text sample is still one.
+_IDENTIFIER = re.compile(
+    # North-American style phone: 555-123-4567, (555) 123 4567, +1 555.123.4567
+    r"(?:\+?\d{1,3}[ .\-]?)?(?:\(\d{3}\)|\d{3})[ .\-]\d{3}[ .\-]?\d{4}\b"
+    # US SSN, with or without separators
+    r"|\b\d{3}[ .\-]\d{2}[ .\-]\d{4}\b"
+    # IBAN-like: two letters, two digits, then 11+ alphanumerics
+    r"|\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b"
+    # A street-address line
+    r"|\b\d{1,6}\s+[A-Za-z][A-Za-z'.\-]*(?:\s+[A-Za-z][A-Za-z'.\-]*){0,3}\s+"
+    r"(?:Street|St|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl|Terrace|Ter)\.?\b",
+    re.I,
+)
+#: Field names whose *values* are restricted whatever they contain. Kept next to the
+#: content patterns so both halves of the policy are read together. `\b` on the short
+#: words matters: an unanchored `card` also matched `declared_key`, which would have
+#: redacted every `describe_resource` answer.
+_SENSITIVE_FIELD = re.compile(
+    r"(password|passwd|\bpass\b|\bpwd\b|passphrase|secret|token|api[_-]?key"
+    r"|access[_-]?key|private[_-]?key|credential|ssn|social[_-]?security"
+    r"|email|e[_-]?mail|phone|mobile|address|street|postcode|postal|zip|dob|birth"
+    r"|passport|licen[cs]e|national[_-]?id|account[_-]?(?:number|no|id)"
+    r"|authorization|bearer|\bjwt\b|\bpin\b|\biban\b|\bswift\b|routing|\bcvv\b"
+    r"|card[_-]?(?:number|no|id)|\bcard\b)",
+    re.I,
+)
+
+
+def canonical_arguments(name: str, arguments: dict[str, Any] | None) -> str:
+    """A stable fingerprint of one tool request, used to prove a replay is a retry.
+
+    A `tool_call_id` is model-authored, so a recorded result proves nothing about
+    *what* was requested. The recorded tool name plus this digest is what makes a
+    replay a re-execution of the same call rather than an answer to a different one.
+    """
+
+    return json.dumps({"name": name, "arguments": arguments or {}}, sort_keys=True, default=str)
+
+
+def _restricted_text(haystack: str) -> bool:
+    """True when a rendered scalar contains a restricted pattern."""
+
+    return bool(
+        _CREDENTIAL.search(haystack)
+        or _EMAIL.search(haystack)
+        or _PAYMENT_CARD.search(haystack)
+        or _IDENTIFIER.search(haystack)
+    )
+
+
+def _restricted_name(name: str) -> bool:
+    """True when a *key* names a restricted value, or is itself credential-shaped.
+
+    Two different things, and the difference matters for keys: `credentials` and
+    `password` are **field names** — a payload keeps them and redacts the value, because
+    callers index and iterate the mapping. `sk-live-...` is a **credential literal** used
+    as a name, which is not a field name at all and is replaced.
+    """
+
+    return bool(_SENSITIVE_FIELD.search(name) or _SECRET_SHAPED.search(name))
+
+
+def _credential_literal(name: str) -> bool:
+    """True only for a key that is itself credential material, not a field name."""
+
+    return bool(_SECRET_SHAPED.search(name))
 
 
 def redact_value(value: Any, field_path: str = "") -> Any:
-    """Replace credential-like and contact-like values with a stable marker.
+    """Replace credential-like, contact-like and identifier-like values with a marker.
 
-    Applied at the tool layer *before* persistence, so a restricted value is not
+    Applied at the tool layer *before persistence*, so a restricted value is not
     stored in a tool result at all — and therefore cannot be projected into a prompt
     later. Structure is preserved; only the offending scalar is replaced.
 
-    Detection is deliberately broad and `search`-based: any `scheme://user:pass@host`
-    connection string, any e-mail address anywhere in a longer string, any card-like
-    run of digits, and any value under a field whose name says it is sensitive. A
-    false positive costs a `[redacted]` marker in a prompt; a false negative costs a
-    credential.
+    Four rules, and the order matters:
+
+    1. **Field name decides first, whatever the value is.** This check has to come
+       before the container branches, not after them: a mapping under a key that names
+       restricted data (`{"credentials": {"user": ..., "pass": ...}}`) is restricted as a
+       whole subtree. Checking the name only when the value was a scalar meant the
+       container branch matched first, the key was replaced, and the plaintext *values*
+       inside it were projected into the prompt while the row was stamped `redacted`.
+    2. **Content**, against the *string form* of any scalar — not only `str` values.
+       A card number or phone number stored as an `int`/`float` is exactly as
+       restricted as one stored as text, and gating on `isinstance(value, str)` let
+       `{"card_number": 4111111111111111}` through untouched.
+    3. **Keys are redacted too.** `{"sk-live-...": "value"}` previously reached the
+       prompt verbatim, key included.
+    4. **Recursion** into lists, tuples and dicts, where a nested key becomes the
+       field path for the value beneath it.
+
+    A false positive costs a `[redacted]` marker in a prompt; a false negative costs
+    a credential.
     """
 
-    if isinstance(value, str) and (
-        _CREDENTIAL.search(value)
-        or _EMAIL.search(value)
-        or _PAYMENT_CARD.search(value)
-    ):
+    if _restricted_name(field_path or ""):
+        # Rule 1: the name decides, whatever the value is — scalar or subtree.
         return REDACTION_MARKER
-    if _SENSITIVE_FIELD.search(field_path or ""):
-        if isinstance(value, (list, tuple)):
-            return [REDACTION_MARKER for _ in value]
-        return REDACTION_MARKER
-    if isinstance(value, list):
-        return [redact_value(item, field_path) for item in value]
-    if isinstance(value, tuple):
-        return [redact_value(item, field_path) for item in value]
     if isinstance(value, dict):
-        return {str(key): redact_value(item, str(key)) for key, item in value.items()}
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            safe_key = REDACTION_MARKER if _credential_literal(name) else name
+            redacted[safe_key] = redact_value(item, name)
+        return redacted
+    if isinstance(value, (list, tuple)):
+        return [redact_value(item, field_path) for item in value]
+    if isinstance(value, bool) or value is None:
+        # `True`/`False` carry no restricted content; `None` is not a value.
+        return value
+    if isinstance(value, (int, float)):
+        return REDACTION_MARKER if _restricted_text(str(value)) else value
+    if isinstance(value, str):
+        return REDACTION_MARKER if _restricted_text(value) else value
     return value
 
 
 def redact_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Redact a whole tool payload. Keys are treated as field paths."""
+    """Redact a whole tool payload, preserving its shape.
 
-    return {str(key): redact_value(value, str(key)) for key, value in payload.items()}
+    Keys are treated as field paths, and a key that *names* restricted data keeps its
+    place in the mapping with a redacted value — it is not dropped and the mapping is not
+    replaced by a scalar, because callers index and iterate the result
+    (`payload["resource_id"]`, `_rows_of(redacted)`). `redact_value` describes the value's
+    own subtree; this function describes the envelope around it.
+    """
+
+    redacted: dict[str, Any] = {}
+    for key, value in payload.items():
+        name = str(key)
+        # A field-named key keeps its place so callers can still index the payload; a key
+        # that *is* credential material is not a field name and does not survive.
+        safe_key = REDACTION_MARKER if _credential_literal(name) else name
+        redacted[safe_key] = (
+            REDACTION_MARKER if _restricted_name(name) else redact_value(value, name)
+        )
+    return redacted
 
 
 def merge_path(resource_id: str, field_path: str) -> str:
@@ -144,6 +255,49 @@ class ToolArgumentModel(StrictModel):
     """Base for per-tool argument models; unknown fields are rejected."""
 
 
+#: A free-form pass-through argument (a path, a cursor, a page token) is a place where
+#: the model can put anything, and a connector will hand it to a backend. Constraining
+#: it to a path-shaped token is what keeps `path="x; DROP TABLE orders"` from being a
+#: legal argument — the same control the field-path check applies to `fields`.
+SafeToken = Annotated[
+    str, StringConstraints(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_./\[\]\-]*$")
+]
+
+
+def rejects_traversal(token: str | None) -> bool:
+    """True when a token could name a location outside the source.
+
+    The character class on `SafeToken` admits `.` and `/`, which is what a path-shaped
+    token needs — and also what `../../etc/passwd` needs. The `..` segment is the obvious
+    case, but not the only one a connector can be tricked by:
+
+    * `....//....//etc/passwd` collapses to `../../…` under a normaliser that strips a
+      single `../` per pass;
+    * an absolute path wins outright, because `os.path.join(root, "/etc/passwd")` returns
+      the absolute path and ignores `root`;
+    * a drive letter or a UNC prefix does the same on Windows.
+
+    All three are refused, and the token is normalised before the segment test so a
+    doubled separator cannot hide one.
+    """
+
+    if token is None:
+        return False
+    text = str(token).strip()
+    if not text:
+        return False
+    # Absolute, drive-qualified or UNC: joining this to a root escapes the root.
+    if text.startswith(("/", "\\")) or (len(text) > 1 and text[1] == ":"):
+        return True
+    collapsed = text.replace("\\", "/")
+    # Collapse the repetitions a normaliser folds, then look for the escape again: this
+    # is what makes `....//....//etc/passwd` visible.
+    while "//" in collapsed:
+        collapsed = collapsed.replace("//", "/")
+    segments = [segment for segment in collapsed.split("/") if segment not in ("", ".")]
+    return any(segment == ".." or segment.endswith("..") for segment in segments)
+
+
 class ToolResultModel(StrictModel):
     """Base for per-tool result models.
 
@@ -156,8 +310,8 @@ class ToolResultModel(StrictModel):
 
 class ListResourcesArgs(ToolArgumentModel):
     source_id: str = Field(min_length=1)
-    path: str | None = None
-    page_token: str | None = None
+    path: SafeToken | None = None
+    page_token: SafeToken | None = None
 
 
 class DescribeResourceArgs(ToolArgumentModel):
@@ -188,7 +342,7 @@ class CompareFieldsArgs(ToolArgumentModel):
 
 class GetChangesArgs(ToolArgumentModel):
     source_id: str = Field(min_length=1)
-    cursor: str | None = None
+    cursor: SafeToken | None = None
 
 
 class ResourceSummaryResult(StrictModel):
@@ -310,6 +464,10 @@ class ToolResult(StrictModel):
     job_id: str = Field(min_length=1)
     tool_call_id: str = Field(min_length=1)
     tool: str = Field(min_length=1)
+    #: The validated arguments this call actually ran with. `tool_call_id` is
+    #: model-authored, so without this a recorded row cannot prove *what* was asked
+    #: for, and a replay under a reused id would hand back another call's payload.
+    arguments: dict[str, Any] = Field(default_factory=dict)
     status: str
     payload: dict[str, Any] = Field(default_factory=dict)
     error_code: str | None = None
@@ -445,11 +603,51 @@ class ToolDispatcher:
             paths.add(merge_path(field.ref.resource_id, field.ref.field_path))
         return paths
 
+    def field_paths_for(self, resource_id: str) -> set[str]:
+        """The field paths that belong to **one** resource, in both accepted forms.
+
+        `allowed_field_paths()` is a union over every resource, so on its own it
+        authorizes `sample_rows(resource_id="customers", fields=["lines[].sku"])` — a
+        field of `orders.lines[]` read under another resource's name. Scope is
+        per-resource, so the accepted set has to be too.
+        """
+
+        paths: set[str] = set()
+        for field in self.inventory.fields:
+            if field.ref.resource_id != resource_id:
+                continue
+            paths.add(field.ref.field_path)
+            paths.add(merge_path(field.ref.resource_id, field.ref.field_path))
+        return paths
+
     # -- dispatch --------------------------------------------------------------
-    def dispatch(self, request: ToolCallRequest, *, job_id: str, tool_calls_used: int) -> ToolOutcome:
+    def dispatch(
+        self,
+        request: ToolCallRequest,
+        *,
+        job_id: str,
+        tool_calls_used: int,
+        seen_call_ids: set[str] | None = None,
+    ) -> ToolOutcome:
         spec = TOOL_SPECS.get(request.name)
         if spec is None:
             return self._error(request, job_id, UNSUPPORTED, f"tool {request.name!r} is not supported")
+
+        # The `tool_call_id` is model-authored and is the harness's replay key, so a
+        # repeated id inside one batch would answer the second request with the
+        # first's payload. The batch is refused whole: the model must re-ask with
+        # distinct ids, and nothing partial is recorded.
+        if seen_call_ids is not None:
+            if request.id in seen_call_ids:
+                return self._error(
+                    request,
+                    job_id,
+                    INVALID_TOOL_REQUEST,
+                    f"tool_call_id {request.id!r} appears more than once in one batch; "
+                    "each requested call needs its own id",
+                    persist=False,
+                )
+            seen_call_ids.add(request.id)
 
         try:
             arguments = spec.arguments.model_validate(request.arguments)
@@ -459,20 +657,37 @@ class ToolDispatcher:
                 job_id,
                 INVALID_ARGUMENTS,
                 f"arguments do not match {request.name}: {_brief(error)}",
+                persist=False,
             )
 
         scope_error = self._scope_error(arguments)
         if scope_error is not None:
             code, message = scope_error
-            if code == UNAUTHORIZED_SOURCE:
+            if code in (UNAUTHORIZED_SOURCE, RESOURCE_NOT_FOUND):
+                # A probe for a source or resource outside the job's snapshot is an
+                # authorization event whether or not the id exists here.
                 self.security_events.append(
                     {"job_id": job_id, "tool_call_id": request.id, "tool": request.name, "code": code}
                 )
-            return self._error(request, job_id, code, message)
+            return self._error(request, job_id, code, message, arguments=request.arguments, persist=False)
 
-        # Replay before the budget check: a replayed call must not double-count.
         recorded = self.repository.get_tool_result(job_id, request.id)
         if recorded is not None:
+            # The id alone proves nothing — it is model-authored. A replay answers
+            # the *same* call; a different tool or different arguments under the same
+            # id is a stale or forged replay and must not receive the other payload.
+            # Both sides are compared in validated form, so an omitted default is not a
+            # difference.
+            if recorded.tool != request.name or recorded.arguments != arguments.model_dump():
+                return self._error(
+                    request,
+                    job_id,
+                    REPLAY_MISMATCH,
+                    f"tool_call_id {request.id!r} was already recorded for "
+                    f"{recorded.tool!r} with different arguments; refusing the replay",
+                    arguments=request.arguments,
+                    persist=False,
+                )
             return ToolOutcome(result=recorded, replayed=True, charged=False)
 
         if tool_calls_used >= self.budgets.max_tool_calls:
@@ -481,6 +696,7 @@ class ToolDispatcher:
                 job_id,
                 BUDGET_EXHAUSTED,
                 f"tool call budget exhausted ({self.budgets.max_tool_calls})",
+                arguments=request.arguments,
                 persist=False,
             )
 
@@ -488,9 +704,11 @@ class ToolDispatcher:
         try:
             raw = self.connector.call(request.name, payload, job_id)
         except ConnectorError as error:
-            return self._error(request, job_id, error.code, error.message, charge=True)
+            return self._error(request, job_id, error.code, error.message, arguments=payload, charge=True)
         except Exception as error:  # noqa: BLE001 - a connector fault is data, not a crash
-            return self._error(request, job_id, CONNECTOR_ERROR, str(error), charge=True)
+            return self._error(
+                request, job_id, CONNECTOR_ERROR, str(error), arguments=payload, charge=True
+            )
 
         # Boundary 4: validate the connector's answer *inside* the guarded block, so
         # a shape the harness did not declare is data rather than an exception.
@@ -504,10 +722,11 @@ class ToolDispatcher:
                 job_id,
                 CONNECTOR_ERROR,
                 f"{request.name} result does not match its contract: {_brief(error)}",
+                arguments=payload,
                 charge=True,
             )
         except ConnectorError as error:
-            return self._error(request, job_id, error.code, error.message, charge=True)
+            return self._error(request, job_id, error.code, error.message, arguments=payload, charge=True)
 
         redacted = {key: redact_value(value, key) for key, value in validated.model_dump().items()}
         size = payload_bytes(redacted)
@@ -520,6 +739,7 @@ class ToolDispatcher:
                 job_id,
                 BUDGET_EXHAUSTED,
                 f"result of {size} bytes exceeds max_tool_bytes ({self.budgets.max_tool_bytes})",
+                arguments=payload,
                 charge=True,
             )
 
@@ -530,6 +750,7 @@ class ToolDispatcher:
                 job_id,
                 BUDGET_EXHAUSTED,
                 f"result of {len(rows)} rows exceeds max_tool_rows ({self.budgets.max_tool_rows})",
+                arguments=payload,
                 charge=True,
             )
 
@@ -538,39 +759,92 @@ class ToolDispatcher:
             job_id=job_id,
             tool_call_id=request.id,
             tool=request.name,
+            arguments=payload,
             status="ok",
             payload=redacted,
             redacted=True,
             bytes_estimate=size,
         )
-        self.repository.record_tool_result(result)
+        try:
+            self.repository.record_tool_result(result)
+        except Exception as error:  # noqa: BLE001 - a store fault is data, not a crash
+            # The read happened but could not be recorded, so there is no evidence row
+            # and no replay key. Reporting `ok` here would publish an unpersisted
+            # result as a successful tool execution.
+            return self._error(
+                request,
+                job_id,
+                STORAGE_FAILED,
+                f"the tool result could not be persisted: {type(error).__name__}: {error}",
+                charge=True,
+            )
         return ToolOutcome(result=result, replayed=False, charged=True)
 
     # -- helpers ---------------------------------------------------------------
     def _scope_error(self, arguments: ToolArgumentModel) -> tuple[str, str] | None:
         """Authorization and field-path validation, before any connector call.
 
-        Two controls, and both are master §7.6's: the job's snapshot must cover the
-        requested source and resource, **and** a requested field path must be one the
-        snapshot discovered. Without the second, `fields: ["x; DROP TABLE orders"]` was
-        a legal argument — the pattern check that would have caught it lives in
-        `contracts.Identifier`, which a free-form `list[str]` argument does not apply.
+        Three controls, all of them master §7.6's:
+
+        * the job's snapshot must cover the requested `source_id`;
+        * a requested `resource_id` must exist in the snapshot;
+        * a requested field path must be one the snapshot discovered **for that
+          resource**. Without the third, `fields: ["x; DROP TABLE orders"]` was a
+          legal argument — `contracts.Identifier`'s pattern does not apply to a
+          free-form `list[str]` — and a field of one resource was readable under
+          another resource's name.
         """
 
         source_id = getattr(arguments, "source_id", None)
         if source_id is not None and source_id not in self.allowed_sources():
             return UNAUTHORIZED_SOURCE, f"source {source_id!r} is not in this job's snapshot"
         dumped = arguments.model_dump()
-        resources = [
-            value for key, value in dumped.items() if key == "resource_id" or key.endswith("_resource_id")
-        ]
-        for resource_id in resources:
-            if resource_id and resource_id not in self.allowed_resources():
-                return RESOURCE_NOT_FOUND, f"resource {resource_id!r} is not in this job's snapshot"
-        unknown = [path for path in self._requested_field_paths(dumped) if path not in self.allowed_field_paths()]
+        for key in ("path", "page_token", "cursor"):
+            value = dumped.get(key)
+            if value is not None and rejects_traversal(str(value)):
+                return INVALID_ARGUMENTS, (
+                    f"{key} contains a '..' path segment, which is not a path inside the source"
+                )
+        declared: set[str] = set()
+        for key, value in dumped.items():
+            if key == "resource_id" or key.endswith("_resource_id"):
+                if not value:
+                    continue
+                if value not in self.allowed_resources():
+                    return RESOURCE_NOT_FOUND, f"resource {value!r} is not in this job's snapshot"
+                declared.add(str(value))
+        requested = self._requested_field_paths(dumped)
+        if not requested:
+            return None
+        if not declared:
+            if len(self.allowed_resources()) > 1:
+                # Several resources are in scope and the request named none of them, so
+                # there is no per-resource set to check against. Refuse rather than fall
+                # back to the union, which was the cross-resource hole.
+                return INVALID_ARGUMENTS, (
+                    "the request names field paths but no resource_id; a field path can "
+                    "only be authorized against one resource"
+                )
+            if len(self.allowed_sources()) > 1:
+                # One resource, but several sources, and the request named no source: the
+                # resource id would have to be resolved against an unspecified source.
+                return INVALID_ARGUMENTS, (
+                    "the request names field paths but no source_id; a field path can "
+                    "only be authorized against one source"
+                )
+        # `compare_fields` declares two resources (`left_resource_id` and
+        # `right_resource_id`), so the accepted set is the union over the resources the
+        # request itself named — still per-resource, never the whole snapshot.
+        allowed = set().union(*(self.field_paths_for(item) for item in declared)) if declared else self.allowed_field_paths()
+        unknown = [path for path in requested if path not in allowed]
         if unknown:
+            where = (
+                ", ".join(repr(item) for item in sorted(declared))
+                if declared
+                else "this job's snapshot"
+            )
             return INVALID_ARGUMENTS, (
-                f"field path(s) not in this job's snapshot: {', '.join(sorted(set(unknown))[:5])}"
+                f"field path(s) not in resource(s) {where}: {', '.join(sorted(set(unknown))[:5])}"
             )
         return None
 
@@ -593,6 +867,7 @@ class ToolDispatcher:
         code: str,
         message: str,
         *,
+        arguments: dict[str, Any] | None = None,
         persist: bool = True,
         charge: bool = False,
     ) -> ToolOutcome:
@@ -604,9 +879,13 @@ class ToolDispatcher:
         that keeps asking for it never exhausts `max_tool_calls` — the loop bound
         silently stops applying exactly when the loop is most likely to run away.
 
-        A refusal made *before* dispatch (bad arguments, out-of-scope source, no budget
-        left, nothing ran) is not charged, and is not persisted either: it is not
-        evidence about the source.
+        `persist` decides whether the refusal becomes a replayable row. A refusal made
+        *before* dispatch (unsupported tool, bad arguments, out-of-scope source or
+        resource, no budget left — nothing ran) is not evidence about the source, so it
+        is not persisted: caching it would make a later **corrected** call under the
+        same `tool_call_id` replay the old refusal forever. A refusal made *after* a
+        connector call is evidence and is persisted, so a retry replays it instead of
+        re-reading a source that may have changed.
         """
 
         result = ToolResult(
@@ -614,13 +893,36 @@ class ToolDispatcher:
             job_id=job_id,
             tool_call_id=request.id,
             tool=request.name,
+            # Recorded in *validated* form so a later replay's integrity comparison sees
+            # the same shape, defaults included.
+            arguments=dict(arguments if arguments is not None else request.arguments),
             status="error",
             payload={},
             error_code=code,
             message=message,
         )
         if persist:
-            self.repository.record_tool_result(result)
+            try:
+                self.repository.record_tool_result(result)
+            except Exception as error:  # noqa: BLE001 - a store fault is data, not a crash
+                return ToolOutcome(
+                    result=ToolResult(
+                        result_ref=result.result_ref,
+                        job_id=job_id,
+                        tool_call_id=request.id,
+                        tool=request.name,
+                        arguments=result.arguments,
+                        status="error",
+                        payload={},
+                        error_code=STORAGE_FAILED,
+                        message=(
+                            f"the {code!r} result could not be persisted: "
+                            f"{type(error).__name__}: {error}"
+                        ),
+                    ),
+                    replayed=False,
+                    charged=charge,
+                )
         return ToolOutcome(result=result, replayed=False, charged=charge)
 
 
@@ -634,9 +936,12 @@ __all__ = [
     "BUDGET_EXHAUSTED",
     "CONNECTOR_ERROR",
     "INVALID_ARGUMENTS",
+    "INVALID_TOOL_REQUEST",
     "REDACTION_MARKER",
+    "REPLAY_MISMATCH",
     "RESOURCE_NOT_FOUND",
     "SNAPSHOT_DRIFTED",
+    "STORAGE_FAILED",
     "TOOL_NAMES",
     "TOOL_SPECS",
     "UNAUTHORIZED_SOURCE",
@@ -656,6 +961,7 @@ __all__ = [
     "ToolResult",
     "ToolResultModel",
     "ToolSpec",
+    "canonical_arguments",
     "payload_bytes",
     "redact_payload",
     "redact_value",

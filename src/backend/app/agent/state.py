@@ -28,6 +28,7 @@ from app.agent.contracts import (
     ToolCallRequest,
     ToolResultRef,
 )
+from app.agent.errors import InvalidStateUpdateError
 
 ACTIVE_STEP = Literal["propose"]
 
@@ -62,6 +63,11 @@ class RoutingJobState(TypedDict, total=False):
     revision_count: int
     model_calls_used: int
     tool_calls_used: int
+    #: Rounds spent in `tool_call` since the model last did something else. A replayed
+    #: call is not charged to `tool_calls_used` (it must stay idempotent), so without a
+    #: round counter a model that keeps re-requesting one `tool_call_id` would loop
+    #: until `max_model_calls` while `max_tool_calls` never fired.
+    tool_rounds_used: int
     tokens_used: int
     failure: FailureInfo | None
     status: str | None
@@ -82,7 +88,17 @@ class RoutingJobState(TypedDict, total=False):
 #: loudly instead of merging a field the state design never accounted for.
 NODE_WRITES: dict[str, frozenset[str]] = {
     "context": frozenset(
-        {"source_snapshot_ids", "inventory_ref", "catalogue_ref", "status", "failure", "updated_at"}
+        {
+            "source_snapshot_ids",
+            "inventory_ref",
+            "catalogue_ref",
+            "status",
+            "failure",
+            # `context` fails the job before any model or tool work, so its failure
+            # update closes the tool round the same way `propose`'s does.
+            "tool_rounds_used",
+            "updated_at",
+        }
     ),
     "propose": frozenset(
         {
@@ -96,23 +112,47 @@ NODE_WRITES: dict[str, frozenset[str]] = {
             "status",
             "failure",
             "updated_at",
+            # `propose` opens a new tool round when it accepts tool requests, and closes
+            # the run's rounds when it accepts a draft.
+            "tool_rounds_used",
         }
     ),
     "tool_call": frozenset(
-        {"tool_results", "tool_calls_used", "pending_tool_calls", "messages", "updated_at"}
+        {
+            "tool_results",
+            "tool_calls_used",
+            "tool_rounds_used",
+            "pending_tool_calls",
+            "messages",
+            # A tool round that cannot proceed — the budget is spent, or the store
+            # holding the results is unavailable — must be able to end the job with the
+            # typed reason rather than reporting an empty round. `token_budget_exhausted`
+            # and `cost_budget_exhausted` are the other two `_failure_update` codes
+            # `tool_call` can produce, so the extra room is deliberate, not leftover.
+            "failure",
+            "status",
+            "updated_at",
+        }
     ),
 }
 
 
 def validate_node_update(node: str, update: dict[str, Any]) -> None:
-    """Reject an update that writes a field its node does not own."""
+    """Reject an update that writes a field its node does not own.
+
+    Raises the **typed** `InvalidStateUpdateError`, not a bare `ValueError`: the
+    runner maps it to `FailureInfo(code="invalid_state_update")`, which is what
+    `plans/LANGGRAPH_HARNESS_PLAN.md` §9.1 row 2 specifies for a bad node write.
+    An untyped exception here escapes `run_routing_job` and takes the job's typed
+    failure record with it.
+    """
 
     allowed = NODE_WRITES.get(node)
     if allowed is None:
         return
     unknown = set(update) - allowed
     if unknown:
-        raise ValueError(
+        raise InvalidStateUpdateError(
             f"node {node!r} wrote undeclared state keys: {sorted(unknown)}"
         )
 
@@ -145,6 +185,7 @@ def initial_state(
         revision_count=0,
         model_calls_used=0,
         tool_calls_used=0,
+        tool_rounds_used=0,
         tokens_used=0,
         failure=None,
         status="running",
@@ -178,8 +219,23 @@ def budget_exhausted(budgets: AgentBudgets, state: RoutingJobState) -> str | Non
 
     if state.get("tool_calls_used", 0) >= budgets.max_tool_calls:
         return "tool_calls"
+    if state.get("tool_rounds_used", 0) >= budgets.max_tool_calls:
+        # Rounds, not only charged reads: a replayed call is free, so `tool_calls_used`
+        # alone cannot bound a model that keeps re-requesting the same `tool_call_id`.
+        return "tool_rounds"
     if state.get("model_calls_used", 0) >= budgets.max_model_calls:
         return "model_calls"
     if state.get("tokens_used", 0) >= budgets.max_tokens:
         return "tokens"
     return None
+
+
+def accumulated_rounds(state: RoutingJobState) -> int:
+    """The tool rounds the run has spent, for a failure update to report.
+
+    A terminal update that wrote a zero here would hide the loop length from the
+    operator: a model that re-requested one `tool_call_id` twenty times would leave
+    `tool_calls_used=1` and no other trace of what happened.
+    """
+
+    return int(state.get("tool_rounds_used", 0) or 0)

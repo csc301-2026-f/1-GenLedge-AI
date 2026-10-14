@@ -482,9 +482,19 @@ class LiveModel:
             payload["tools"] = request.tools
             payload["tool_choice"] = {"type": "auto"}
         # Structured output is requested natively; the same contract validates it.
-        payload["output_format"] = {
-            "type": "json_schema",
-            "schema": ModelDraft.model_json_schema(),
+        #
+        # The parameter is `output_config.format`, not the older top-level
+        # `output_format`: the provider's structured-output surface is documented as
+        # "JSON outputs (`output_config.format`)" and the Python SDK migrated to it in
+        # 0.77.0 ("migrate sending message format in `output_config` rather than
+        # `output_format`"). `anthropic>=0.77,<1` in `requirements.txt` is the floor
+        # this is written against, and `tests/agent/test_adapters_and_modes.py` pins the
+        # payload shape.
+        payload["output_config"] = {
+            "format": {
+                "type": "json_schema",
+                "schema": ModelDraft.model_json_schema(),
+            },
         }
         try:
             response = client.messages.create(**payload)

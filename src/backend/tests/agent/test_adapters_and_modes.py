@@ -265,7 +265,12 @@ def test_live_adapter_sends_the_sdk_payload_and_returns_a_validated_draft(stub_a
     assert payload["model"] == "claude-opus-5-5"
     assert payload["system"]
     assert payload["messages"][0]["role"] == "user"
-    assert payload["output_format"]["schema"]["title"] == "ModelDraft"
+    assert payload["output_config"]["format"]["type"] == "json_schema"
+    assert payload["output_config"]["format"]["schema"]["title"] == "ModelDraft"
+    # The older top-level `output_format` is what the SDK migrated away from in 0.77.0;
+    # sending it is either rejected or silently ignored, which would leave "native
+    # structured output" a claim the adapter does not actually make.
+    assert "output_format" not in payload
 
 
 def test_live_adapter_returns_provider_tool_calls_as_typed_requests(stub_anthropic):

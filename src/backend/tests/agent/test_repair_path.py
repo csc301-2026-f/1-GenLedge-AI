@@ -5,7 +5,14 @@ from __future__ import annotations
 import pytest
 
 from app.agent.contracts import AgentBudgets
-from app.agent.errors import CATALOGUE_NOT_FOUND, EMPTY_INVENTORY, INVALID_MODEL_OUTPUT, PROMPT_RENDER_FAILED
+from app.agent.errors import (
+    CATALOGUE_NOT_FOUND,
+    EMPTY_INVENTORY,
+    INVALID_MODEL_OUTPUT,
+    INVALID_STATE_UPDATE,
+    PROMPT_RENDER_FAILED,
+    InvalidStateUpdateError,
+)
 from app.agent.graph import run_routing_job
 from app.agent.models import ModelResponse, build_fake_draft, parse_model_draft
 from app.agent.repositories import SNAPSHOT_ID, empty_inventory_repository, seeded_repository
@@ -121,14 +128,19 @@ def test_parse_model_draft_reports_a_location_for_a_contract_breach():
 
 def test_a_node_cannot_write_a_field_it_does_not_own():
     validate_node_update("context", {"inventory_ref": "inventory:1"})
-    with pytest.raises(ValueError, match="model_draft"):
+    with pytest.raises(InvalidStateUpdateError, match="model_draft"):
         validate_node_update("context", {"model_draft": None})
     assert "model_draft" in NODE_WRITES["propose"]
     assert "model_draft" not in NODE_WRITES["context"]
 
 
-def test_the_write_guard_is_wired_into_graph_execution():
-    """A node that writes an undeclared key fails at the graph boundary, not silently."""
+def test_the_write_guard_failure_is_typed_not_an_unhandled_exception():
+    """A bad node write ends the job as `invalid_state_update`, never as a traceback.
+
+    The guard used to raise a bare `ValueError`, which escaped `run_routing_job`
+    entirely, so a programming error in a node took the job's typed failure record with
+    it (`plans/LANGGRAPH_HARNESS_PLAN.md` §5.4 boundary 5, §9.1 row 2).
+    """
 
     import app.agent.graph as graph_module
     import app.agent.nodes as nodes_module
@@ -140,16 +152,20 @@ def test_the_write_guard_is_wired_into_graph_execution():
 
     graph_module.node_module.context_node = rogue_context
     try:
-        with pytest.raises(ValueError, match="model_draft"):
-            graph_module.build_graph()
-            run_routing_job(
-                job_id="job-guard",
-                source_snapshot_ids=[SNAPSHOT_ID],
-                repository=seeded_repository(),
-                budgets=AgentBudgets(max_tool_calls=5, max_model_calls=5),
-            )
+        run = run_routing_job(
+            job_id="job-guard",
+            source_snapshot_ids=[SNAPSHOT_ID],
+            repository=seeded_repository(),
+            budgets=AgentBudgets(max_tool_calls=5, max_model_calls=5),
+        )
     finally:
         graph_module.node_module.context_node = original
+    assert run.failure is not None
+    assert run.failure.code == INVALID_STATE_UPDATE
+    assert run.failure.retryable is False
+    assert run.status == "failed"
+    assert run.model_draft is None
+    assert "model_draft" in run.failure.message
 
 
 def test_an_unresolvable_catalogue_is_a_typed_failure_not_a_cold_start():

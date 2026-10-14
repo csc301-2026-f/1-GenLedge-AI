@@ -386,9 +386,112 @@ def _changed_files() -> list[str]:
     return _git_diff([])
 
 
-def _git_diff(extra: list[str]) -> list[str]:
+#: The commit that froze the shared contracts (`plans/us4-four-person-task-split.md`
+#: "Gate 0"). `contracts.py` came from the shared base here, not from this branch.
+FROZEN_CONTRACT_COMMIT = "ca87e2a"
+FROZEN_CONTRACT_PATH = "src/backend/app/agent/contracts.py"
+
+#: `contracts.py` is frozen. The decision is that this branch does **not** modify it, so
+#: there is no delta to declare: the file must equal the frozen blob exactly. An earlier
+#: revision of this script accepted one declared delta (a `StrEnum` import swap); the team
+#: decided against modifying the frozen contract, and the import was restored.
+#:
+#: The comparison is line-ending tolerant because `core.autocrlf=true` checks the file out
+#: with CRLF on Windows while the committed blob is LF; the content is what is frozen. The
+#: same normalisation is what makes the check meaningful pre-commit: it compares against
+#: the *working tree*, so an uncommitted edit is caught.
+FROZEN_CONTRACT_DELTAS: list[tuple[str, str]] = []
+
+
+def _blob_at(commit: str, path: str) -> str:
     out = subprocess.run(
-        ["git", "-C", str(ROOT), "diff", "--name-only", *extra, "ca87e2a", "HEAD"],
+        ["git", "-C", str(ROOT), "show", f"{commit}:{path}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return out.stdout.replace("\r\n", "\n")
+
+
+def _normalised(path: Path) -> str:
+    return path.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+
+@check("The frozen contract is byte-identical to the frozen baseline")
+def _frozen_contract():
+    """`contracts.py` is frozen at Gate 0, and this is the check that can see it.
+
+    The scope gate below filters on `startswith("src/backend/app/agent/")`, so
+    `contracts.py` — which lives inside that prefix — was invisible to it by
+    construction. This check compares the working-tree file against the frozen blob
+    directly, so an uncommitted edit is caught as well as a committed one.
+
+    `FROZEN_CONTRACT_DELTAS` is empty and is meant to stay empty: the decision on this
+    branch is that the frozen contract is not modified. A non-empty list would be a
+    declaration, not an approval, so the second check below fails if it ever grows.
+    """
+
+    frozen = _blob_at(FROZEN_CONTRACT_COMMIT, FROZEN_CONTRACT_PATH)
+    assert frozen, (
+        f"could not read {FROZEN_CONTRACT_PATH} at {FROZEN_CONTRACT_COMMIT}; "
+        "the frozen baseline is missing, so this check cannot run"
+    )
+    current = _normalised(ROOT / FROZEN_CONTRACT_PATH)
+    if current == frozen:
+        return
+
+    expected = frozen
+    for old, new in FROZEN_CONTRACT_DELTAS:
+        assert old in expected, (
+            f"the declared delta {old!r} is no longer present in the frozen blob; "
+            "the declaration is stale"
+        )
+        expected = expected.replace(old, new, 1)
+
+    if current != expected:
+        raise AssertionError(
+            f"{FROZEN_CONTRACT_PATH} differs from the frozen baseline at "
+            f"{FROZEN_CONTRACT_COMMIT}. A contract change needs team review and a "
+            "version bump (plans/us4-four-person-task-split.md, Gate 0); this branch "
+            "was told not to modify it."
+        )
+
+
+@check("No contracts.py delta is declared, and CONTRACT_VERSION is unchanged")
+def _contract_delta_is_declared():
+    """The frozen contract is unmodified, and no future edit can slip in as a "delta".
+
+    A declaration list would let a later editor accept their own contract change by
+    appending to it. There is nothing to declare here, so the list must stay empty, and
+    `CONTRACT_VERSION` must still read `"1"` — a version bump is a team decision.
+    """
+
+    from app.agent.contracts import CONTRACT_VERSION
+
+    assert CONTRACT_VERSION == "1", (
+        f"CONTRACT_VERSION changed to {CONTRACT_VERSION!r}; a version bump is a team "
+        "decision, not a local edit"
+    )
+    assert FROZEN_CONTRACT_DELTAS == [], (
+        "a contracts.py delta was declared; this branch does not modify the frozen "
+        "contract, and declaring a delta is not the same as the team approving one"
+    )
+    current = _normalised(ROOT / FROZEN_CONTRACT_PATH)
+    assert "from enum import StrEnum" in current, (
+        "the frozen import was changed; contracts.py must match the baseline verbatim"
+    )
+    assert "app.agent.compat" not in current, (
+        "contracts.py must not import from the agent package; it is frozen"
+    )
+
+
+def _git_diff(extra: list[str]) -> list[str]:
+    # Two-dot (`A B`), deliberately: this asks "what does the working tree differ by,
+    # relative to the frozen base", so a file the *base* added is not reported as
+    # branch work. `A...B` would answer the different question "what did this branch
+    # change since the merge base".
+    out = subprocess.run(
+        ["git", "-C", str(ROOT), "diff", "--name-only", *extra, FROZEN_CONTRACT_COMMIT, "HEAD"],
         capture_output=True,
         text=True,
         check=False,

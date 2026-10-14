@@ -53,56 +53,87 @@ tool_call -> propose
 - [x] Tests under `tests/agent/`
 - [x] GLM 5.3 review findings fixed, each with a regression test
 - [x] Plan finalized into `doc/us4-person-b-langgraph-model.md`
+- [x] Third-review remediation: restored the prompt cap a killed mutation run had left
+      disabled; rewrote `tools/mutation_check.py` to work on a throwaway copy with a
+      baseline run and verified restores; typed storage failures; harness-checked replay
+      identity; tool-round budgeting; replay reference deduplication; the full redaction
+      category set; typed `invalid_state_update`; the frozen-contract check in
+      `verify_us4_person_b.py`; `output_config.format` for the live adapter;
+      `anthropic` declared in `requirements.txt`
+- [ ] **Blocked:** a real provider call (`anthropic` not installed, no credential)
+- [x] **`contracts.py` restored to `us4/integration`.** The frozen contract is not modified
+      by this branch: the `StrEnum` import swap was reverted and `verify_us4_person_b.py`
+      asserts byte-identity against the frozen blob. See
+      `doc/us4-person-b-langgraph-model.md` §7.6 for the Python-version consequence.
+- [ ] **Blocked:** the mutation battery has no verified run in this environment (the
+      sandbox denies every copy destination); it refuses cleanly rather than mutating the
+      repository
+- [ ] **Not started:** checkpoint resume, which needs Person A's persistence
 
 ## Verification
 
 ```text
 cd src/backend
-python -m pytest tests
+..\..\.venv\Scripts\python.exe -m pytest tests -o addopts=""
 ```
+
+The venv interpreter is not optional: `python` on `PATH` has neither pytest nor
+pydantic. `-o addopts=""` overrides `pytest.ini`'s `addopts = -q`, which otherwise
+suppresses the summary line and hides the test count.
 
 Pass criteria and their outcomes:
 
 | Criterion | Outcome |
 | --- | --- |
-| exactly three graph nodes and the declared edges | met (`test_graph_shape.py`); the two compiled-LangGraph introspection cases skip without the package |
+| exactly three graph nodes and the declared edges | met on the langgraph engine by introspection of the compiled graph; the declared-shape cases are tautological and nothing asserts the built node set on the fallback engine |
 | the fake model completes a real tool loop and returns a valid `ModelDraft` | met (`test_fake_model_tool_loop.py`) |
-| tool and model budget exhaustion each produce a typed failure | met, plus token, wall-clock and cost (`test_budget_exhaustion.py`) |
+| tool and model budget exhaustion each produce a typed failure | met, plus token, wall-clock and cost (`test_budget_exhaustion.py`); `max_tool_calls` now bounds tool *rounds*, so a replayed call cannot make the loop free |
 | invalid output → one repair attempt → `invalid_model_output` | met (`test_repair_path.py`) |
-| duplicate `(job_id, tool_call_id)` replays without a second connector call | met (`test_duplicate_tool_replay.py`) |
-| fake/live adapter compatibility | met against an SDK stub (`test_adapters_and_modes.py`) |
-| restricted values never reach a prompt | met (`test_prompt_safety.py`) |
+| duplicate `(job_id, tool_call_id)` replays without a second connector call | met, and now checked for integrity: a replay under a reused id with a different tool or different arguments is refused (`replay_mismatch`) |
+| fake/live adapter compatibility | met against an SDK stub (`test_adapters_and_modes.py`) — the stub accepts any keyword, so it cannot validate a parameter *name* |
+| restricted values never reach a prompt | met for the named categories (`test_prompt_safety.py`, and one sentinel per category in `test_remediation_regressions.py`) |
 
 ### Verification results recorded
 
-Three commands, all checked in and all green:
+**Numbers below were produced by earlier cycles and are kept only as a record. Re-run
+the commands; do not cite the counts.** Two of them were wrong at the time they were
+written: the "458 passed" run was green on a *pristine copy* while the delivered working
+tree was red, and "14/14 mutations killed" was produced by a battery that mutated the
+real checkout and could not distinguish a kill from a collection error.
 
 ```text
-python -m pytest                  # from the repo root (pytest.ini sets testpaths)
-python -m pytest tests            # from src/backend, the documented invocation
-python verify_us4_person_b.py     # 17/17 requirement-level checks hold
-python run_agent_tests.py         # passed=423 failed=0 skipped=5 (no langgraph present)
-python -m mypy --check-untyped-defs app/agent tests/agent   # clean
+..\..\.venv\Scripts\python.exe -m pytest tests -o addopts=""   # prints the count
+python verify_us4_person_b.py     # requirement-level checks, independent of the suite
+python tools/mutation_check.py    # mutation battery, on a throwaway copy
+python run_agent_tests.py         # the agent suite on a machine without pytest
 ```
 
-- **458 passed** with `langgraph 1.2.15` installed, from both the repository root and
-  `src/backend`. This is the real `langgraph.StateGraph`, including the library's own
-  `get_graph()` introspection and an assertion that the framework's injected runtime
-  actually reaches the nodes.
-- **423 passed, 5 skipped** on Python 3.10 with no `langgraph`, which is how the
-  labelled fallback path stays exercised.
+- The suite exercises the **real `langgraph.StateGraph`** when the package is
+  installed, including `get_graph()` introspection and an assertion that the
+  framework's injected runtime actually reaches the nodes. The labelled fallback is
+  selected with `GENLEDGE_GRAPH_RUNTIME=local-fallback`.
+- A third review, of the *working tree* rather than the commits, found the delivery
+  broken: `tools/mutation_check.py` mutated the real checkout and was killed before its
+  restore, leaving a disabled prompt cap in `prompts.py`. That tool has been rewritten to
+  work on a throwaway copy with a baseline run and verified restores, and the defects
+  found in the same cycle (typed storage failures, replay identity, tool-round budgeting,
+  redaction categories, typed `invalid_state_update`, the frozen-contract check, and the
+  live adapter's `output_config.format`) are fixed with regression tests.
 - `verify_us4_person_b.py` asserts the requirements from the outside through the
-  public entrypoints and names, at the end, what it cannot verify.
+  public entrypoints, compares the frozen `contracts.py` against the blob at the freeze
+  commit, and names at the end what it cannot verify.
 
 **Defect the real-library run caught:** LangGraph injects a parameter *named*
 `runtime` as a keyword, and only when it is visible in the callable's signature. The
 node-write guard wrapped each node in `*args, **kwargs`, hiding it — so every node ran
 with no runtime. Fixed in `guarded`/`runtime_for`.
 
-A GLM 5.3 review of the first commit found one blocker (source data containing
-`{{...}}` could escape the renderer) and several majors; all are fixed and each has a
-regression test. The full list of what was fixed, and the limitations that remain,
-is in [`doc/us4-person-b-langgraph-model.md`](../doc/us4-person-b-langgraph-model.md).
+**Still not established:** a real provider call. `anthropic` is declared in
+`requirements.txt`, but it is not installed here, no credential or endpoint is
+configured, and `tools/live_provider_check.py` has never run. The live wire format is
+justified by the provider's documentation, not by an accepted response.
 
 Full detail, environment variables, and the remaining provider and persistence
-limitations are in [`doc/us4-person-b-langgraph-model.md`](../doc/us4-person-b-langgraph-model.md).
+limitations are in [`doc/us4-person-b-langgraph-model.md`](../doc/us4-person-b-langgraph-model.md);
+the remediation record and the list of what remains unverified are in
+[`doc/us4-person-b-verification.md`](../doc/us4-person-b-verification.md).

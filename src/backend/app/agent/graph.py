@@ -20,7 +20,12 @@ from typing import Any, Mapping, cast
 
 from app.agent import nodes as node_module
 from app.agent.contracts import AgentBudgets, FailureInfo, InventoryView, ModelDraft
-from app.agent.errors import ModelConfigurationError
+from app.agent.errors import (
+    REPOSITORY_UNAVAILABLE,
+    AgentFailure,
+    InvalidStateUpdateError,
+    ModelConfigurationError,
+)
 from app.agent.graphs import (
     END,
     RUNTIME_LANGGRAPH,
@@ -151,14 +156,27 @@ def run_routing_job(
     frozen_budgets = budgets or AgentBudgets()
     resolved = mode or resolve_model_mode(env=env)
 
-    # `context` owns loading the inventory; the model adapter needs it too, so the
-    # runner loads it once for adapter construction. It is not model input.
+    # The runner reads the control store before the first node runs, and `context` owns
+    # holding an inventory — but the adapter needs one too, so the runner loads it here.
+    # A store fault at this point used to escape `run_routing_job` as a traceback: the
+    # graph had not started, so `_run_graph`'s handlers never saw it. A blip during the
+    # very first read is the *most* likely moment for one, so it is typed like every
+    # other repository fault (master §9.1 row 20).
+    stopping: AgentFailure | None = None
     inventory: InventoryView | None = None
-    for snapshot_id in source_snapshot_ids:
-        inventory = repository.get_inventory(snapshot_id)
-        if inventory is not None:
-            break
-    catalogue = repository.get_catalogue(catalogue_ref)
+    catalogue = None
+    try:
+        for snapshot_id in source_snapshot_ids:
+            inventory = repository.get_inventory(snapshot_id)
+            if inventory is not None:
+                break
+        catalogue = repository.get_catalogue(catalogue_ref)
+    except Exception as error:  # noqa: BLE001 - a store fault is data, not a crash
+        stopping = AgentFailure(
+            REPOSITORY_UNAVAILABLE,
+            f"the control store could not be read before the run: {type(error).__name__}: {error}",
+            retryable=True,
+        )
 
     job_runtime = GraphRuntime(
         repository=repository,
@@ -179,9 +197,24 @@ def run_routing_job(
         model_mode=resolved.mode,
         catalogue_ref=catalogue_ref,
     )
-    repository.create_job(job_id, source_snapshot_ids=list(source_snapshot_ids), catalogue_ref=catalogue_ref)
-    graph = build_graph(runtime)
-    final = _run_graph(graph, job_state, job_runtime, frozen_budgets)
+
+    if stopping is None:
+        try:
+            repository.create_job(
+                job_id, source_snapshot_ids=list(source_snapshot_ids), catalogue_ref=catalogue_ref
+            )
+        except Exception as error:  # noqa: BLE001 - a store fault is data, not a crash
+            stopping = AgentFailure(
+                REPOSITORY_UNAVAILABLE,
+                f"the job could not be registered: {type(error).__name__}: {error}",
+                retryable=True,
+            )
+
+    if stopping is not None:
+        final = _terminal_failure_state(job_state, stopping, job_runtime)
+    else:
+        graph = build_graph(runtime)
+        final = _run_graph(graph, job_state, job_runtime, frozen_budgets)
 
     failure = final.get("failure")
     return RoutingRunResult(
@@ -193,6 +226,19 @@ def run_routing_job(
         status=str(final.get("status") or _terminal_status(failure)),
         model_responses=list(job_runtime.responses),
     )
+
+
+def _terminal_failure_state(
+    job_state: RoutingJobState, error: AgentFailure, runtime: GraphRuntime
+) -> RoutingJobState:
+    """Build a terminal state for a failure raised before the graph ran."""
+
+    failed = cast("RoutingJobState", dict(job_state))
+    failed["failure"] = error.to_failure_info()
+    failed["status"] = "failed"
+    failed["model_calls_used"] = _observed_model_calls(job_state, runtime)
+    failed["tool_calls_used"] = _observed_tool_calls(job_state, runtime)
+    return failed
 
 
 def _terminal_status(failure: FailureInfo | None) -> str:
@@ -226,12 +272,47 @@ def _run_graph(graph: Any, job_state: RoutingJobState, runtime: GraphRuntime, bu
             job_state,
             "the graph reached its derived recursion limit; the semantic budgets should "
             "have fired first",
+            runtime,
         )
     except GraphRecursionError:
-        return _recursion_failure(job_state, "the graph runtime stopped the run at its recursion limit")
+        return _recursion_failure(job_state, "the graph runtime stopped the run at its recursion limit", runtime)
+    except InvalidStateUpdateError as error:
+        # A node wrote a state key its `Writes` list does not own. That is a
+        # programming error, not a model-authored one, but it must still end the job
+        # with a typed failure rather than escaping as an untyped exception
+        # (master §5.4 boundary 5, §9.1 row 2).
+        return _invalid_state_update_failure(job_state, error, runtime)
 
 
-def _recursion_failure(job_state: RoutingJobState, message: str) -> RoutingJobState:
+def _invalid_state_update_failure(
+    job_state: RoutingJobState, error: InvalidStateUpdateError, runtime: GraphRuntime
+) -> RoutingJobState:
+    failed = cast("RoutingJobState", dict(job_state))
+    failed["failure"] = error.to_failure_info()
+    failed["status"] = "failed"
+    failed["model_calls_used"] = _observed_model_calls(job_state, runtime)
+    failed["tool_calls_used"] = _observed_tool_calls(job_state, runtime)
+    return failed
+
+
+def _observed_model_calls(job_state: RoutingJobState, runtime: GraphRuntime) -> int:
+    """The model calls the run actually made, whichever count is larger.
+
+    The pre-invoke state always reads `0`, so a terminal failure built from it would
+    report an empty snapshot. `runtime.responses` is the run-scoped record of what
+    happened, so it is the honest lower bound.
+    """
+
+    return max(int(job_state.get("model_calls_used", 0) or 0), len(runtime.responses))
+
+
+def _observed_tool_calls(job_state: RoutingJobState, runtime: GraphRuntime) -> int:
+    return max(int(job_state.get("tool_calls_used", 0) or 0), len(runtime.tool_results))
+
+
+def _recursion_failure(
+    job_state: RoutingJobState, message: str, runtime: GraphRuntime | None = None
+) -> RoutingJobState:
     # A partial terminal state, deliberately: the counters accumulated so far are the
     # diagnostic, and `total=False` makes every key optional. The state is a
     # `TypedDict` channel container built at runtime, so the copy is cast rather than
@@ -243,6 +324,11 @@ def _recursion_failure(job_state: RoutingJobState, message: str) -> RoutingJobSt
         retryable=False,
     )
     failed["status"] = "failed"
+    if runtime is not None:
+        # `job_state` is the state as it was handed to `invoke`, so its counters are
+        # the pre-run values. The run-scoped `runtime` knows better.
+        failed["model_calls_used"] = _observed_model_calls(job_state, runtime)
+        failed["tool_calls_used"] = _observed_tool_calls(job_state, runtime)
     return failed
 
 
