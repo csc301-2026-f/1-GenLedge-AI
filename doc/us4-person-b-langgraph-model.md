@@ -172,12 +172,16 @@ Written for this slice, under `tests/agent/`:
 | `test_adapters_and_modes.py` | `auto`/`live`/`fake` resolution; startup banner has no secret; both adapters satisfy one contract and both end with a schema-valid draft |
 | `test_prompt_safety.py` | sentinel values, whole rows, descriptions, sample and row caps at any depth, page caps, untrusted-block containment, block-splice protection, typed tool errors reaching the prompt, prompt digests |
 | `test_compat.py` | the `StrEnum` fallback matches the standard library's `str`, `format`, f-string, JSON and ordering behaviour |
-
 ### Verification performed on the development machine
 
 - `python -m mypy --check-untyped-defs app/agent tests/agent` — clean.
   `pytest` and `mypy` are **not installable here** (see below), so mypy was run from
   the system interpreter, which type-checks without importing the packages.
+- `compat.StrEnum` was compared against the real `enum.StrEnum` by running the same
+  18 probes (`str`, `format`, format spec, f-string, `%s`, `json.dumps`, equality both
+  ways, dict-key lookup, `hash`, `len`, sorting interleaved with plain strings,
+  string methods, `in`, `repr`) under Python 3.13 (stdlib) and Python 3.10 (the
+  fallback): **identical output on every probe**.
 - The 104 `tests/agent` cases were **executed** with the suite unmodified through a
   temporary pytest-compatible runner against Python 3.10 + pydantic 2.11.9:
   `passed=104 failed=0 skipped=2`. The runner was a local aid and was removed before
