@@ -17,7 +17,7 @@ export function RouteScreen({ jobId, owner, onJob, onNav, onInvalidate }: {
   useEffect(() => {
     let active = true
     let timer: ReturnType<typeof setTimeout>
-    setJob(null); setReview(null); setError(''); setNotice('')
+    setError('')
     async function refresh() {
       try {
         const status = await readJob(jobId)
@@ -44,9 +44,10 @@ export function RouteScreen({ jobId, owner, onJob, onNav, onInvalidate }: {
     forget(`${scope}:${decision === 'accept' ? 'reject' : 'accept'}`)
     try {
       const result = await editJob(jobId, requestKey(choiceScope), target, decision)
-      const latest = await readPackage(jobId)
-      setReview(latest.payload)
-      setNotice(result.replayed ? 'Decision already saved; replay confirmed.' : 'Decision saved.')
+      // The receipt acknowledges pending work, not a newly published decision.
+      setJob(current => current ? { ...current, status: result.status } : current)
+      setAttempt(n => n + 1)
+      setNotice(result.replayed ? 'Edit already submitted; replay confirmed.' : 'Edit submitted for processing.')
       onInvalidate()
     } catch (e) {
       if (e instanceof RoutingError && e.status < 500) forget(choiceScope)
@@ -75,6 +76,7 @@ export function RouteScreen({ jobId, owner, onJob, onNav, onInvalidate }: {
       <div role="status" aria-live="polite">{job ? <><StatusPill status={job.status} /> · Model mode: <strong>{job.model_mode ?? 'Not resolved'}</strong> · Snapshot: {job.source_snapshot_id}</> : 'Loading routing job…'}</div>
       {error && <div role="alert"><Alert type="error">{error}</Alert><Btn onClick={() => setAttempt(n => n + 1)} disabled={saving}>Reload status</Btn></div>}
       {notice && <div role="status">{notice}</div>}
+      {job && ['edit_requested', 'revising'].includes(job.status) && <Alert type="info">Your edit is pending. The previous published decisions remain visible until processing completes.</Alert>}
       {job?.status === 'blocked' && <Alert type="warning">This proposal has blockers. Review the findings below. Decisions are saved without clearing validation blockers.</Alert>}
       {job?.status === 'failed' && <div role="alert"><Alert type="error">{job.failure?.message ?? 'Routing failed.'}</Alert>{job.failure?.retryable && <Btn onClick={() => void retry()} disabled={saving}>Retry routing</Btn>}</div>}
       {job && ['queued', 'running'].includes(job.status) && <p>Routing is {job.status}. You can refresh this page; the saved job will be reopened.</p>}

@@ -100,7 +100,7 @@ export default function App() {
         <main style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
           {screen === 'sources'  && <SourcesScreen  onNav={navigateWorkflow} onAdvance={() => advance('sources', 'discover')} onInvalidate={() => invalidateAfter('sources')} />}
           {screen === 'discover' && <DiscoverScreen owner={user.username} onNav={navigateWorkflow} onAdvance={id => { store(`active:${user.username}`, id); setRoutingJobId(id); advance('discover', 'route') }} onInvalidate={() => invalidateAfter('discover')} />}
-          {screen === 'route' && routingJobId && <RouteScreen jobId={routingJobId} owner={user.username} onJob={setRoutingJobId} onNav={navigateWorkflow} onInvalidate={() => invalidateAfter('route')} />}
+          {screen === 'route' && routingJobId && <RouteScreen key={routingJobId} jobId={routingJobId} owner={user.username} onJob={setRoutingJobId} onNav={navigateWorkflow} onInvalidate={() => invalidateAfter('route')} />}
           {screen === 'mapping'  && <MappingScreen  onNav={navigateWorkflow} onAdvance={() => advance('mapping', 'run')} onInvalidate={() => invalidateAfter('mapping')} />}
           {screen === 'run'      && <RunScreen      onNav={navigateWorkflow} onAdvance={() => advance('run', 'monitor')} onInvalidate={() => invalidateAfter('run')} />}
           {screen === 'monitor'  && <MonitorScreen  onNav={navigateWorkflow} />}

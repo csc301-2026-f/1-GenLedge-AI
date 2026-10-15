@@ -25,10 +25,13 @@ fixtures; it is not evidence of the real database/model smoke below.
   Expected: Confidence, rationale, merge keys, new/reused flags, coverage,
   ambiguous-date blocker, and resolved fake/live mode come from API responses.
 - Action: Reject one table and refresh.
-  Expected: The same job reopens with the saved rejection and other tables intact.
+  Expected: The job first shows Edit requested/Revising with disabled decision
+  controls and the previous package. After worker processing, the same job reopens
+  with the applied rejection and other tables intact.
 - Action: Submit the same decision again.
-  Expected: The edit ID is replayed safely; an already-saved notice appears and
-  the latest package still contains decisions for other tables.
+  Expected: The same Idempotency-Key header and edit ID are replayed safely; an
+  already-submitted notice appears, no extra revision is produced, and the latest
+  package still contains decisions for other tables.
 - Action: Interrupt the network during creation or an edit, reconnect and retry.
   Expected: The original request ID is reused; no duplicate job or edit results.
 - Action: Inspect a failed job and click Retry routing when available.
@@ -36,3 +39,8 @@ fixtures; it is not evidence of the real database/model smoke below.
 
 Execution on the Person D branch: automated HTTP-fixture browser flow passed;
 full manual PostgreSQL/LangGraph flow is blocked by unmerged A/B/C dependencies.
+
+Browser setup from `src/frontend`: `pnpm install --frozen-lockfile`, then
+`pnpm exec playwright install chromium` and `pnpm test:routing`. An installed
+Chrome may instead be selected with `CHROME_BIN`; no global Playwright package
+or NODE_PATH is required.

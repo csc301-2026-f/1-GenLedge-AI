@@ -43,6 +43,9 @@ class EditMappingRequest(StrictModel):
 
 
 class EditMappingResponse(StrictModel):
+    job_id: str
+    edit_id: str
+    status: JobStatus
     payload: dict[str, object] | None = None
     replayed: bool = False
 

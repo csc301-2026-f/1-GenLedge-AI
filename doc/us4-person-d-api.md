@@ -29,12 +29,15 @@ every login. This is demo isolation, not production organization authorization.
 | `POST /api/mappings/jobs` | `Idempotency-Key` (1–200 characters), `{source_snapshot_id: string or null, catalog_ref?: string or null}` | `202 {job_id, status}`. Null snapshot uses the explicitly configured demo snapshot. Missing/empty/unknown inventory is rejected. |
 | `GET /api/mappings/jobs/{job_id}` | Cookie session | Canonical job status, snapshot ID, resolved `fake`/`live` mode, safe failure information. |
 | `GET /api/mappings/jobs/{job_id}/package` | Cookie session | `{payload, status, failure}`; payload is null until published. |
-| `PUT /api/mappings/jobs/{job_id}/edits` | `{edit_id, target: table_id, decision: "accept" or "reject"}` | `200 {payload, replayed}`. Rejecting one table preserves every other table. |
+| `PUT /api/mappings/jobs/{job_id}/edits` | `{edit_id, target: table_id, decision: "accept" or "reject"}` | `Idempotency-Key` is required. Returns `202 {job_id, edit_id, status: "edit_requested", payload: null, replayed}`. The worker applies the decision and republishes; unrelated tables are preserved. |
 
 Reusing a creation key with different inputs returns `409 idempotency_conflict`.
-Exact edit replays return their original receipt; different input under the same
-edit ID returns `409 edit_conflict`. The client reads the latest package after an
-edit receipt so a historical replay cannot hide more recent decisions.
+Exact edit replays return their original pending receipt (with `replayed: true`);
+different input under either the same request key or edit ID returns `409
+edit_conflict`. The repository stores both identifiers atomically. Replaying an
+applied edit never resets status or applies it again. The client reads the latest
+package and resumes polling after an edit receipt, so historical receipts cannot
+hide newer decisions. While pending, the previous package remains visible.
 Table decisions do not remove findings or authorize warehouse execution.
 
 ## Composition required from integration
@@ -43,7 +46,7 @@ Table decisions do not remove findings or authorize warehouse execution.
 
 - `repository`: Person A adapter implementing `RoutingRepository` (see its
   atomicity requirements, especially `create_job`, `claim_job`, `publish`, and
-  `save_decision`). Storage must persist model/mapping revisions, findings,
+  `request_edit`, `claim_edit`, and `publish_edit`). Storage must persist model/mapping revisions, findings,
   coverage, decisions, failure and status; ownership applies to every lookup.
 - `inventory(owner, snapshot_id)`: authorize the immutable snapshot, then call
   A's inventory reader; return the canonical `InventoryView` or None.
@@ -54,6 +57,12 @@ Table decisions do not remove findings or authorize warehouse execution.
   wrapper returning `RoutingReviewPackage`. It includes the safe model draft,
   mapping draft, findings, coverage, and C-computed `is_new` flags. Resolve an
   authorized catalogue before invoking C; do not invent business rules here.
+- `resume_edit(job_id, package, edit)`: the review-workflow adapter, called only
+  by `execute` on the worker. Consume the persisted edit, preserve unrelated valid
+  tables, assign the new application-owned revision, and return the revised
+  `ModelDraft` or safe `FailureInfo`. Projection/validation is rerun before
+  `publish_edit` atomically publishes and marks the edit consumed. If the callback
+  is absent, edit requests return 503 without recording an unprocessable edit.
 - `model_mode`: B's resolved `fake` or `live` value, not the unresolved `auto`.
 - `default_snapshot_id`: optional A-seeded demo snapshot identifier.
 
@@ -67,7 +76,13 @@ the two-thread executor. The runtime enters the Flask application context in the
 worker and logs only the resolved model mode. Graph work never runs in the
 request thread. For an external worker, configure a quick durable queue callable
 `MAPPING_DISPATCH(owner, job_id)` and invoke `service.execute(owner, job_id)` in
-the worker. The repository claims queued jobs atomically before graph execution.
+the worker. The repository claims queued jobs atomically before graph execution. For edits,
+`request_edit` commits the audit row, original receipt and `edit_requested` state
+before dispatch; `claim_edit` atomically moves it to `revising`. New edits while
+pending/revising are rejected (exact replays remain valid). A dispatch failure
+returns a safe 503 and retains the pending edit: retrying the same request
+re-enqueues it. Multiple queue deliveries are safe because claiming is atomic.
+The old package and unconsumed edit remain available if resume fails.
 
 PostgreSQL migrations, connection variables and fixture setup remain Person A's
 responsibility; this branch defines no replacement schema or database settings.
@@ -81,7 +96,9 @@ its existing discovery rows are visibly labelled illustrative. Clicking **Find
 where this data belongs** creates the job and opens its status. The routing screen
 polls active jobs and displays validated mappings, per-column confidence,
 rationale, merge keys, new/reused flags, blockers, coverage and decisions. It has
-loading, queued/running, blocked, failed, retry and connection-error states.
+loading, queued/running, awaiting-review, edit-pending/revising, blocked, failed,
+retry and connection-error states. Lifecycle pills have deliberate colors and
+readable labels. Decision controls are disabled until edits finish.
 `ROUTE_DATA` is removed from the live routing screen. The standalone demo is intact.
 
 Session storage contains job/request IDs scoped to the login, never review
@@ -101,13 +118,17 @@ python -m pytest tests
 From `src/frontend`:
 
 ```sh
+pnpm install --frozen-lockfile
+pnpm exec playwright install chromium
 pnpm build
 pnpm exec tsc --noEmit
-node tests/routing-smoke.cjs
+pnpm test:routing
 ```
 
-The browser test needs Playwright available to Node and a compatible browser.
-Set `CHROME_BIN` to an installed Chrome executable if bundled Chromium is absent.
+Playwright is pinned in devDependencies and the lockfile. The install command
+above downloads its compatible Chromium browser (Linux CI may need
+`pnpm exec playwright install --with-deps chromium`). Alternatively, set
+`CHROME_BIN` to an installed Chrome executable and skip the browser download.
 It starts its own Vite server and uses intercepted HTTP responses.
 
 Backend tests cover 202/non-inline creation, idempotency and conflicting keys,
@@ -133,7 +154,7 @@ mode and failure/retry rendering.
 - US5 approval/revision and US6 warehouse execution/populated-table protection
   are outside this branch. Accept is a recorded review decision, not approval.
 
-## Person D verification results (2026-10-13)
+## Original Person D verification results (2026-10-13)
 
 - Backend: `python -m pytest tests` — **43 passed**, including 13 new routing tests.
 - Frontend: `pnpm build` — passed; `pnpm exec tsc --noEmit` — passed.
@@ -142,3 +163,21 @@ mode and failure/retry rendering.
 - `git diff --check` — passed.
 - Full manual integration smoke — not run: A/B/C are absent from the integration
   base. The runtime factory and real adapters still need to be connected.
+
+## PR #18 review follow-up (2026-10-14)
+
+Addressed the five review requests: asynchronous edit_requested/resume lifecycle,
+required edit Idempotency-Key validation and propagation, frontend retry headers,
+pinned Playwright dependency plus reproducible setup, and distinct lifecycle pills.
+The integration adapter now needs `request_edit`, `claim_edit`, `publish_edit`
+and the `resume_edit` callback described above instead of synchronous save_decision.
+
+Verification: 52 backend tests passed; TypeScript and production build passed;
+updated HTTP-fixture browser smoke passed. A separate temporary frontend copy
+with no node_modules passed `pnpm install --frozen-lockfile` and `pnpm test:routing`
+using CHROME_BIN, without NODE_PATH or a globally resolved Playwright package.
+Tests cover header/payload conflicts, pending state before worker consumption,
+concurrent claim/replay, dispatch retry after app reconstruction, preservation of
+unrelated tables and decisions, background-thread resumes, and refusing to mark
+an edit applied if the workflow returns the old revision. Real persistence and
+graph integration remain dependent on the adapters; these are boundary tests.

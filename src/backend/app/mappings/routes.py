@@ -4,7 +4,7 @@ from pydantic import ValidationError
 
 from app.common.api_schemas import (
     CreateMappingJobRequest, CreateMappingJobResponse, EditMappingRequest,
-    EditMappingResponse, MappingPackageResponse,
+    MappingPackageResponse,
 )
 from app.common.errors import make_error
 from .service import MappingError
@@ -56,12 +56,17 @@ def parse(schema):
         raise MappingError('invalid_request', 'Expected a valid JSON request with no unknown fields.', 400)
 
 
-@bp.post('/jobs')
-def create_job():
-    service, owner = context()
+def idempotency_key():
     key = request.headers.get('Idempotency-Key', '')
     if not key.strip() or len(key) > 200:
         raise MappingError('invalid_idempotency_key', 'Idempotency-Key must contain 1–200 characters.', 400)
+    return key
+
+
+@bp.post('/jobs')
+def create_job():
+    service, owner = context()
+    key = idempotency_key()
     payload = parse(CreateMappingJobRequest)
     job = service.create(owner, key, payload, current_app.extensions['mapping_dispatch'])
     return response(CreateMappingJobResponse(job_id=job.job_id, status=job.status), 202)
@@ -85,5 +90,6 @@ def get_package(job_id):
 @bp.put('/jobs/<job_id>/edits')
 def edit_job(job_id):
     service, owner = context()
-    package, replayed = service.decide(owner, job_id, parse(EditMappingRequest))
-    return response(EditMappingResponse(payload=package.model_dump(mode='json'), replayed=replayed))
+    result = service.decide(owner, job_id, idempotency_key(), parse(EditMappingRequest),
+                            current_app.extensions['mapping_dispatch'])
+    return response(result, 202)

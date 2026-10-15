@@ -14,7 +14,12 @@ const root = path.resolve(__dirname, '..');
     const page = await browser.newPage();
     const errors = []; page.on('pageerror', e => errors.push(e.message));
     let user = null, status = 'queued', attempts = [], edits = [], failFirst = true;
-    let modelMode = 'fake';
+    let modelMode = 'fake', pendingEdit = null, loseEditResponse = true;
+    const editHeaders = [];
+    function finishEdit() {
+      packageData.decisions[pendingEdit.target] = pendingEdit.decision;
+      pendingEdit = null; status = 'blocked';
+    }
     const packageData = {
       contract_version: '1',
       model_draft: { revision: 1, unresolved: [], tables: ['fact_orders', 'fact_lines'].map(id => ({ id, name: id, key: ['id'], rationale: 'Preserve order grain.', attributes: [{ id: 'id', type: 'text', confidence: 0.9 }] })) },
@@ -36,10 +41,14 @@ const root = path.resolve(__dirname, '..');
       }
       if (url.endsWith('/edits')) {
         const edit = req.postDataJSON(); edits.push(edit);
-        if (receipts.has(edit.edit_id)) return send(200, { payload: receipts.get(edit.edit_id), replayed: true });
-        packageData.decisions[edit.target] = edit.decision;
-        receipts.set(edit.edit_id, structuredClone(packageData));
-        return send(200, { payload: packageData, replayed: false });
+        const key = req.headers()['idempotency-key']; editHeaders.push(key);
+        if (!key) return send(400, { error: { message: 'Idempotency-Key required.' } });
+        if (receipts.has(key)) return send(202, { ...receipts.get(key), replayed: true });
+        pendingEdit = edit; status = 'edit_requested';
+        const receipt = { job_id: 'job-1', edit_id: edit.edit_id, status, payload: null, replayed: false };
+        receipts.set(key, receipt);
+        if (loseEditResponse) { loseEditResponse = false; return route.abort(); }
+        return send(202, receipt);
       }
       if (url.endsWith('/package')) return send(200, { status, failure: status === 'failed' ? { code: 'routing_failed', message: 'Routing failed.', retryable: true } : null, payload: ['queued', 'running', 'failed'].includes(status) ? null : packageData });
       return send(200, { job_id: 'job-1', status, source_snapshot_id: 'snapshot-1', model_mode: modelMode, failure: null });
@@ -56,9 +65,17 @@ const root = path.resolve(__dirname, '..');
     await page.getByText('Routing is queued.', { exact: false }).waitFor();
     assert.equal(attempts.length, 2); assert.equal(attempts[0].key, attempts[1].key);
     assert.equal(attempts[1].body.source_snapshot_id, 'snapshot-1');
+    const queuedColor = await page.getByText('Queued', { exact: true }).evaluate(el => getComputedStyle(el).backgroundColor);
     status = 'running';
     await page.getByText('Routing is running.', { exact: false }).waitFor();
+    status = 'awaiting_review';
+    const waiting = page.getByText('Awaiting review', { exact: true });
+    await waiting.waitFor();
+    const waitingColor = await waiting.evaluate(el => getComputedStyle(el).backgroundColor);
     status = 'blocked';
+    await page.reload();
+    await page.getByText('Blocked', { exact: true }).waitFor();
+    const blockedColor = await page.getByText('Blocked', { exact: true }).evaluate(el => getComputedStyle(el).backgroundColor);
     await page.getByRole('heading', { name: 'Proposed tables (2)' }).waitFor();
     await page.getByText('blocker · ambiguous_date', { exact: true }).waitFor();
     await page.getByText('blocker · invalid_source_reference', { exact: true }).waitFor();
@@ -67,21 +84,36 @@ const root = path.resolve(__dirname, '..');
     assert.match(await orders.innerText(), /New table/); assert.match(await lines.innerText(), /Reuse table/);
     assert.match(await orders.innerText(), /90%/);
     await orders.getByRole('button', { name: 'Reject', exact: true }).click();
-    await page.getByText('Decision saved.', { exact: true }).waitFor();
+    await page.getByRole('alert').filter({ hasText: 'Unable to connect' }).waitFor();
+    await orders.getByRole('button', { name: 'Reject', exact: true }).click();
+    await page.getByText('Your edit is pending.', { exact: false }).waitFor();
+    assert.equal(editHeaders[0], editHeaders[1]);
+    assert.equal(editHeaders[0], edits[0].edit_id);
+    const pendingColor = await page.getByText('Edit requested', { exact: true }).evaluate(el => getComputedStyle(el).backgroundColor);
+    assert.equal(new Set([queuedColor, waitingColor, blockedColor, pendingColor]).size, 4);
+    assert.equal(await orders.getByRole('button', { name: 'Accept', exact: true }).isDisabled(), true);
+    await page.reload();
+    await page.getByText('Your edit is pending.', { exact: false }).waitFor();
+    await orders.getByText('Not reviewed', { exact: true }).waitFor();
+    finishEdit();
+    await orders.getByText('reject', { exact: true }).waitFor();
     await lines.getByRole('button', { name: 'Accept', exact: true }).click();
+    await page.getByText('Your edit is pending.', { exact: false }).waitFor();
+    finishEdit();
     await page.waitForFunction(() => document.querySelector('section[aria-label="fact_lines"]').textContent.includes('Decision: accept'));
     await page.reload();
     await orders.getByText('reject', { exact: true }).waitFor();
     await lines.getByText('accept', { exact: true }).waitFor();
     await orders.getByRole('button', { name: 'Reject', exact: true }).click();
-    await page.getByText('Decision already saved; replay confirmed.', { exact: true }).waitFor();
-    assert.equal(edits[0].edit_id, edits[2].edit_id);
+    await page.getByText('Edit already submitted; replay confirmed.', { exact: true }).waitFor();
+    assert.equal(edits[0].edit_id, edits[3].edit_id);
+    assert.equal(editHeaders[0], editHeaders[3]);
     await lines.getByText('accept', { exact: true }).waitFor(); // Old receipt must not replace current package.
     modelMode = 'live'; status = 'failed';
     await page.reload();
     await page.getByRole('button', { name: 'Retry routing', exact: true }).waitFor();
     await page.getByText('live', { exact: true }).waitFor();
     assert.deepEqual(errors, []);
-    console.log('Routing browser smoke passed: login, create retry, queued/running, blockers, decisions, refresh, replay, live mode, failure state. HTTP fixtures only.');
+    console.log('Routing browser smoke passed: login, creation/edit network retries, lifecycle colors, pending edits, disabled controls, refresh, async completion, replay, live mode, failure state. HTTP fixtures only.');
   } finally { if (browser) await browser.close(); await server.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
