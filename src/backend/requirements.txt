@@ -7,3 +7,10 @@ SQLAlchemy>=2.0,<3
 psycopg[binary]>=3.2,<4
 python-dotenv>=1.0,<2
 alembic>=1.14,<2
+langgraph>=1.2,<2
+# The live model adapter's SDK. Required only for `GENLEDGE_MODEL_MODE=live`; the
+# default `auto` resolves to the deterministic fake when no provider credential or
+# endpoint is configured, and `app/agent/models.py` imports this lazily so the fake
+# path runs without it. The floor is the release that moved structured output to
+# `output_config.format`; the adapter codes against that surface.
+anthropic>=0.77,<1
