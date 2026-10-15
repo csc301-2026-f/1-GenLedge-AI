@@ -143,3 +143,22 @@ Expected: only 03/04/2026 is flagged in the first list. The four-record discover
 
 - Action: Open the working app's synthetic discovery preview, choosing Initial sample and Refreshed sample.
   Expected: order_date displays Date format ambiguous with an explanatory confirmation notice. Samples remain strings; types and schema-change counts retain their existing meanings. Empty/loading/error previews do not invent a date warning.
+
+## US3 snapshot publication
+
+Use a disposable local control database, apply its existing control-plane migration, and create InventoryRepository(Database(explicit_local_dsn)). Do not use a shared/team database for this check. From src/backend, pass the synthetic orders DiscoveryResult to publish_discovery with an explicit preparation callback such as withhold_samples in doc/us3-discovery.md.
+
+- Action: Publish the orders fixture with candidate snapshot ID orders-v1, then read it through InventoryService scoped to the same organization.
+  Expected: One resource, 14 fields, preserved canonical paths/types/nullable/repeating/native_type and order_date ambiguity. Samples reflect the explicit policy; withhold_samples saves empty sample lists.
+- Action: Publish identical prepared metadata under candidate orders-retry.
+  Expected: The returned ID is orders-v1 and only one snapshot exists for this source. Use that returned ID in later calls.
+- Action: Publish orders-refreshed.json under orders-v2, then read both IDs.
+  Expected: Two immutable snapshots. The old one retains paid; the new one has currency and the changed total type evidence. Neither is deleted or rewritten.
+- Action: Read orders-v1 from another process and after restarting only the disposable server.
+  Expected: The same stored inventory remains readable with the correct organization scope.
+- Action: Attempt a read/save under another organization, reuse orders-v1 for different content, or update a sealed snapshot's field directly.
+  Expected: Scoped not-found, source/ID conflict or immutability error; existing saved metadata remains intact.
+- Action: Supply a preparation callback that raises before returning an inventory.
+  Expected: The error propagates and no source/snapshot is created for that attempt. No silent retry or success response is produced.
+
+No raw-source ingestion, HTTP API, browser wiring, sampling metadata persistence or model call is established by these checks. Remove only the disposable database/cluster after inspection.

@@ -149,3 +149,43 @@ Detection runs over all observed strings within the existing first-N record limi
 The discovery screen displays a field marker and confirmation notice from the supplied result. It does not resolve ambiguity, block routing proposals, or implement a reviewer decision. Downstream validation owns the existing rule that date_format cannot be applied while the ambiguity remains unresolved. Schema comparison still reports added/missing paths and type changes only; ambiguity-only changes do not produce a comparison entry.
 
 This detector is deliberately narrow: hyphen/dot separators, two-digit years, timestamps, locale inference and mixed-format consistency checks are outside this step. No marker means this rule found no distinct slash-date interpretations in the sample; it is not confirmation of the field's format, validity, meaning or unsampled values. Sampling and bounded display-value limits still apply.
+
+## Snapshot publication
+
+`app.sources.snapshot_service.publish_discovery` connects an existing DiscoveryResult to the inventory adapter and Person A's InventoryRepository. Supply the configured repository, server-authorized organization/source identity, candidate snapshot/resource metadata, and an explicit prepare_inventory callback. The function does not open a second storage implementation or infer identity from request data.
+
+```python
+from app.common.database import Database
+from app.sources.repository import InventoryRepository
+from app.sources.snapshot_service import publish_discovery
+
+
+def withhold_samples(inventory):
+    return inventory.model_copy(update={
+        "fields": [field.model_copy(update={"samples": []}) for field in inventory.fields],
+    })
+
+
+saved = publish_discovery(
+    result, InventoryRepository(Database()),
+    prepare_inventory=withhold_samples,
+    organization_id=authorized_organization_id,
+    source_id=authorized_source_id,
+    source_name="Orders",
+    snapshot_id=candidate_snapshot_id,
+    resource_id="orders",
+    resource_name="Orders",
+    resource_kind="collection",
+)
+print(saved.snapshot_id)
+```
+
+The example deliberately withholds all sample values. Real application composition should pass the agreed sample preparation/redaction policy; there is no default pass-through and no new redaction algorithm here. The callback receives the canonical inventory, must preserve its intended identity/structural evidence, and returns metadata safe for persistence. It runs before any repository call. A callback failure or repository error propagates to the caller rather than returning an apparent success. The repository revalidates shared contracts and owns publication transactions, scoped reads, fingerprint deduplication and immutability.
+
+The returned inventory is the repository's published result. Identical prepared metadata for the same source may return an earlier snapshot ID instead of the candidate ID; use saved.snapshot_id for subsequent reads and routing. Changed metadata is a new immutable snapshot, and reusing an occupied ID for different content is a conflict. Existing snapshots and their field references are retained; this service does not update or delete mappings.
+
+Repository fingerprinting applies to prepared inventory, including resource metadata, fields, samples and ambiguity, but excludes the candidate snapshot ID. If only withheld values or sample counts change, inventory may deduplicate. This is a metadata snapshot, not an uploaded batch identity or full data-version guarantee. Discovery sampling counts/method and any raw report must be retained separately; no sampling columns or latest-snapshot pointer are added here.
+
+Use InventoryService(repository, organization_id=authorized_organization_id).get_inventory(saved.snapshot_id) for application reads. The global unscoped inventory helper is for trusted workers. Source authorization and choosing the correct organization's fixture remain the application's responsibility; the service is not a public HTTP boundary.
+
+The persistence-only dependency retains Person A's original commits through 45e81f2. Its source repository, database adapter and migrations match the newer combined persistence branch at integration time, without importing that branch's LangGraph merge. Configure and migrate the control database using doc/us4-source-persistence.md; auth and control-plane migration histories remain separate. Neither importing nor calling this helper applies migrations automatically.
