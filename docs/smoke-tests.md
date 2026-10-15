@@ -83,18 +83,24 @@ PYTHON
 
 Expected: `added` contains `currency`; `missing` contains `paid`; `typeChanges` reports `total` changing from null/number/string to string. These are sample observations; the comparison does not delete source fields or mappings.
 
-## US3 discovery presentation
+## US3 saved snapshot presentation
 
-- Action: Open the working app, sign in and choose Discover from the source screen.
-  Expected: Discovery is labelled Synthetic preview, with source Synthetic orders fixture and collection orders. The initial result reports three sampled records and 14 fields; `total` displays null/number/string and `customer_code` retains quoted leading-zero strings.
-- Action: Search `LINES` and choose the number type filter. Clear filters before the next step.
-  Expected: Search is case-insensitive; `lines[].qty` matches the type filter; no-match queries show an explicit empty-filter message.
-- Action: Click Re-sample or select Refreshed sample.
-  Expected: `currency` is added, `paid` is missing from the sample, and `total` changes to string. The notice explains missing is not confirmed deletion. Added and Type changed filters show the matching current fields.
-- Action: Use the labelled preview selector to choose Empty sample, Loading, then Error.
-  Expected: Empty fields, loading status and explicit error are shown separately. Routing is disabled in all three states; Re-sample is disabled during loading and returns to the refreshed fixture from error/empty.
-- Action: Advance from a nonempty sample.
-  Expected: The existing mock routing screen opens. Discovery does not make an HTTP request, persist data, or supply live records to routing.
+Prepare an authorized synthetic snapshot using the publication steps below, configure/migrate the control store, and sign in to the working app with an application user in that same organization.
+
+- Action: Choose Discover from the source screen.
+  Expected: The saved snapshot ID form appears with no fabricated source/field data. Load and routing actions are disabled until their required inputs/integration exist.
+- Action: Enter a saved snapshot ID and load it.
+  Expected: The displayed snapshot ID is the requested saved ID; resources and fields come from GET /api/sources/snapshots/<id>. Sampling count/method are reported as not recorded. Canonical types, native evidence, stored status and prepared samples appear without invented conversions.
+- Action: Search LINES and select the number type on the 14-field orders fixture.
+  Expected: Only lines[].qty matches. Changing resource/snapshot resets filters; an unmatched query shows a no-match message.
+- Action: Load a multi-resource snapshot, select orders.lines[], then load an empty snapshot.
+  Expected: The correct resource fields are shown; empty resources show an explicit empty message. Routing stays disconnected.
+- Action: Edit the snapshot ID, load an unknown/other-organization ID, or stop only the disposable store and load an authorized ID.
+  Expected: Old rows clear immediately; 404 or safe503 messages appear with no SQL/DSN/credential details. Reloading after recovery succeeds.
+- Action: Click Reload snapshot after a successful read.
+  Expected: GET reads the same immutable ID. No source sampling, write or new snapshot occurs.
+
+The standalone Frontend Demo and isolated DiscoveryPreview remain synthetic; they are not the connected App's live snapshot path.
 
 ## US3 shared inventory adapter
 
@@ -141,8 +147,8 @@ PYTHON
 
 Expected: only 03/04/2026 is flagged in the first list. The four-record discovery result carries ambiguity even though its three display samples are the ISO strings. Its type remains string, inventory type remains text, and the same marker appears in InventoryField. No date values are changed.
 
-- Action: Open the working app's synthetic discovery preview, choosing Initial sample and Refreshed sample.
-  Expected: order_date displays Date format ambiguous with an explanatory confirmation notice. Samples remain strings; types and schema-change counts retain their existing meanings. Empty/loading/error previews do not invent a date warning.
+- Action: Load a saved snapshot published from the orders discovery fixture.
+  Expected: order_date displays Date format ambiguous with a confirmation notice; stored canonical type/native evidence are unchanged. The isolated synthetic preview still supports its original initial/refreshed cases.
 
 ## US3 snapshot publication
 
@@ -162,3 +168,16 @@ Use a disposable local control database, apply its existing control-plane migrat
   Expected: The error propagates and no source/snapshot is created for that attempt. No silent retry or success response is produced.
 
 No raw-source ingestion, HTTP API, browser wiring, sampling metadata persistence or model call is established by these checks. Remove only the disposable database/cluster after inspection.
+
+## US3 saved snapshot API
+
+- Action: Request a saved snapshot without a valid login, then with a valid login in its organization.
+  Expected:401 then200 with contract_version/inventory and Cache-Control:no-store.
+- Action: Request an unknown ID and another organization's ID, including a forged organization_id query parameter.
+  Expected: Identical404 snapshot_not_found envelopes; identity is taken from the session.
+- Action: Sign out and retry the read.
+  Expected:401.
+- Action: Use a logged-in app without control-store configuration, or stop only its disposable control database.
+  Expected: Explicit503 snapshot_not_configured or snapshot_unavailable, no secret-bearing response, and no-store headers. Unexpected failures are not converted into an apparent successful empty inventory.
+
+Keep all manual verification data in a disposable local store. Do not reuse team credentials or alter a shared database for these checks.

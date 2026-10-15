@@ -57,12 +57,9 @@ const root = path.resolve(__dirname, '..');
  await page.locator('input[type=password]').press('Enter');await page.locator('input[type=password]').press('Enter');await loggedIn();assert.equal(loginCount,before+1);assert.equal(lastLogin.rememberMe,true);assert.equal(lastLogin.email,'analyst@example.com');
  assert.ok((await page.evaluate(() => window.__authRequests)).every(value => value === 'include'));
  await page.reload();await loggedIn();assert.equal(meCount,2);
- // Walk all static workflow screens without changing their implementation.
+ // Visit discovery without requiring a configured inventory database.
  await page.getByRole('button',{name:'Discover',exact:true}).first().click();
- await page.getByRole('button',{name:'Run AI Routing',exact:true}).click();
- await page.getByRole('button',{name:/Accept All/}).click();
- await page.getByRole('button',{name:'Save & Continue',exact:true}).click();
- await page.getByRole('button',{name:'Pipelines & Monitor',exact:true}).click();
+ await page.getByRole('button',{name:'Load snapshot',exact:true}).waitFor();
  await page.getByRole('button',{name:'Display Settings',exact:true}).click();
  await page.getByRole('heading', {name:'Display settings',exact:true}).waitFor();
  // Reload closes appearance panel, and restores session.
@@ -77,6 +74,6 @@ const root = path.resolve(__dirname, '..');
  assert.deepEqual(errors,[]);
  const storage=await page.evaluate(()=>[JSON.stringify(localStorage),JSON.stringify(sessionStorage)]);
  assert.ok(!storage.join('').includes('test-value'));
- console.log('PASS: Strict Mode single restore, empty fields, API 400, network failure, keyboard submit/repeat protection, remember-me payload, restore, all static screens, appearance, logout failure/retry, expired session, restore retry, invalid JSON shape/non-JSON fallback.');
+ console.log('PASS: Strict Mode single restore, empty fields, API 400, network failure, keyboard submit/repeat protection, remember-me payload, restore, discovery entry, appearance, logout failure/retry, expired session, restore retry, invalid JSON shape/non-JSON fallback.');
  } finally {await browser.close();await server.close();}
 })().catch(e=>{console.error(e);process.exit(1)});

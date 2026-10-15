@@ -93,13 +93,15 @@ The fixtures `tests/fixtures/us3/orders.json` and `orders-refreshed.json` contai
 
 ## Frontend presentation
 
-`src/frontend/src/features/discovery/DiscoverScreen.tsx` consumes contract v1 via the types in `types.ts`. Its caller supplies `sourceName`, `collectionName`, controlled `state`, `onResample`, and `onAdvance`. State is either loading, error with a message, or ready with a result and optional comparison. It performs no network or storage operations. Remount it with the selected collection identity as its React key when changing collections to reset filters.
+The connected App now uses DiscoveryContainer to load a saved snapshot by ID from the authenticated API. It shows idle/loading/error/ready states, selects resources returned by that snapshot, clears stale results when the ID changes, cancels replaced/unmounted requests and bounds requests to 15 seconds. Reload snapshot re-reads the same immutable artifact; it does not sample a source or publish a new snapshot.
 
-The table displays canonical paths, type unions, nullable/repeating observations and JSON-rendered samples. Search is case-insensitive; type filters match any observed type. Change filters apply to currently observed fields. Missing paths remain visible in the comparison notice, even though they are absent from the current field table. Initial fields are labelled Observed; Unchanged only means unchanged paths/types relative to the supplied comparison.
+DiscoverScreen remains presentation-only. Its caller supplies sourceName, collectionName, a controlled DiscoveryState, and optional refresh/advance callbacks. The display model is separate from both raw DiscoveryResult and shared InventoryView: discoveryView renders raw samples as JSON literals; snapshotView displays canonical saved types and already prepared sample strings without quoting them twice. Native type evidence is shown separately, not parsed into invented raw types. Saved status is displayed as stored. Filters use the types/statuses present in the selected resource.
 
-`DiscoveryPreview.tsx` is the temporary application host. It clearly labels synthetic data and provides initial/refreshed/empty/loading/error scenarios. Re-sample selects the refreshed fixture immediately; it does not read a source or save a snapshot. `previewData.ts` is generated from the backend synthetic orders fixtures with `discover_records(...).as_dict()` and `compare_discoveries(...).as_dict()`. The preview includes the core-generated date ambiguity marker; it invents no date conversion, ObjectId inference or real source metadata.
+Raw previews can show sampledCount. Saved InventoryView has no sample count/method, so its screen explicitly says they were not recorded. No total record count is invented. A resource with zero fields displays an empty-resource message; changing snapshot/resource resets filters. An error never leaves the previous snapshot's fields visible.
 
-For real integration, replace the preview host with the authorized source/collection caller and supply the same props after validating the HTTP response. The caller owns request lifecycle, organization access/redaction, snapshot comparison scope and downstream result handoff. Existing routing/mapping screens still use their own mock data; advancing from this preview does not feed them a real mapping input.
+DiscoveryPreview remains an isolated synthetic component using generated core payloads and initial/refreshed/empty/loading/error modes. It is no longer the connected App's default discovery host. The preserved standalone Frontend Demo is unchanged.
+
+Routing remains disconnected in this step: the live view's action is disabled rather than navigating to the still-mocked routing screen. The later job integration must pass the displayed persisted snapshot ID to the mapping job API.
 
 ## Shared inventory adapter
 
@@ -189,3 +191,32 @@ Repository fingerprinting applies to prepared inventory, including resource meta
 Use InventoryService(repository, organization_id=authorized_organization_id).get_inventory(saved.snapshot_id) for application reads. The global unscoped inventory helper is for trusted workers. Source authorization and choosing the correct organization's fixture remain the application's responsibility; the service is not a public HTTP boundary.
 
 The persistence-only dependency retains Person A's original commits through 45e81f2. Its source repository, database adapter and migrations match the newer combined persistence branch at integration time, without importing that branch's LangGraph merge. Configure and migrate the control database using doc/us4-source-persistence.md; auth and control-plane migration histories remain separate. Neither importing nor calling this helper applies migrations automatically.
+
+## Saved snapshot HTTP API
+
+GET /api/sources/snapshots/<snapshot_id> uses the existing login_required helper and derives organization scope from g.user["organizationId"]. It never accepts organization identity from URL query/body fields. Unknown snapshots and snapshots belonging to another organization return the same404. Source registration creates a repository only when its DSN is configured, without connecting or applying migrations. The repository/service are reused unchanged.
+
+Successful response:
+
+```json
+{
+  "contract_version": "1",
+  "inventory": {
+    "snapshot_id": "orders-v1",
+    "resources": [{"resource_id": "orders", "name": "Orders", "kind": "collection", "field_count": 0}],
+    "fields": []
+  }
+}
+```
+
+Responses carry Cache-Control: no-store. Unauthenticated requests return the existing auth401 response. Missing storage configuration returns503 snapshot_not_configured; expected PostgreSQL/auth database errors return503 snapshot_unavailable with no DSN, credential or database exception text. Server logging records the exception class. Unexpected application errors retain normal failure behavior. The route is read-only, so it performs no CSRF-protected mutation or implicit publication.
+
+The client sends credentials and validates the response's major contract version, requested snapshot ID, consumed field types/flags/samples, resource references/counts and uniqueness before rendering. It treats401 as an expired-session message and displays safe API error messages for other expected failures. The frontend makes no organization-identity claim.
+
+### Control store configuration
+
+Flask reads the existing GENLEDGE_DATABASE_URL and GENLEDGE_DATABASE_SCHEMA settings from its private .env or process environment, with process values taking precedence. The optional .env.example fields contain no credentials. Use the assigned developer database, a PostgreSQL/psycopg DSN with the required TLS settings, and the existing dedicated control schema (default genledge_control). No fallback to an unrelated auth/demo database is introduced.
+
+Apply Person A's control-plane migrations separately before serving saved inventory. Its standalone migration command reads process environment, so export the settings as described in doc/us4-source-persistence.md; it does not automatically read Flask's .env. Auth tables/migrations remain separate. Startup does not create snapshots or seed another organization. A snapshot must have been published with the logged-in user's actual organization ID.
+
+The existing auth HOST/PORT/DATABASE/USER/PASSWORD configuration and its known generic USER environment-name collision are unchanged by this feature. The isolated verification process used its own synthetic auth/control configuration, not the team's .env or normal launcher.

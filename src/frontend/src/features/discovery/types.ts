@@ -21,6 +21,31 @@ export type DiscoveryChanges = {
   typeChanges: { path: string; previousTypes: ObservedType[]; currentTypes: ObservedType[] }[]
 }
 export type DiscoveryState =
+  | { status: 'idle' }
   | { status: 'loading' }
   | { status: 'error'; message: string }
-  | { status: 'ready'; result: DiscoveryResult; changes?: DiscoveryChanges }
+  | { status: 'ready'; result: DiscoveryView; changes?: DiscoveryChanges }
+
+export type SourceType = 'text' | 'number' | 'boolean' | 'date' | 'timestamp' | 'json'
+export type InventoryField = {
+  ref: { source_id: string; resource_id: string; field_path: string }
+  type: SourceType
+  nullable: boolean
+  repeating: boolean
+  samples: string[]
+  status: 'stable' | 'new' | 'unknown'
+  ambiguity?: string | null
+  native_type?: string | null
+}
+export type InventoryView = {
+  snapshot_id: string
+  resources: { resource_id: string; name: string; kind: 'collection' | 'table' | 'sheet' | 'file'; field_count: number }[]
+  fields: InventoryField[]
+}
+export type DiscoveryFieldView = Omit<DiscoveredField, 'types' | 'samples'> & {
+  types: (ObservedType | SourceType)[]
+  samples: string[]
+  nativeType?: string
+  status?: InventoryField['status']
+}
+export type DiscoveryView = { fields: DiscoveryFieldView[]; sampledCount?: number }
