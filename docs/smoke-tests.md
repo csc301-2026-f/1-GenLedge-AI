@@ -65,3 +65,25 @@ Expected: `added` contains `currency`; `missing` contains `paid`; `typeChanges` 
   Expected: Empty fields, loading status and explicit error are shown separately. Routing is disabled in all three states; Re-sample is disabled during loading and returns to the refreshed fixture from error/empty.
 - Action: Advance from a nonempty sample.
   Expected: The existing mock routing screen opens. Discovery does not make an HTTP request, persist data, or supply live records to routing.
+
+## US3 shared inventory adapter
+
+From `src/backend`, run a synthetic conversion without Flask startup or a database:
+
+```bash
+.venv/bin/python - <<'PYTHON'
+import json
+from pathlib import Path
+from app.sources.discovery import discover_records
+from app.sources.inventory_adapter import to_inventory
+
+result = discover_records(json.loads(Path("tests/fixtures/us3/orders.json").read_text()))
+inventory = to_inventory(result, snapshot_id="snapshot-orders-1", source_id="source-orders-1",
+                         resource_id="orders", resource_name="Orders", resource_kind="collection")
+print(inventory.snapshot_id, inventory.resources[0].field_count)
+for field in inventory.fields:
+    print(field.ref.field_path, field.type.value, field.native_type, field.samples, field.status)
+PYTHON
+```
+
+Expected: 14 fields in the orders resource; `total` is json with `observed:null|number|string`; `order_date` is text; `customer_code` preserves JSON-quoted leading-zero strings; `lines[].sku` keeps its path and repeating flag. Every status is unknown. No source read, semantic date detection, redaction or snapshot persistence is performed by this adapter.

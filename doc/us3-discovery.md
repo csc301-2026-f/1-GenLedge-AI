@@ -100,3 +100,40 @@ The table displays canonical paths, type unions, nullable/repeating observations
 `DiscoveryPreview.tsx` is the temporary application host. It clearly labels synthetic data and provides initial/refreshed/empty/loading/error scenarios. Re-sample selects the refreshed fixture immediately; it does not read a source or save a snapshot. `previewData.ts` is generated from the backend synthetic orders fixtures with `discover_records(...).as_dict()` and `compare_discoveries(...).as_dict()`. No semantic date detection, ObjectId inference, or real source metadata is invented.
 
 For real integration, replace the preview host with the authorized source/collection caller and supply the same props after validating the HTTP response. The caller owns request lifecycle, organization access/redaction, snapshot comparison scope and downstream result handoff. Existing routing/mapping screens still use their own mock data; advancing from this preview does not feed them a real mapping input.
+
+## Shared inventory adapter
+
+`app.sources.inventory_adapter.to_inventory` adapts one `DiscoveryResult` to the existing `app.agent.contracts.InventoryView`. It does not introduce another inventory schema. The frozen shared-contract commit is retained as a dependency of this branch; it is also used by the US4 workstreams.
+
+```python
+from app.sources.discovery import discover_records
+from app.sources.inventory_adapter import to_inventory
+
+result = discover_records([{"order_no": "001", "total": 12.5}])
+inventory = to_inventory(
+    result,
+    snapshot_id="snapshot-orders-1",
+    source_id="source-orders-1",
+    resource_id="orders",
+    resource_name="Orders",
+    resource_kind="collection",
+)
+print(inventory.model_dump_json(indent=2))
+```
+
+The caller supplies all identities and resource metadata. One report becomes one resource; all canonical paths and their nullable/repeating flags are preserved, including parent objects, array containers/elements and quoted literal-key paths. This adapter does not extract nested arrays into independent resources or rename fields. If US4 needs `orders.lines[]` with a relative `sku`, the caller must discover that explicitly scoped resource rather than relabel the full orders result. Downstream mapping/tool identifier restrictions still need integration review for literal-key and non-ASCII paths.
+
+| Structural observations | Inventory type |
+| --- | --- |
+| string, optionally with null | text |
+| number, optionally with null | number |
+| boolean, optionally with null | boolean |
+| object or array, optionally with null | json |
+| multiple non-null types | json |
+| null only | json |
+
+`json` for mixed/null-only observations is a conservative projection, not a conversion of source values or a claim about a warehouse target type. `native_type` records the complete observed structural type set as `observed:null|number|string`, distinguishing observation from a connector's declared native type. Every field starts with status `unknown`; this adapter has no prior snapshot with which to establish `stable` or `new`. Description and ambiguity remain unset. Dates and leading-zero identifiers stay structural strings; ambiguity detection is a separate step.
+
+The shared contract requires string samples. Each existing bounded scalar sample is JSON-rendered into a string: the source string `001` becomes the display string `"001"`, boolean true becomes `true`, and actual null becomes `null`. This keeps a source string such as `"null"` distinguishable from actual null. Object/array samples remain the core's size-summary strings. The original report is not modified.
+
+`InventoryView` does not contain `sampledCount` or `samplingMethod`; the caller must retain the original report alongside the inventory if those observations need to be displayed or persisted. Do not manufacture total record counts from the sample. The adapter does not redact samples, authorize access, assign IDs, save snapshots, or call HTTP/model/connector services. Apply the agreed access/redaction policy before exposing the result. Construction uses the shared Pydantic models and their existing validation rules.
