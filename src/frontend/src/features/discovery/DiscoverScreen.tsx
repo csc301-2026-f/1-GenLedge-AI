@@ -42,6 +42,9 @@ export function DiscoverScreen({ sourceName, collectionName, state, onResample, 
         {state.status === 'error' && <div role="alert"><Alert type="error">{state.message}</Alert></div>}
         {result && <>
           <Alert type="info">Sampled {result.sampledCount} records in source order (up to 500). Fields outside the sample may be missed. Nullable describes observed null or missing values.</Alert>
+          {result.fields.some(field => field.ambiguity) && <div style={{ marginTop: 12 }}>
+            <Alert type="warning">Some sampled dates support both DD/MM/YYYY and MM/DD/YYYY. Confirm the date format before transformation. Values have not been converted.</Alert>
+          </div>}
           {changes && <div style={{ marginTop: 12 }} aria-live="polite">
             <Alert type="warning">
               <strong>Sample changes</strong>
@@ -69,7 +72,10 @@ export function DiscoverScreen({ sourceName, collectionName, state, onResample, 
               </tr></thead>
               <tbody>
                 {fields.map(field => <tr key={field.path}>
-                  <td style={{ padding: 12, fontFamily: 'monospace', color: T.text }}>{field.path}</td>
+                  <td style={{ padding: 12, fontFamily: 'monospace', color: T.text }}>
+                    {field.path}
+                    {field.ambiguity && <div style={{ marginTop: 4, color: 'var(--c-7a4800)', fontSize: 11 }}>Date format ambiguous</div>}
+                  </td>
                   <td style={{ padding: 12 }}><div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>{field.types.map(type => <TypeTag key={type} type={type} />)}</div></td>
                   <td style={{ padding: 12, color: T.textMid }}>{field.nullable ? 'Yes' : 'No'}</td>
                   <td style={{ padding: 12, color: T.textMid }}>{field.repeating ? 'Yes' : 'No'}</td>

@@ -38,6 +38,7 @@ def to_inventory(result: DiscoveryResult, *, snapshot_id: str, source_id: str,
         samples=[json.dumps(value, ensure_ascii=False) for value in field.samples],
         native_type="observed:" + "|".join(field.types),
         status="unknown",
+        ambiguity=field.ambiguity,
     ) for field in result.fields]
     return InventoryView(
         snapshot_id=snapshot_id,

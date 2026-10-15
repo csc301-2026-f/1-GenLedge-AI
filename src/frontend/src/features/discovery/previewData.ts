@@ -81,7 +81,8 @@ export const previewData = {
           "03/04/2026",
           "04/05/2026",
           "2026-10-12"
-        ]
+        ],
+        "ambiguity": "date_format_ambiguous: DD/MM/YYYY or MM/DD/YYYY"
       },
       {
         "path": "order_no",
@@ -275,7 +276,8 @@ export const previewData = {
           "03/04/2026",
           "04/05/2026",
           "2026-10-12"
-        ]
+        ],
+        "ambiguity": "date_format_ambiguous: DD/MM/YYYY or MM/DD/YYYY"
       },
       {
         "path": "order_no",

@@ -87,3 +87,29 @@ PYTHON
 ```
 
 Expected: 14 fields in the orders resource; `total` is json with `observed:null|number|string`; `order_date` is text; `customer_code` preserves JSON-quoted leading-zero strings; `lines[].sku` keeps its path and repeating flag. Every status is unknown. No source read, semantic date detection, redaction or snapshot persistence is performed by this adapter.
+
+## US3 date ambiguity
+
+From `src/backend`, inspect the detector and inventory propagation without starting services:
+
+```bash
+.venv/bin/python - <<'PYTHON'
+from app.sources.date_ambiguity import detect_date_ambiguity
+from app.sources.discovery import discover_records
+from app.sources.inventory_adapter import to_inventory
+
+for value in ('03/04/2026', '13/04/2026', '04/04/2026', '31/02/2026', '2026-04-03'):
+    print(value, detect_date_ambiguity(value))
+result = discover_records([{'date': value} for value in
+                           ('2026-01-01', '2026-01-02', '2026-01-03', '03/04/2026')])
+inventory = to_inventory(result, snapshot_id='dates-1', source_id='source-1',
+                         resource_id='dates', resource_name='Dates', resource_kind='collection')
+print(result.as_dict())
+print(inventory.fields[0].model_dump(mode='json'))
+PYTHON
+```
+
+Expected: only 03/04/2026 is flagged in the first list. The four-record discovery result carries ambiguity even though its three display samples are the ISO strings. Its type remains string, inventory type remains text, and the same marker appears in InventoryField. No date values are changed.
+
+- Action: Open the working app's synthetic discovery preview, choosing Initial sample and Refreshed sample.
+  Expected: order_date displays Date format ambiguous with an explanatory confirmation notice. Samples remain strings; types and schema-change counts retain their existing meanings. Empty/loading/error previews do not invent a date warning.

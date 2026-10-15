@@ -6,6 +6,8 @@ from itertools import islice
 import json
 from typing import Iterable, Literal, TypeAlias
 
+from .date_ambiguity import detect_date_ambiguity
+
 
 JSONScalar: TypeAlias = str | int | float | bool | None
 JSONValue: TypeAlias = JSONScalar | dict[str, "JSONValue"] | list["JSONValue"]
@@ -23,6 +25,7 @@ class DiscoveredField:
     nullable: bool
     repeating: bool
     samples: tuple[JSONScalar, ...]
+    ambiguity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,7 @@ class DiscoveryResult:
                 "path": item.path, "types": list(item.types),
                 "nullable": item.nullable, "repeating": item.repeating,
                 "samples": list(item.samples),
+                **({"ambiguity": item.ambiguity} if item.ambiguity is not None else {}),
             } for item in self.fields],
         }
 
@@ -52,6 +56,7 @@ class _ObservedField:
     sample_keys: set[tuple[ObservedType, str]] = field(default_factory=set)
     documents: set[int] = field(default_factory=set)
     occurrences: int = 0
+    ambiguity: str | None = None
 
 
 def _key_path(parent: str, key: str) -> str:
@@ -82,6 +87,8 @@ def discover_records(records: Iterable[dict[str, JSONValue]], *,
         item.documents.add(document)
         item.occurrences += 1
         item.repeating |= repeating or kind == "array"
+        if isinstance(value, str) and item.ambiguity is None:
+            item.ambiguity = detect_date_ambiguity(value)
         if len(item.samples) < 3:
             sample: JSONScalar
             if isinstance(value, dict):
@@ -115,6 +122,7 @@ def discover_records(records: Iterable[dict[str, JSONValue]], *,
                           and item.occurrences < object_counts[item.parent])),
             repeating=item.repeating,
             samples=tuple(item.samples),
+            ambiguity=item.ambiguity,
         ) for path, item in sorted(observed.items())
     ))
 

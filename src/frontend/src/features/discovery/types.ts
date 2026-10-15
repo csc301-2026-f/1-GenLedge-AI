@@ -6,6 +6,7 @@ export type DiscoveredField = {
   nullable: boolean
   repeating: boolean
   samples: (string | number | boolean | null)[]
+  ambiguity?: string
 }
 export type DiscoveryResult = {
   contractVersion: 1
