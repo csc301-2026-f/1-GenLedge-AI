@@ -21,7 +21,12 @@ from app.agent.contracts import AgentBudgets, ToolCallRequest
 from app.agent.graph import run_routing_job
 from app.agent.models import ModelRequest, ModelResponse
 from app.agent.repositories import SNAPSHOT_ID, InMemoryRoutingRepository, seeded_repository
-from app.agent.tools import REDACTION_MARKER, ConnectorError, ToolDispatcher
+from app.agent.tools import (
+    REDACTION_MARKER,
+    UNDECLARED_FIELD_MARKER,
+    ConnectorError,
+    ToolDispatcher,
+)
 
 from .doubles import inventory
 
@@ -163,6 +168,12 @@ def test_an_undeclared_connector_field_is_rejected_not_absorbed():
     would otherwise appear on the review screen as data nobody validated. The cost is
     that adding a field to a connector requires adding it to the result model first,
     which is the intended direction.
+
+    The rejection names the *problem*, not the connector's key. The key is text the
+    connector authored, and this report is persisted — so it is whitelisted against the
+    declared result-model fields and an undeclared one is rendered as a marker. The test
+    asserts the marker rather than the key name deliberately: asserting the key name is
+    what made the earlier revision's claim ("never a connector-supplied value") false.
     """
 
     connector = FaultConnector("extra_field")
@@ -172,8 +183,16 @@ def test_an_undeclared_connector_field_is_rejected_not_absorbed():
     assert outcome.result.status == "error"
     assert outcome.result.error_code == "connector_error"
     assert "does not match its contract" in (outcome.result.message or "")
-    assert "confidence" in (outcome.result.message or ""), "the offending field is named"
-    assert repository.get_tool_result("job-extra", "extra-1") is not None
+    assert "Extra inputs are not permitted" in (outcome.result.message or ""), (
+        "pydantic's own message names the category of problem"
+    )
+    assert "confidence" not in (outcome.result.message or ""), (
+        "the connector-authored key name must not be persisted"
+    )
+    assert UNDECLARED_FIELD_MARKER in (outcome.result.message or "")
+    stored = repository.get_tool_result("job-extra", "extra-1")
+    assert stored is not None
+    assert "confidence" not in (stored.message or "")
 
 
 @pytest.mark.parametrize(

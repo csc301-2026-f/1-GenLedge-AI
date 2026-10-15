@@ -38,6 +38,7 @@ adding another example-based test.
 ..\..\.venv\Scripts\python.exe -m pytest tests   # from src/backend
 python verify_us4_person_b.py    # requirement-level checks, independent of the suite
 python tools/mutation_check.py   # mutation battery, on a throwaway copy
+python tools/sensitivity_check.py  # do the regression tests fail when their fix is reverted?
 python run_agent_tests.py        # the agent suite on a machine without pytest
 python tools/prompt_manifest.py  # regenerate the prompt digests after a prompt edit
 python tools/live_provider_check.py   # opt-in: needs a provider key (see below)
@@ -116,6 +117,121 @@ check, the duplicate-id guard, the non-string-scalar content rule, the nested-cr
 rule, the three runner-level store faults and the traversal token each produced a named
 assertion failure. `tools/mutation_check.py` asks the same question at a larger scale and
 is the tool to run once a writable scratch location exists.
+
+**Fifth cycle (the five follow-up findings).** The same check was repeated for each of
+them, by reverting the fix in place, running the matching tests, and restoring the file
+(the tree was fingerprinted afterwards and the suite re-run green). Every revert was
+caught, by name:
+
+| Fix reverted | Test that failed |
+| --- | --- |
+| `redact_message` at the persisted `ToolResult.message` | `test_i1_a_connector_exception_cannot_write_a_credential_into_the_result` — all six parametrisations |
+| `_call_connector`'s deadline (dispatch calls the connector directly again) | `test_i2_a_hung_connector_fails_its_call_not_the_node` |
+| The model-node deadline check | `test_i2_an_over_budget_model_answer_is_refused_and_charged` |
+| `_record_model_call`'s fail-closed raise (back to a `logger.warning` and continue) | `test_i3_a_model_call_whose_record_cannot_be_written_ends_the_run`, `test_i3_a_raising_adapter_whose_record_cannot_be_written_ends_the_run`, `test_i3_a_repair_call_whose_record_cannot_be_written_ends_the_run` |
+| `SUPPORTED_LIVE_PROVIDERS` widened to include `openai` | `test_an_advertised_provider_is_refused_when_no_adapter_exists_for_it`, `test_build_model_client_refuses_an_unsupported_provider`, `test_live_model_refuses_an_unsupported_provider` |
+| `canonical_prompt_text`'s line-ending fold (`return raw.decode("utf-8")`) | `test_a_crlf_checkout_hashes_the_same_as_an_lf_checkout`, `test_the_canonicalisation_matches_the_regeneration_tool` |
+
+This is the substitute for `tools/mutation_check.py`, which still has no verified run
+here — see above. It is weaker evidence than the battery would be: it reverts one whole
+fix at a time rather than one line at a time, and it was run by the same agent that made
+the fixes.
+
+**It is now a tool, not a claim.** `python tools/sensitivity_check.py` copies the current
+implementation (uncommitted work included) into the ignored `.mutation-scratch/`, runs the
+unmutated copy first and refuses to score anything if that is not green, then applies one
+named revert at a time, requires the tests that claim to cover it to fail **by name**, and
+restores the file — verifying that the restore landed. It exits non-zero on any single
+`SURVIVED`, `STALE` (an anchor that no longer matches, which is how a battery starts
+lying) or `BROKEN` entry. Its last run here reported `KILLED=9 of 9 mutations`, naming the
+nine finding labels and the failing test ids; the development tree was unchanged afterwards
+(`git status` identical, suite green). It also earned its place during this work: the
+`error_code` change renamed a test, and the tool's first run after that reported the mutation
+as `SURVIVED` with the stale expected name — which is exactly the "a battery that silently
+skips is a battery that lies" failure it exists to prevent, caught in practice rather than
+described.
+
+### Targeted security follow-up: the connector redaction was a blocklist
+
+The fifth cycle's finding 1 was closed by redacting connector exception text with the
+credential patterns. A targeted follow-up then observed what the report itself admitted:
+*"a credential shape nobody enumerated still reaches `ToolResult.message`"* — which
+contradicts the requirement it was meant to satisfy. Redaction **cannot** close that: any
+pattern list leaks the first shape it does not know.
+
+The correction moves the boundary rather than widening the list. Connector exception text
+is no longer persisted at all:
+
+| | Before (fifth cycle) | At that fix | Now (round 4) |
+| --- | --- | --- | --- |
+| Where the message comes from | `redact_message(<connector's text>)` | `tools.connector_error_message(<typed code>)` — a **closed** lookup | unchanged |
+| An unenumerated credential shape | persisted unless a pattern happened to match | cannot be persisted: the row never held the text | unchanged |
+| A message with no restricted shape | persisted verbatim | replaced by the fixed sentence for its code | unchanged |
+| An unknown connector-declared code | persisted with its own prose | generic `connector_error` sentence; **the code itself was still stored verbatim** | replaced by `connector_error`; the declared code goes to `DEBUG` — see `DECLARED_ERROR_CODES` below |
+| Diagnostics for an operator | in the row | `logger.debug` on `app.agent.tools` (`DEBUG`, so a default process emits nothing) | unchanged |
+| Harness-authored refusals (validation, scope, budget) | persisted verbatim | **unchanged** — persisted verbatim, which is what the model corrects itself from | unchanged |
+| Typed `error_code` | preserved | preserved | **validated** against the declared envelope |
+
+The middle column is what the message fix did on its own; the last column is the current state.
+The `error_code` row is the reason the last column exists at all: making the message generic
+left the *code* — also connector-declared — persisted verbatim, any length, unredacted, and the
+third route below is where that was found and closed.
+
+Verified by `test_i1_*` (17 test functions, 24 cases) against the **constructed and
+persisted** rows, not against the redaction helper: a known DSN, a known `Authorization`
+header, and an *unfamiliar* sentinel (`X-Acme-Session=Zx9Qv2Lm7Rt4Wp1Kd8Nh5Bs3Gy6Jc0Fa`)
+that `redact_message` provably returns unchanged — the test asserts that non-match
+explicitly, so it cannot silently stop proving the fail-safe case. The sensitivity tool
+reverts the new boundary (`persisted_message = redact_message(details)`, the fifth-cycle
+design) and **six** tests fail, including the unfamiliar-shape case.
+
+**A third route was found by a follow-up question, and is closed too.** The message had been
+made generic while `error_code` — also connector-declared, `error_code: str | None` with no
+pattern or enum, on a model that is *not* the frozen contract — was still persisted
+verbatim: any text, any length, unredacted, and it is the field the model acts on. Probed and
+confirmed before the fix (`X-Acme-Session-Zx9Qv2…` as the code, persisted; a 5000-character
+code, persisted). `prompts.py` had been projecting `error_code` through `redact_value`
+*because* the model treated it as source-derived, so the row was trusting a value the prompt
+boundary did not. It is now validated against `tools.DECLARED_ERROR_CODES` — the eight-code
+envelope of `plans/LANGGRAPH_HARNESS_PLAN.md` §8.4 plus this module's own storage, dispatch
+and connector-transport codes — and an undeclared code becomes `connector_error` with the
+declared string on the `DEBUG` channel. The frozen contract is untouched: `ToolResultRef`
+carries no code, and the field stays `str`; the set constrains what the harness *writes*.
+Pinned by `test_i1_an_unknown_connector_code_is_replaced_not_persisted`,
+`test_i1_a_very_long_connector_code_cannot_be_persisted` and
+`test_i1_every_code_the_harness_itself_emits_is_declared` (the control, which caught the
+closed set and the message table drifting apart while it was being written).
+
+**The control test's own limit, measured rather than assumed.** That control scans
+`tools.py`'s `_error(...)` call sites with an AST. An independent review defeated it three
+ways, each by exploiting a *spelling* trust rather than a provenance check: a new local
+`code = "some_new_failure"` passed at a real call site, a module-local `_Codes.code`
+attribute, and a call through an alias of `self._error`. In all three the control stayed
+green while the undeclared code reached `_error` — and in all three the **runtime gate still
+replaced it before persistence**, so the guarantee this round added is untouched and none was
+blocking. What the bypasses defeat is the drift tripwire, not the boundary, and the test
+docstring now says exactly that instead of claiming a provenance check the code does not
+perform. Closing them properly means resolving `Name('code')` by its assignment inside the
+enclosing function, exempting `Attribute` only when its value side is a bare `Name`, and
+resolving aliased calls — recorded here as known follow-up rather than done, because the
+tripwire's remaining value did not justify the machinery in the same change.
+
+**An independent review of that fix found a second route, now closed as well.** `extra="forbid"`
+makes a connector's invented key the *location* of a `ValidationError`, and `_brief` rendered
+that location — so a connector-chosen field name reached a persisted row through the one
+message the new boundary does not cover, contradicting the claim that a validation report
+never renders a connector-supplied value. It was demonstrated, not theoretical:
+`describe_resource result does not match its contract: X-Acme-Session-Zx9Qv2…: Extra inputs
+are not permitted`, persisted. The correction is the same shape as the boundary — whitelist
+rather than sanitise: a location part is rendered only when the result (or argument) model
+declares it, or when it is an integer list index; anything else becomes `<undeclared-field>`.
+Pydantic's own `msg` still names the category of problem, so the model loses nothing it can
+act on. Pinned by
+`test_i1_a_connector_chosen_field_name_cannot_reach_the_persisted_result` and, for the
+pre-existing strictness test, `test_an_undeclared_connector_field_is_rejected_not_absorbed`
+— whose assertion was **changed** from "the offending field is named" to "the connector's
+name is not persisted, the marker and pydantic's message are". That assertion was the bug:
+it required the leak.
 
 ### Defects fixed
 
@@ -201,6 +317,37 @@ provider's documentation, not by an accepted response.
    the provider documents effort as a request control whose home has moved between top
    level and `output_config`. Sending it is a behaviour change that cannot be validated
    here, so it stays unsent and this line stays on the list.
+7. **The fallback graph runtime, in this cycle.** The suite was run with `langgraph`
+   installed, so `graph_runtime()` reported `langgraph`; the
+   `GENLEDGE_GRAPH_RUNTIME=local-fallback` pass was not repeated after the fifth-cycle
+   changes. Both engines share the same node functions and the same `guarded` wrapper, and
+   nothing in this cycle touches the runtime seam (`app/agent/graphs.py` and
+   `app/agent/graph.py` are unmodified), but that is an argument, not an observation.
+8. **The tool-call deadline's residual thread.** `run_with_deadline` bounds the *caller*
+   by waiting on a daemon worker. A connector that never returns leaves that worker alive;
+   Python cannot preempt a thread. The run proceeds on a typed `connector_timeout` and the
+   budget bounds how often that can happen, but the thread is a real, documented cost.
+9. **The model-node deadline is not preemption.** A synchronous SDK call cannot be
+   interrupted in-process, so `model_node_timeout_seconds` is enforced as a deadline on
+   what the node will *accept*: an over-budget answer is recorded, refused and reported as
+   `model_unavailable`. The hard per-attempt bound is the provider client's own request
+   timeout (`GENLEDGE_LLM_TIMEOUT_SECONDS`, 300 s by default, derived to a 960 s attempt
+   bound per `plans/LANGGRAPH_HARNESS_PLAN.md` §6.5). Do not read the node budget as a
+   guarantee that a hung provider call is abandoned.
+10. **Message redaction is a scalar rule, not a parser — and it is no longer the
+    guarantee for connector text.** `redact_message` remains a blocklist, and a credential
+    shape nobody has enumerated (an opaque session cookie, a bespoke header) would still
+    pass through it. That is now acceptable **only** because no connector exception text is
+    persisted at all: `_error` builds the row's message from the typed code through the
+    closed lookup `tools.connector_error_message()`, and the exception's own text goes to
+    `logger.debug` on `app.agent.tools`. This item previously read as a residual gap in the
+    connector guarantee; the targeted security follow-up below closed it. What remains a
+    documented limit is narrower: the `storage_failed` path still persists harness-authored
+    prose *around* a control-store exception, and that path relies on the blocklist — a
+    control-store driver that quotes an unenumerated credential shape in the message the
+    harness frames would reach the row. It is not the connector path, it is defence in
+    depth rather than a guarantee, and it is pinned by
+    `test_i1_an_unfamiliar_credential_from_the_store_is_also_kept_out`.
 
 ## One deliberate friction point, recorded
 

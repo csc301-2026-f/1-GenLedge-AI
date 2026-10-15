@@ -68,6 +68,35 @@ PROVIDER_CREDENTIAL_ENV_VARS = (
 #: Every variable the mode resolver looks at, for diagnostics and error messages.
 PROVIDER_ENV_VARS = PROVIDER_CREDENTIAL_ENV_VARS + PROVIDER_NAME_ENV_VARS
 
+#: The providers this module can actually construct a client for. One entry, because
+#: one adapter exists: `LiveModel` speaks the Anthropic Messages API (and any
+#: gateway that fronts it via `GENLEDGE_LLM_BASE_URL`). `_build_client` imports
+#: `anthropic` unconditionally, so a provider name this tuple does not contain used
+#: to be accepted and then routed through the Anthropic SDK anyway — the banner said
+#: `provider=openai` while the Anthropic client made the call. A provider that is not
+#: here is refused at resolution time with the typed `model_configuration_error`
+#: rather than being silently mis-served. Adding a provider means adding an adapter to
+#: `build_model_client` **and** its id here, in the same change.
+SUPPORTED_LIVE_PROVIDERS: tuple[str, ...] = ("anthropic",)
+
+
+def normalise_provider(provider: str) -> str:
+    """Canonical form of a provider id, for comparison and for the banner."""
+
+    return str(provider).strip().lower()
+
+
+def unsupported_provider(provider: str) -> str | None:
+    """The rejection message for a provider id, or `None` when it is supported."""
+
+    if normalise_provider(provider) in SUPPORTED_LIVE_PROVIDERS:
+        return None
+    return (
+        f"provider {str(provider).strip()!r} is not supported; this build speaks the "
+        f"Anthropic Messages API, so GENLEDGE_LLM_PROVIDER must be one of "
+        f"{', '.join(SUPPORTED_LIVE_PROVIDERS)} (or set GENLEDGE_MODEL_MODE=fake)"
+    )
+
 
 @dataclass(frozen=True)
 class ModelRequest:
@@ -420,7 +449,13 @@ def _source_id(inventory: InventoryView) -> str:
 
 
 class LiveModel:
-    """The provider SDK path. Native tools and native structured output only."""
+    """The provider SDK path. Native tools and native structured output only.
+
+    Constructing one asserts the provider is a provider this adapter speaks, because
+    the class *is* the Anthropic Messages API path: it is the last place that can
+    refuse without a request having been made. The typed `ModelConfigurationError`
+    matches the code the graph already maps a configuration fault to.
+    """
 
     def __init__(
         self,
@@ -434,7 +469,10 @@ class LiveModel:
         api_key: str | None = None,
         base_url: str | None = None,
     ) -> None:
-        self.name = provider
+        rejection = unsupported_provider(provider)
+        if rejection is not None:
+            raise ModelConfigurationError(rejection)
+        self.name = normalise_provider(provider)
         self.model_id = model
         self.effort = effort
         self.max_output_tokens = max_output_tokens
@@ -571,6 +609,31 @@ class ResolvedModelMode:
         return f"model_mode=live provider={self.provider} model={self.model}"
 
 
+#: How long a single provider request waits before the SDK gives up, when the
+#: deployment does not say. Level 1 of `plans/LANGGRAPH_HARNESS_PLAN.md` §6.5.
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
+
+
+def derived_model_timeout_seconds(
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    *,
+    max_retries: int = 2,
+) -> float:
+    """The hard bound on one model **call attempt**, from the plan's §6.5 derivation.
+
+    `request_timeout × (1 + retries) + margin`: the attempt can legitimately make one
+    request per retry, so a per-request timeout alone does not bound it. This is the
+    number that bounds a *synchronous* provider call, because a thread cannot be
+    preempted and the SDK's own request timeout is the only thing that can abandon a
+    socket — which is why `AgentBudgets.model_node_timeout_seconds` is enforced as a
+    node deadline (`app/agent/deadlines.py`) rather than claimed to bound the call.
+    """
+
+    from app.agent.deadlines import MODEL_CALL_MARGIN_SECONDS  # noqa: PLC0415 - avoids a cycle
+
+    return request_timeout_seconds * (1 + max(0, max_retries)) + MODEL_CALL_MARGIN_SECONDS
+
+
 def provider_configured(env: Mapping[str, str] | None = None) -> bool:
     """True when there is something to call the provider *with*. Presence only.
 
@@ -597,14 +660,28 @@ def resolve_model_mode(
       configuration error;
     * `auto` (the default) uses the live path only when provider configuration
       exists.
+
+    A **named** provider is validated here, whatever the mode: naming one is a
+    statement about which SDK is expected, and a resolution that prints
+    `provider=openai` while `LiveModel` imports `anthropic` is a claim the code cannot
+    honour. The provider implied by the environment is validated by
+    `build_model_client`, which is the only path that constructs a live adapter — so
+    `fake` mode keeps running with any unrelated provider string in the environment,
+    because no provider is ever contacted.
     """
 
     source = os.environ if env is None else env
     raw = (requested if requested is not None else source.get("GENLEDGE_MODEL_MODE", "auto")) or "auto"
     mode = raw.strip().lower()
-    resolved_provider = provider or source.get("GENLEDGE_LLM_PROVIDER", "anthropic")
+    resolved_provider = provider if provider is not None else source.get("GENLEDGE_LLM_PROVIDER", "anthropic")
     resolved_model = model or source.get("GENLEDGE_LLM_MODEL", "claude-opus-5-5")
     configured = provider_configured(source)
+
+    if provider is not None:
+        rejection = unsupported_provider(provider)
+        if rejection is not None:
+            raise ModelConfigurationError(rejection)
+    resolved_provider = normalise_provider(resolved_provider)
 
     if mode == "fake":
         return ResolvedModelMode("fake", mode, resolved_provider, resolved_model, "explicit fake mode")
@@ -614,9 +691,17 @@ def resolve_model_mode(
                 "GENLEDGE_MODEL_MODE=live requires provider configuration "
                 f"({', '.join(PROVIDER_ENV_VARS)}); none was present"
             )
+        rejection = unsupported_provider(resolved_provider)
+        if rejection is not None:
+            # The banner is printed from this object, so refusing here is what keeps a
+            # `provider=openai` line off a process that will call the Anthropic SDK.
+            raise ModelConfigurationError(rejection)
         return ResolvedModelMode("live", mode, resolved_provider, resolved_model, "explicit live mode")
     if mode == "auto":
         if configured:
+            rejection = unsupported_provider(resolved_provider)
+            if rejection is not None:
+                raise ModelConfigurationError(rejection)
             return ResolvedModelMode("live", mode, resolved_provider, resolved_model, "provider configuration present")
         return ResolvedModelMode("fake", mode, resolved_provider, resolved_model, "no provider configuration present")
     raise ModelConfigurationError(
@@ -631,27 +716,59 @@ def build_model_client(
     catalogue: CatalogueView | None = None,
     env: Mapping[str, str] | None = None,
 ) -> ModelClient:
-    """Instantiate the adapter the resolved mode names."""
+    """Instantiate the adapter the resolved mode names.
+
+    The live branch refuses a provider it has no adapter for. This is the boundary
+    that decides *which SDK is called*, so it is where the check has to hold: without
+    it, `GENLEDGE_LLM_PROVIDER=openai` with an `ANTHROPIC_API_KEY` in the environment
+    built a live Anthropic client, announced `provider=openai` on the startup banner,
+    and billed the run to a provider it never contacted.
+    """
 
     if resolved.mode == "fake":
         return FakeModel(inventory=inventory, catalogue=catalogue)
+    rejection = unsupported_provider(resolved.provider)
+    if rejection is not None:
+        raise ModelConfigurationError(rejection)
     source = os.environ if env is None else env
-    api_key: str | None = None
-    for name in PROVIDER_CREDENTIAL_ENV_VARS:
-        value = str(source.get(name, "")).strip()
-        if value and (name.endswith("_API_KEY")):
-            api_key = value
-            break
+    api_key = _provider_api_key(resolved.provider, source)
+    max_retries = int(source.get("GENLEDGE_LLM_MAX_RETRIES", "2"))
+    # Level 1 and level 2 of the plan's timeout hierarchy, from one pair of settings:
+    # `GENLEDGE_LLM_TIMEOUT_SECONDS` is the per-request bound the SDK is given, and
+    # `derived_model_timeout_seconds` states the attempt bound those retries imply
+    # (300 × (1 + 2) + 60 = 960 s) so the model-node budget on `AgentBudgets` and the
+    # transport settings are visibly the same arithmetic rather than two unrelated
+    # numbers.
+    request_timeout = float(source.get("GENLEDGE_LLM_TIMEOUT_SECONDS", str(DEFAULT_REQUEST_TIMEOUT_SECONDS)))
     return LiveModel(
         provider=resolved.provider,
         model=resolved.model,
         effort=source.get("GENLEDGE_LLM_EFFORT", "medium"),
         max_output_tokens=int(source.get("GENLEDGE_LLM_MAX_OUTPUT_TOKENS", "16000")),
-        timeout_seconds=float(source.get("GENLEDGE_LLM_TIMEOUT_SECONDS", "300")),
-        max_retries=int(source.get("GENLEDGE_LLM_MAX_RETRIES", "2")),
+        timeout_seconds=request_timeout,
+        max_retries=max_retries,
         api_key=api_key,
         base_url=_base_url(source),
     )
+
+
+def _provider_api_key(provider: str, env: Mapping[str, str]) -> str | None:
+    """The key that belongs to the resolved provider, or the vendor-neutral one.
+
+    The order matters, and it is why this is not the old "first `*_API_KEY` in the
+    tuple" loop. That loop returned whichever key came first in
+    `PROVIDER_CREDENTIAL_ENV_VARS`, so a machine holding both an Anthropic and an
+    OpenAI key sent the OpenAI secret to the Anthropic SDK. A provider-specific
+    variable (`ANTHROPIC_API_KEY`) wins over the deployment-wide
+    `GENLEDGE_LLM_API_KEY`, which is provider-agnostic by name and therefore safe to
+    use for whichever provider is configured.
+    """
+
+    for name in (f"{normalise_provider(provider).upper()}_API_KEY", "GENLEDGE_LLM_API_KEY"):
+        value = str(env.get(name, "")).strip()
+        if value:
+            return value
+    return None
 
 
 def _base_url(env: Mapping[str, str]) -> str | None:
@@ -665,11 +782,13 @@ def _base_url(env: Mapping[str, str]) -> str | None:
 
 
 __all__ = [
+    "DEFAULT_REQUEST_TIMEOUT_SECONDS",
     "FAKE_MODEL_ID",
     "FAKE_PROVIDER",
     "FAKE_TARGET_RESOURCE",
     "FAKE_TOOL_CALL_ID",
     "PROVIDER_ENV_VARS",
+    "SUPPORTED_LIVE_PROVIDERS",
     "FakeModel",
     "LiveModel",
     "ModelClient",
@@ -679,7 +798,10 @@ __all__ = [
     "ResolvedModelMode",
     "build_fake_draft",
     "build_model_client",
+    "derived_model_timeout_seconds",
+    "normalise_provider",
     "parse_model_draft",
     "provider_configured",
     "resolve_model_mode",
+    "unsupported_provider",
 ]

@@ -7,9 +7,33 @@ what `tool_call` must do per requested call:
 2. check the job's scope covers the requested source and resource;
 3. check the budget **before** dispatch;
 4. replay a recorded result when this `(job_id, tool_call_id)` already ran;
-5. dispatch through the connector seam;
+5. dispatch through the connector seam under `tool_node_timeout_seconds`, so a hung
+   connector fails its own call rather than the node;
 6. validate the connector's answer against the tool's result model;
-7. redact, persist, and return a compact `ToolResultRef`.
+7. keep foreign diagnostics out, persist the typed result, and return a compact
+   `ToolResultRef`.
+
+Step 7 is a **fail-safe boundary, not a filter**. No text a connector authored *about a
+failure* is persisted: the record's `message` comes from one of this module's fixed
+sentences (`CONNECTOR_ERROR_MESSAGES`) and its `error_code` from `DECLARED_ERROR_CODES`,
+both chosen by the typed code, and the connector's own text goes to a `DEBUG` log instead.
+Redaction patterns (`redact_message`) are still applied as defence in depth, but nothing
+about the guarantee depends on that list being complete — a credential shape nobody
+enumerated cannot reach a persisted row, because the row never held that text in the first
+place. A message the *harness* authors (argument validation, scope, budgets) is different:
+it is our own string, it is the data the model has to adapt to, and it is persisted as
+written.
+
+"About a failure" is doing real work in that sentence. A **successful** read's `payload`
+is connector-authored *data* and is persisted by design — that is what a tool result is —
+so the boundary protects the diagnostic fields, not the data plane. The data plane's
+control is the declared result models plus `redact_value` over every value, and the prompt
+projection re-redacts what it reads.
+
+`error_code` needed the same treatment as `message` and for a while did not have it: the
+message was made generic while the *code* — also connector-declared — was still persisted
+verbatim, any length, unredacted. It is the field the model acts on, which is exactly why it
+must be a value from a closed set rather than whatever a connector chose to call its failure.
 
 A failure at any step is *data*: the model receives a typed `error` result it must
 adapt to. Nothing in this module raises for a model-authored problem, because a
@@ -20,12 +44,20 @@ about.
 from __future__ import annotations
 
 import json
+import logging
 import re
-from typing import Annotated, Any, Protocol
+from typing import Annotated, Any, Collection, Protocol
 
 from pydantic import Field, StringConstraints, ValidationError
 
 from app.agent.contracts import AgentBudgets, InventoryView, StrictModel, ToolCallRequest, ToolResultRef
+from app.agent.deadlines import (
+    DeadlineExceeded,
+    run_with_deadline,
+    tool_call_timeout_seconds,
+)
+
+logger = logging.getLogger(__name__)
 
 TOOL_NAMES: tuple[str, ...] = (
     "list_resources",
@@ -46,15 +78,109 @@ UNSUPPORTED = "unsupported"
 BUDGET_EXHAUSTED = "budget_exhausted"
 SNAPSHOT_DRIFTED = "snapshot_drifted"
 CONNECTOR_ERROR = "connector_error"
+#: The typed code for a connector that did not answer inside
+#: `AgentBudgets.tool_node_timeout_seconds`. Named by
+#: `plans/LANGGRAPH_HARNESS_PLAN.md` §8.4's result envelope and §6.5's per-tool-call
+#: row; this is the harness raising it rather than a connector reporting it.
+CONNECTOR_TIMEOUT = "connector_timeout"
 REPLAY_MISMATCH = "replay_mismatch"
 STORAGE_FAILED = "storage_failed"
 
 REDACTION_MARKER = "[redacted]"
+
+#: The message a persisted `ToolResult` carries when a **connector** failed — one fixed
+#: string per code the harness can raise or a connector can declare.
+#:
+#: This mapping is the guarantee, and it is deliberately a closed set rather than a
+#: sanitiser. A connector's exception text is written by other people's code: a driver
+#: quotes the DSN it could not reach, an HTTP client quotes the header it sent, a
+#: bespoke adapter quotes whatever its vendor returns. Enumerating the *shapes* of those
+#: strings is a blocklist, and a blocklist leaks the first credential shape nobody
+#: thought of — a session cookie, a vendor-specific header, an opaque token with no
+#: recognisable prefix. Persisting a message from this table instead means the row
+#: cannot contain foreign text at all, so completeness is not required for safety.
+#:
+#: Every key here is a code in `DECLARED_ERROR_CODES`, and that is load-bearing rather
+#: than decorative: an undeclared code is replaced by `connector_error` before the row is
+#: built (see `_error`), so a table entry outside the declared set could never be reached.
+#: The pair is asserted together by `test_i1_every_code_the_harness_itself_emits_is_declared`.
+CONNECTOR_ERROR_MESSAGES: dict[str, str] = {
+    CONNECTOR_ERROR: "the source could not complete the read (connector_error)",
+    CONNECTOR_TIMEOUT: (
+        "the source did not answer within tool_node_timeout_seconds (connector_timeout)"
+    ),
+    "connector_unavailable": "the source is unavailable (connector_unavailable)",
+    "connector_refused": "the source refused the read (connector_refused)",
+    SNAPSHOT_DRIFTED: "the source changed since the snapshot (snapshot_drifted)",
+}
+
+#: The one connector-timeout message, named so the harness's own deadline and a
+#: connector's `connector_timeout` report the same safe sentence.
+CONNECTOR_TIMEOUT_MESSAGE = CONNECTOR_ERROR_MESSAGES[CONNECTOR_TIMEOUT]
+
+#: Every code a persisted `ToolResult` may carry, as one closed set.
+#:
+#: This is the envelope of `plans/LANGGRAPH_HARNESS_PLAN.md` §8.4 — "result envelopes are
+#: **typed data**, not exceptions: `unsupported`, `unauthorized_source`,
+#: `resource_not_found`, `invalid_arguments`, `budget_exhausted`, `snapshot_drifted`,
+#: `connector_timeout`, `connector_error`" — plus this module's own codes, which are ours
+#: all the same: `invalid_tool_request`, `replay_mismatch` and `storage_failed` for the
+#: dispatch contract's own refusals, and the two connector-transport codes
+#: (`connector_unavailable`, `connector_refused`) that `CONNECTOR_ERROR_MESSAGES` names.
+#: Those last two are **declared here rather than left to a connector to invent**: the
+#: sentence above is the vocabulary, and a set that did not contain the codes the message
+#: table knows would be inconsistent with itself. `test_i1_every_code_the_harness_itself_
+#: emits_is_declared` asserts the two stay in step.
+#:
+#: `error_code` is the field the model reads to decide what to do next, so it is the one
+#: foreign string the message boundary could not reach: `ConnectorError.code` is *declared*
+#: by a connector, and the row used to hold it verbatim — any text, any length, unredacted,
+#: while `prompts.py` projected `error_code` through `redact_value` precisely because the
+#: model considered it source-derived. A code outside this set is replaced by
+#: `connector_error` and the declared one goes to the restricted `DEBUG` channel, which is
+#: the same rule the message follows: the row keeps a value from a closed set, and the
+#: foreign text is available to whoever deliberately turns diagnostics on.
+#:
+#: Nothing in the frozen contract changes: `ToolResultRef` carries no code, and
+#: `ToolResult.error_code` stays `str` — this set constrains *what the harness will write
+#: into it*, not the type of the field.
+DECLARED_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        INVALID_ARGUMENTS,
+        INVALID_TOOL_REQUEST,
+        UNAUTHORIZED_SOURCE,
+        RESOURCE_NOT_FOUND,
+        UNSUPPORTED,
+        BUDGET_EXHAUSTED,
+        SNAPSHOT_DRIFTED,
+        CONNECTOR_ERROR,
+        CONNECTOR_TIMEOUT,
+        REPLAY_MISMATCH,
+        STORAGE_FAILED,
+        # The two connector-transport codes the message table names. Declared here so the
+        # vocabulary is one set rather than two that can drift apart.
+        "connector_unavailable",
+        "connector_refused",
+    }
+)
+
 #: Credential *words*, and any connection string. The scheme list is open-ended on
 #: purpose: `scheme://user:pass@host` is a DSN whoever makes it, and enumerating
 #: vendors meant `mysql://` and `mongodb+srv://` reached prompts unredacted.
+#:
+#: `authorization` and `bearer` are here because an HTTP client's exception text quotes
+#: the request header it sent (`Authorization: Bearer …`), which is credential material
+#: with no credential word in it and no DSN shape. `_SENSITIVE_FIELD` already treats both
+#: as restricted names.
+#:
+#: **These patterns are a blocklist and are treated as one.** Connector exception text
+#: is no longer persisted at all (`CONNECTOR_ERROR_MESSAGES`), so nothing here has to be
+#: complete for the connector-failure guarantee to hold; what they still cover is the
+#: harness's own message text on the `storage_failed` path, which quotes a control-store
+#: fault.
 _CREDENTIAL = re.compile(
-    r"(password|passwd|secret|token|api[_-]?key|credential|dsn)"
+    r"(password|passwd|secret|token|api[_-]?key|credential|dsn|authorization)"
+    r"|\bbearer\b"
     r"|([a-z][a-z0-9+.\-]{1,20}://[^\s]*:[^\s]*@)"
     r"|((?:mongodb(?:\+srv)?|redis|amqp|jdbc):[^\s]*@)",
     re.I,
@@ -212,6 +338,40 @@ def redact_payload(payload: dict[str, Any]) -> dict[str, Any]:
             REDACTION_MARKER if _restricted_name(name) else redact_value(value, name)
         )
     return redacted
+
+
+def connector_error_message(code: str) -> str:
+    """The safe, fixed message a persisted connector failure carries.
+
+    The lookup is closed: an unknown code (a connector declares its own, so the code is
+    foreign text too) gets the generic `connector_error` sentence, never its own text.
+    The code itself is not lost — it is recorded in the typed `error_code` field, which
+    is what the model adapts to.
+    """
+
+    return CONNECTOR_ERROR_MESSAGES.get(code, CONNECTOR_ERROR_MESSAGES[CONNECTOR_ERROR])
+
+
+def redact_message(message: str) -> str:
+    """Defence in depth over a diagnostic string before it is persisted.
+
+    **This is no longer the guarantee for connector text, and must not be treated as
+    one.** Connector exception text never reaches a persisted record at all — see
+    `CONNECTOR_ERROR_MESSAGES` and `_error(details=...)` — so a credential shape these
+    patterns miss has nothing to leak from. What this covers is the harness's *own*
+    message text on the paths that still embed foreign exception text, which today means
+    the `storage_failed` result quoting a control-store fault: a driver that fails to
+    open a connection quotes the string it could not open, and that string is redacted
+    here.
+
+    The patterns are a blocklist and are documented as one: they catch a DSN, a
+    credential word, an `Authorization` header, a card-like run. Anything outside the
+    list passes through unchanged, which is acceptable precisely because no arbitrary
+    foreign text is persisted through this function — either the text is the harness's
+    own (safe by construction) or the caller routes it to `details=` instead.
+    """
+
+    return str(redact_value(message, "message"))
 
 
 def merge_path(resource_id: str, field_path: str) -> str:
@@ -621,6 +781,27 @@ class ToolDispatcher:
         return paths
 
     # -- dispatch --------------------------------------------------------------
+    def _call_connector(self, name: str, arguments: dict[str, Any], job_id: str) -> dict[str, Any]:
+        """Call the connector under `tool_node_timeout_seconds`.
+
+        The deadline belongs to **one tool call**, which is the granularity
+        `plans/LANGGRAPH_HARNESS_PLAN.md` §6.5 gives it, so it is enforced here rather
+        than around the whole batch: a slow first call must not eat the second call's
+        budget, and the batch node stays free to record a typed timeout for the call
+        that hung and dispatch the rest.
+
+        The connector is not asked to cooperate — `ToolConnector.call` is a frozen
+        protocol shared with Person A's real services, and adding a `timeout` parameter
+        to it would be a contract change for a guarantee the harness can keep on its
+        own side of the seam.
+        """
+
+        return run_with_deadline(
+            lambda: self.connector.call(name, arguments, job_id),
+            timeout_seconds=tool_call_timeout_seconds(self.budgets),
+            label=name,
+        )
+
     def dispatch(
         self,
         request: ToolCallRequest,
@@ -652,11 +833,16 @@ class ToolDispatcher:
         try:
             arguments = spec.arguments.model_validate(request.arguments)
         except ValidationError as error:
+            # The location is whitelisted against the *argument* model's own fields, so a
+            # name the model invented under `extra="forbid"` is not echoed back — while a
+            # declared field it omitted (`resource_id: Field required`) is still named,
+            # which is what it needs to correct itself.
             return self._error(
                 request,
                 job_id,
                 INVALID_ARGUMENTS,
-                f"arguments do not match {request.name}: {_brief(error)}",
+                f"arguments do not match {request.name}: "
+                f"{_brief(error, spec.arguments.model_fields)}",
                 persist=False,
             )
 
@@ -702,31 +888,72 @@ class ToolDispatcher:
 
         payload = arguments.model_dump()
         try:
-            raw = self.connector.call(request.name, payload, job_id)
+            raw = self._call_connector(request.name, payload, job_id)
         except ConnectorError as error:
-            return self._error(request, job_id, error.code, error.message, arguments=payload, charge=True)
-        except Exception as error:  # noqa: BLE001 - a connector fault is data, not a crash
+            # `error.message` is the connector's own text, so it is a *restricted
+            # diagnostic*: logged at DEBUG, never persisted. The declared code is kept.
             return self._error(
-                request, job_id, CONNECTOR_ERROR, str(error), arguments=payload, charge=True
+                request, job_id, error.code, details=error.message, arguments=payload, charge=True
+            )
+        except DeadlineExceeded as error:
+            # `tool_node_timeout_seconds` is the per-call bound of
+            # `plans/LANGGRAPH_HARNESS_PLAN.md` §6.5: a hung connector fails its call,
+            # not the node. The run keeps its typed evidence and moves on. This message
+            # is the harness's own sentence, so it is persisted rather than genericised.
+            return self._error(
+                request,
+                job_id,
+                CONNECTOR_TIMEOUT,
+                CONNECTOR_TIMEOUT_MESSAGE,
+                details=str(error),
+                arguments=payload,
+                charge=True,
+            )
+        except Exception as error:  # noqa: BLE001 - a connector fault is data, not a crash
+            # An undeclared exception is foreign text with no declared code at all, so
+            # only its type name reaches the DEBUG channel — never `str(error)`, which
+            # is the string most likely to quote a credential.
+            return self._error(
+                request,
+                job_id,
+                CONNECTOR_ERROR,
+                details=f"{type(error).__name__}",
+                arguments=payload,
+                charge=True,
             )
 
         # Boundary 4: validate the connector's answer *inside* the guarded block, so
         # a shape the harness did not declare is data rather than an exception.
         try:
             if not isinstance(raw, dict):
-                raise ConnectorError(CONNECTOR_ERROR, f"connector returned {type(raw).__name__}, not an object")
+                # Harness-authored text: the *type* of what came back is our own
+                # vocabulary, and naming it is what tells the model to change shape.
+                raise ConnectorError(
+                    CONNECTOR_ERROR,
+                    f"{connector_error_message(CONNECTOR_ERROR)}; the connector returned "
+                    f"{type(raw).__name__} rather than an object",
+                )
             validated = spec.result.model_validate(raw)
         except ValidationError as error:
+            # Harness-authored: `_brief` renders the location only when it is one of the
+            # declared result-model fields (integers pass as list indices), so a
+            # connector's own key name cannot ride in on a validation report. Pydantic's
+            # `msg` is its own text and is kept verbatim.
             return self._error(
                 request,
                 job_id,
                 CONNECTOR_ERROR,
-                f"{request.name} result does not match its contract: {_brief(error)}",
+                f"{request.name} result does not match its contract: "
+                f"{_brief(error, spec.result.model_fields)}",
                 arguments=payload,
                 charge=True,
             )
         except ConnectorError as error:
-            return self._error(request, job_id, error.code, error.message, arguments=payload, charge=True)
+            # Raised by this module (above) or by the connector. Classifying on
+            # `isinstance` rather than reaching into `error.message` by hand.
+            return self._error(
+                request, job_id, error.code, details=error.message, arguments=payload, charge=True
+            )
 
         redacted = {key: redact_value(value, key) for key, value in validated.model_dump().items()}
         size = payload_bytes(redacted)
@@ -865,8 +1092,9 @@ class ToolDispatcher:
         request: ToolCallRequest,
         job_id: str,
         code: str,
-        message: str,
+        message: str | None = None,
         *,
+        details: str | None = None,
         arguments: dict[str, Any] | None = None,
         persist: bool = True,
         charge: bool = False,
@@ -886,7 +1114,46 @@ class ToolDispatcher:
         same `tool_call_id` replay the old refusal forever. A refusal made *after* a
         connector call is evidence and is persisted, so a retry replays it instead of
         re-reading a source that may have changed.
+
+        **Two kinds of failure reach here, and only one of them may carry text.**
+
+        * `message=` is for a string *the harness wrote*: argument validation, scope,
+          the budget, a result that does not match its declared model. It is our own
+          text, it is the evidence the model adapts to, and it is persisted as written.
+        * `details=` is for text written by *foreign* code — a connector's exception, a
+          driver's error. It is **never persisted**: the row gets
+          `connector_error_message(code)` instead, and the text goes to `logger.debug`
+          (`src/backend/app/agent/tools.py`'s restricted diagnostic channel — see
+          `_log_restricted`). A credential shape nobody enumerated therefore has
+          nothing to leak from, which a redaction blocklist alone could not promise.
+
+        The typed `code` is persisted verbatim **when it is one of ours** — the harness's
+        declared envelope (`DECLARED_ERROR_CODES`) or a connector code the table knows. A
+        code outside that set is connector-declared text with no declared meaning, so it is
+        replaced by `connector_error` and the original is logged on the restricted channel:
+        the model gets a classification it can act on, and the row holds no arbitrary
+        string. See `DECLARED_ERROR_CODES`.
         """
+
+        if details is not None:
+            _log_restricted(request, job_id, code, details)
+            persisted_message = connector_error_message(code)
+        else:
+            # Defence in depth for the harness's own text: the `storage_failed` message
+            # quotes a control-store exception. This is a blocklist and is documented as
+            # one; no arbitrary foreign text travels this route.
+            persisted_message = redact_message(message or connector_error_message(code))
+
+        if code not in DECLARED_ERROR_CODES:
+            # `ConnectorError.code` is connector-declared, so it is foreign text like the
+            # message — and it is the one the boundary above does not cover, because the
+            # value is the classification the model acts on. An undeclared code is
+            # replaced by the generic one and the declared string goes to the restricted
+            # channel, so the row holds a value from `DECLARED_ERROR_CODES` and nothing
+            # else. The message was already chosen from the declared code above, so it
+            # stays the safe fallback sentence.
+            _log_restricted(request, job_id, code, "undeclared error_code, not persisted")
+            code = CONNECTOR_ERROR
 
         result = ToolResult(
             result_ref=f"tool:{job_id}:{request.id}",
@@ -899,7 +1166,7 @@ class ToolDispatcher:
             status="error",
             payload={},
             error_code=code,
-            message=message,
+            message=persisted_message,
         )
         if persist:
             try:
@@ -915,7 +1182,11 @@ class ToolDispatcher:
                         status="error",
                         payload={},
                         error_code=STORAGE_FAILED,
-                        message=(
+                        # The store's own exception travels the same route as a
+                        # connector's *diagnostic*, and gets the blocklist rather than a
+                        # generic sentence: this message is the harness's own framing
+                        # around it, and the framing is what the operator needs.
+                        message=redact_message(
                             f"the {code!r} result could not be persisted: "
                             f"{type(error).__name__}: {error}"
                         ),
@@ -926,15 +1197,87 @@ class ToolDispatcher:
         return ToolOutcome(result=result, replayed=False, charged=charge)
 
 
-def _brief(error: ValidationError) -> str:
+#: What an undeclared field name becomes in a persisted validation report. The
+#: *information* survives — the model learns a field is not permitted — while the name
+#: itself, which the connector authored, does not.
+UNDECLARED_FIELD_MARKER = "<undeclared-field>"
+
+
+def _brief(error: ValidationError, declared_fields: Collection[str] = ()) -> str:
+    """A one-line validation report that never quotes a connector-authored name.
+
+    `_brief` renders a `ValidationError`'s location, and a location is **not** always
+    ours. For a missing or malformed *declared* field it is one of our own field names,
+    which is the evidence the model corrects itself from. But for an *undeclared* field
+    pydantic reports the name the connector chose, and `extra="forbid"` is exactly the
+    strictness that produces that case — so `describe_resource result does not match its
+    contract: <the connector's key>: Extra inputs are not permitted` put foreign text
+    into a persisted row through the one route the message boundary does not cover.
+
+    The rule is therefore the same shape as that boundary: **whitelist, do not sanitise.**
+    A location part is rendered only when it is a name this model declares, or an integer
+    (a list index, which no connector authors). Anything else becomes
+    `UNDECLARED_FIELD_MARKER`. Pydantic's own `msg` is kept verbatim — it is pydantic's
+    text, and for the `extra_forbidden` case it is what names the category of problem. A
+    pattern check over the location would have been the smaller edit and the wrong one:
+    it would put the blocklist back in charge of a boundary that exists because
+    blocklists are incomplete.
+
+    Three location shapes are covered, and a fourth would need this revisited:
+
+    * a declared field name (`('resource_id',)`) — rendered, because it is ours;
+    * an undeclared top-level name (`('<the connector's key>',)`) — marked;
+    * a foreign key *inside* a declared container (`('nulls', '<the payload key>')`) —
+      `nulls` is rendered and the key is marked, because a `dict[str, int]` key is payload
+      rather than a field name.
+
+    `msg` is trusted as pydantic's own text: it names a category ("Extra inputs are not
+    permitted") and does not echo input values — verified across the result models, and the
+    reason the location, not the message, was the leak.
+    """
+
     first = error.errors()[0]
-    location = ".".join(str(part) for part in first.get("loc", ())) or "<root>"
+    parts = [
+        str(part) if isinstance(part, int) or str(part) in declared_fields else UNDECLARED_FIELD_MARKER
+        for part in first.get("loc", ())
+    ]
+    location = ".".join(parts) or "<root>"
     return f"{location}: {first.get('msg', 'invalid')}"
+
+
+def _log_restricted(request: ToolCallRequest, job_id: str, code: str, details: str) -> None:
+    """Record foreign diagnostic text on the restricted channel, not in a result row.
+
+    This module's restricted-diagnostic convention, and the whole of it: the exception
+    text a connector or a driver produced goes to **`DEBUG`** and nowhere else. `DEBUG`
+    rather than `INFO` or `WARNING` because the content is exactly what the persisted
+    row is not allowed to hold — a DSN, a token, whatever the vendor's client chose to
+    quote — so it must not be produced by a default-configured process either. An
+    operator who needs it sets `logging.getLogger("app.agent.tools").setLevel(DEBUG)`
+    deliberately, and whatever consumes that stream inherits the same restriction.
+
+    Only identifiers that are already non-sensitive travel with it: the tool name, the
+    model-authored `tool_call_id` and the job id. The `error_code` is logged unredacted
+    too, because it is the field the persisted row also carries verbatim.
+    """
+
+    logger.debug(
+        "restricted connector diagnostic: tool=%s tool_call_id=%s job_id=%s code=%s details=%s",
+        request.name,
+        request.id,
+        job_id,
+        code,
+        details,
+    )
 
 
 __all__ = [
     "BUDGET_EXHAUSTED",
     "CONNECTOR_ERROR",
+    "CONNECTOR_ERROR_MESSAGES",
+    "CONNECTOR_TIMEOUT",
+    "CONNECTOR_TIMEOUT_MESSAGE",
+    "DECLARED_ERROR_CODES",
     "INVALID_ARGUMENTS",
     "INVALID_TOOL_REQUEST",
     "REDACTION_MARKER",
@@ -945,6 +1288,7 @@ __all__ = [
     "TOOL_NAMES",
     "TOOL_SPECS",
     "UNAUTHORIZED_SOURCE",
+    "UNDECLARED_FIELD_MARKER",
     "UNSUPPORTED",
     "CompareFieldsResult",
     "ConnectorError",
@@ -962,7 +1306,9 @@ __all__ = [
     "ToolResultModel",
     "ToolSpec",
     "canonical_arguments",
+    "connector_error_message",
     "payload_bytes",
+    "redact_message",
     "redact_payload",
     "redact_value",
     "tool_schemas",

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -602,6 +603,185 @@ def test_the_output_schema_is_generated_from_the_contract():
 def test_checked_in_prompt_digests_match_the_manifest():
     recorded = json.loads((PROMPTS_DIR / "manifest.json").read_text(encoding="utf-8"))
     assert recorded["sha256"] == manifest()
+
+
+# --- manifest hashing is a property of the prompt, not of the checkout ----------
+#
+# `core.autocrlf=true` — which this repository sets, and which is the default on a
+# Windows install — checks these files out with CRLF while the committed blob is LF.
+# Hashing the raw bytes therefore made a fresh clone fail the digest check above for a
+# reason that had nothing to do with the prompt. `canonical_prompt_text` normalises line
+# endings only; every one of the "meaningful change" cases below still moves the hash.
+#
+# These cases need real files, and they deliberately do not use pytest's `tmp_path`:
+# the throwaway directory is the repository's ignored `.mutation-scratch/` — the
+# scratch convention `tools/mutation_check.py` already uses — so the suite needs
+# nothing writable outside the checkout and adds nothing to `git status`. Each affected
+# test wipes and recreates its own leaf under it, so a run leaves the tree as it found
+# it, and a run that dies mid-test costs one stale leaf rather than a failure.
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+SCRATCH_ROOT = REPO_ROOT / ".mutation-scratch" / "prompt-digest"
+
+
+def _remove_tree(path: Path) -> None:
+    """Best-effort `rmtree`: a locked or denied path must not fail a test."""
+
+    import shutil
+
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        pass
+
+
+@pytest.fixture
+def scratch(request):
+    """A clean, writable directory for a test that needs one, under the repo."""
+
+    leftover = SCRATCH_ROOT / request.node.name.split("[", 1)[0]
+    _remove_tree(leftover)
+    leftover.mkdir(parents=True, exist_ok=True)
+    return leftover
+
+
+def _checkout(root: Path, newline: str, label: str) -> Path:
+    """A copy of the real prompt files, checked out with the given line ending.
+
+    The files are re-encoded on disk, so this is a genuine CRLF checkout rather than a
+    simulated one — the digest is computed from the bytes a Windows checkout holds.
+    """
+
+    target = root / label
+    target.mkdir(parents=True, exist_ok=True)
+    for path in sorted(PROMPTS_DIR.glob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        (target / path.name).write_bytes(text.replace("\n", newline).encode("utf-8"))
+    assert list(target.glob("*.md")), f"the {label} checkout is empty"
+    return target
+
+
+def _digests_of(monkeypatch, directory):
+    import app.agent.prompts as prompts_module
+
+    monkeypatch.setattr(prompts_module, "PROMPTS_DIR", directory)
+    return prompts_module.manifest()
+
+
+def test_a_crlf_checkout_hashes_the_same_as_an_lf_checkout(scratch, monkeypatch):
+    """The same commit checked out two ways is the same prompt, so it hashes the same."""
+
+    lf = _checkout(scratch, "\n", "lf")
+    crlf = _checkout(scratch, "\r\n", "crlf")
+
+    # the two checkouts really do differ on disk, or this test proves nothing
+    assert (lf / "propose.md").read_bytes() != (crlf / "propose.md").read_bytes()
+
+    assert _digests_of(monkeypatch, crlf) == _digests_of(monkeypatch, lf)
+    # and they equal the reviewed values, which is the check that used to fail
+    recorded = json.loads((PROMPTS_DIR / "manifest.json").read_text(encoding="utf-8"))
+    assert _digests_of(monkeypatch, crlf) == recorded["sha256"]
+
+
+def test_the_canonicalisation_matches_the_regeneration_tool():
+    """Two implementations of one digest must agree, or regeneration drifts.
+
+    `tools/prompt_manifest.py` writes `manifest.json` and `app.agent.prompts.manifest()`
+    reads it. A line-ending difference between the two would make every regenerated
+    manifest wrong on the other platform, so the equivalence is pinned rather than
+    assumed.
+    """
+
+    import importlib.util
+
+    import app.agent.prompts as prompts_module
+
+    tool = REPO_ROOT / "tools" / "prompt_manifest.py"
+    assert tool.is_file(), f"the regeneration tool is missing: {tool}"
+    spec = importlib.util.spec_from_file_location("_prompt_manifest_tool", tool)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    for path in sorted(PROMPTS_DIR.glob("*.md")):
+        raw = path.read_bytes()
+        assert module.canonical_prompt_text(raw) == prompts_module.canonical_prompt_text(raw)
+        assert module.canonical_prompt_text(raw) == prompts_module.canonical_prompt_text(
+            raw.replace(b"\n", b"\r\n")
+        )
+
+
+def test_a_meaningful_prompt_edit_still_changes_the_digest(scratch, monkeypatch):
+    """The integrity guarantee survives: content edits move the hash.
+
+    Four edits that a reviewer would care about, each asserted separately so a
+    normalisation that was too aggressive is caught by the one it blinded.
+    """
+
+    baseline = _digests_of(monkeypatch, _checkout(scratch, "\n", "base"))
+
+    #: Each edit is real text from `propose.md`, so the case cannot silently stop
+    #: matching the file it is meant to be editing. `front_matter` moves the *id*, so
+    #: it renames the ref as well as the digest — which is the front-matter being part
+    #: of the record, and is asserted rather than worked around.
+    #:
+    #: The `placeholder` case appends a *second* placeholder for a declared variable
+    #: rather than mangling one: `load_prompt` refuses a front-matter/placeholder
+    #: disagreement outright (its own test covers that), so mangling `{{budgets}}` would
+    #: measure the refusal, not the digest.
+    edits = {
+        "instruction": (
+            ("Propose the target warehouse tables for this source snapshot.", "Propose the tables and their keys."),
+            "propose@2",
+        ),
+        "placeholder": (("{{output_schema}}", "{{output_schema}}\n{{output_schema}}"), "propose@2"),
+        "trailing_space": (("## Task", "## Task "), "propose@2"),
+        "front_matter": (("id: propose", "id: proposal"), "proposal@2"),
+    }
+    for label, ((old, new), expected_ref) in edits.items():
+        directory = _checkout(scratch, "\n", label)
+        target = directory / "propose.md"
+        text = target.read_text(encoding="utf-8")
+        assert old in text, f"the {label} case no longer matches the prompt file"
+        target.write_text(text.replace(old, new, 1), encoding="utf-8")
+        changed = _digests_of(monkeypatch, directory)
+        assert expected_ref in changed, f"a {label} edit changed the ref to {sorted(changed)}"
+        assert changed[expected_ref] != baseline["propose@2"], f"a {label} edit went unnoticed"
+        # and the edit is local to the file it was made in
+        assert changed["repair@2"] == baseline["repair@2"]
+
+
+def test_the_manifest_digest_is_taken_over_the_whole_file(scratch, monkeypatch):
+    """Front-matter is part of the record, so a version bump moves both ref and digest.
+
+    The digest covers the file, not just the body the renderer substitutes: a reviewed
+    prompt's declared variables and contract are part of what was approved.
+    """
+
+    baseline = _digests_of(monkeypatch, _checkout(scratch, "\n", "whole"))
+
+    # (a) a version bump renames the ref — `ref` is `id@version`, read from the file
+    directory = _checkout(scratch, "\n", "version")
+    target = directory / "repair.md"
+    text = target.read_text(encoding="utf-8")
+    assert "version: 2" in text
+    target.write_text(text.replace("version: 2", "version: 3", 1), encoding="utf-8")
+
+    changed = _digests_of(monkeypatch, directory)
+    assert "repair@3" in changed, "the ref is read from the front-matter"
+    assert "repair@2" not in changed
+    assert changed["repair@3"] != baseline["repair@2"], "the digest covers the front-matter"
+
+    # (b) a declared-variable change is a content change even though the body is untouched
+    directory = _checkout(scratch, "\n", "declaration")
+    target = directory / "repair.md"
+    text = target.read_text(encoding="utf-8")
+    assert "contract: ModelDraft" in text
+    target.write_text(text.replace("contract: ModelDraft", "contract: ModelDraftV2", 1), encoding="utf-8")
+
+    declared = _digests_of(monkeypatch, directory)
+    assert declared["repair@2"] != baseline["repair@2"], "a front-matter edit went unnoticed"
+    assert declared["propose@2"] == baseline["propose@2"]
 
 
 def test_every_prompt_file_declares_its_variables():

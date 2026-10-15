@@ -22,6 +22,20 @@ FRONT_MATTER = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.S)
 PLACEHOLDER = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 
 
+def canonical_prompt_text(raw: bytes) -> str:
+    """The canonical text a prompt digest is taken over.
+
+    Must stay identical to `app.agent.prompts.canonical_prompt_text`, so that
+    regenerating the manifest on any machine — and comparing it on any checkout —
+    produces the same values. Only line endings are normalised: `core.autocrlf=true`
+    checks these files out with CRLF on Windows while the committed blob is LF, and a
+    check-out difference is not a prompt edit. Every real edit — an instruction, a
+    `{{placeholder}}`, the front-matter, a trailing space — still changes the digest.
+    """
+
+    return raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def main() -> int:
     digests: dict[str, str] = {}
     problems: list[str] = []
@@ -49,7 +63,7 @@ def main() -> int:
             # `render()` fails on a mismatch, so catching it here names the file early.
             problems.append(f"{path.name}: declared={sorted(declared)} found={found}")
         digests[f"{header.get('id')}@{header.get('version')}"] = hashlib.sha256(
-            path.read_bytes()
+            canonical_prompt_text(path.read_bytes()).encode("utf-8")
         ).hexdigest()
 
     out = PROMPTS_DIR / "manifest.json"

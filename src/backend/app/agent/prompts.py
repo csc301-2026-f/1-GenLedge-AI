@@ -121,6 +121,32 @@ class PromptError(RuntimeError):
     """A prompt could not be loaded or rendered as declared."""
 
 
+def canonical_prompt_text(raw: bytes) -> str:
+    """Decode a prompt file into the canonical text its digest is taken over.
+
+    The manifest is the change-control record for a reviewed prompt, so its digest has
+    to identify the *content* a reviewer approved — and line endings are not content
+    here. Every prompt is parsed with `splitlines()` and rendered by single-pass
+    substitution, neither of which can observe a CRLF/LF difference, so two checkouts
+    of the same commit are the same prompts. Hashing the raw bytes said otherwise:
+    `core.autocrlf=true` — which this repository sets, and which is the default on a
+    Windows install — checks these files out with CRLF while the committed blob is LF,
+    so `manifest()` disagreed with `manifest.json` on a *fresh clone* and
+    `test_checked_in_prompt_digests_match_the_manifest` failed for a reason that had
+    nothing to do with the prompt (the same class of failure
+    `verify_us4_person_b.py` already normalises away when it compares the frozen
+    contract).
+
+    Only line endings are normalised: a check-out difference is not an edit, but an
+    instruction change, a `{{placeholder}}` change, a front-matter change and even a
+    trailing space are, and all of them still change the digest. Normalising more —
+    stripping whitespace, collapsing blank lines — would blind the record to real
+    edits, which is the guarantee this function exists to preserve.
+    """
+
+    return raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+
 @dataclass(frozen=True)
 class PromptSpec:
     prompt_id: str
@@ -135,7 +161,16 @@ class PromptSpec:
 
     @property
     def sha256(self) -> str:
-        return hashlib.sha256(self.template.encode("utf-8")).hexdigest()
+        """The digest recorded as provenance on every model call.
+
+        Normalised through the same canonicalisation as the manifest: this value is
+        written onto the step's `messages` as `prompt_sha256`, so two reviewers
+        comparing a run on a CRLF checkout with a run on an LF checkout must be
+        comparing the prompt, not the line endings their Git configuration chose.
+        """
+
+        canonical = canonical_prompt_text(self.template.encode("utf-8"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -201,15 +236,19 @@ def load_prompt(prompt_id: str) -> PromptSpec:
 def manifest() -> dict[str, str]:
     """`id@version -> sha256` for every checked-in prompt.
 
-    The digest is of the whole file, so a silent edit to an instruction or to the
-    front-matter both show up. `prompts/manifest.json` holds the reviewed values;
-    a mismatch is caught by `tests/agent/test_prompt_safety.py`.
+    The digest is over the whole file — front-matter included — so a silent edit to an
+    instruction or to a declaration changes it. Line endings are canonicalised first
+    (`canonical_prompt_text`) so the digest is a property of the prompt rather than of
+    the checkout that produced it. `prompts/manifest.json` holds the reviewed values;
+    a mismatch is caught by `tests/agent/test_prompt_safety.py`, and
+    `tools/prompt_manifest.py` regenerates them through the same canonicalisation.
     """
 
     digests: dict[str, str] = {}
     for path in sorted(PROMPTS_DIR.glob("*.md")):
         spec = load_prompt(path.stem)
-        digests[spec.ref] = hashlib.sha256(path.read_bytes()).hexdigest()
+        canonical = canonical_prompt_text(path.read_bytes())
+        digests[spec.ref] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return digests
 
 
@@ -525,6 +564,7 @@ __all__ = [
     "PromptError",
     "PromptSpec",
     "RenderedPrompt",
+    "canonical_prompt_text",
     "job_ref",
     "load_prompt",
     "manifest",

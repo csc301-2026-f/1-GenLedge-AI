@@ -19,6 +19,7 @@ from app.agent.models import (
     LiveModel,
     ModelRequest,
     ModelResponse,
+    ResolvedModelMode,
     build_model_client,
     parse_model_draft,
     provider_configured,
@@ -149,6 +150,128 @@ def test_log_resolved_mode_reports_rather_than_crashes_on_missing_configuration(
 
     monkeypatch.setenv("GENLEDGE_MODEL_MODE", "fake")
     assert "model_mode=fake" in (log_resolved_mode() or "")
+
+
+# --- provider selection --------------------------------------------------------
+
+
+def test_an_advertised_provider_is_refused_when_no_adapter_exists_for_it():
+    """The follow-up review's finding 4: a banner must name the SDK that is called.
+
+    `LiveModel` is the Anthropic Messages API path — `_build_client` imports
+    `anthropic` unconditionally. Before this, `GENLEDGE_LLM_PROVIDER=openai` was
+    accepted, resolved to live mode, printed `provider=openai` at startup, and then
+    made the call through the Anthropic SDK. The provider that cannot be served is now
+    refused with the project's existing typed `model_configuration_error` before any
+    request exists.
+    """
+
+    env = {"GENLEDGE_LLM_PROVIDER": "openai", "OPENAI_API_KEY": "sk-not-anthropic"}
+    with pytest.raises(ModelConfigurationError) as caught:
+        resolve_model_mode("live", env=env)
+    assert caught.value.code == MODEL_CONFIGURATION_ERROR
+    assert caught.value.retryable is False
+    assert "openai" in caught.value.message
+    assert "anthropic" in caught.value.message, "the message names what is supported"
+
+    # `auto` must not silently substitute a provider either: the configuration is
+    # present, so the user asked for a provider, and the honest answer is a refusal.
+    with pytest.raises(ModelConfigurationError):
+        resolve_model_mode("auto", env=env)
+    with pytest.raises(ModelConfigurationError):
+        resolve_model_mode(env=env)
+    # the startup banner is what used to print the untrue line
+    with pytest.raises(ModelConfigurationError):
+        startup_banner(env=env)
+
+
+def test_the_supported_provider_still_resolves_and_builds(monkeypatch):
+    """The control: the one adapter that exists keeps working, banner included."""
+
+    resolved = resolve_model_mode("live", env={"ANTHROPIC_API_KEY": "sk-ant-x"})
+    assert resolved.mode == "live"
+    assert resolved.provider == "anthropic"
+    assert "provider=anthropic" in startup_banner(mode=resolved)
+
+
+def test_build_model_client_refuses_an_unsupported_provider():
+    """The seam that chooses the SDK refuses too, whatever a caller resolved."""
+
+    hand_built = ResolvedModelMode("live", "live", "openai", "gpt-4o", "hand-built")
+    with pytest.raises(ModelConfigurationError):
+        build_model_client(
+            hand_built,
+            inventory=_inventory(),
+            env={"OPENAI_API_KEY": "sk-not-anthropic"},
+        )
+
+
+def test_live_model_refuses_an_unsupported_provider():
+    """The adapter itself is the last place that can refuse without a request."""
+
+    with pytest.raises(ModelConfigurationError) as caught:
+        LiveModel(provider="openai", api_key="sk-not-anthropic")
+    assert caught.value.code == MODEL_CONFIGURATION_ERROR
+
+
+def test_the_api_key_sent_belongs_to_the_resolved_provider(stub_anthropic, monkeypatch):
+    """A key for another vendor is never handed to the Anthropic SDK.
+
+    `build_model_client` used to take whichever `*_API_KEY` came first in the variable
+    tuple, so a machine holding an Anthropic key and an OpenAI key sent the OpenAI
+    secret to Anthropic. A provider-specific variable now wins, and the vendor-neutral
+    `GENLEDGE_LLM_API_KEY` is the fallback.
+    """
+
+    stub_anthropic([_StubResponse([_StubBlock(type="text", text=_fake_draft_json())])])
+    env = {
+        "ANTHROPIC_API_KEY": "sk-ant-correct",
+        "OPENAI_API_KEY": "sk-openai-wrong",
+        "GENLEDGE_LLM_PROVIDER": "anthropic",
+    }
+    resolved = resolve_model_mode("live", env=env)
+    model = build_model_client(resolved, inventory=_inventory(), env=env)
+    assert isinstance(model, LiveModel)
+    model.invoke(_proposal_request())
+    assert _StubAnthropic.last is not None
+    assert _StubAnthropic.last.kwargs["api_key"] == "sk-ant-correct"
+
+    # with only the vendor-neutral variable set, that is the key used
+    neutral = {"GENLEDGE_LLM_API_KEY": "sk-neutral"}
+    resolved_neutral = resolve_model_mode("live", env=neutral)
+    build_model_client(resolved_neutral, inventory=_inventory(), env=neutral).invoke(_proposal_request())
+    assert _StubAnthropic.last is not None
+    assert _StubAnthropic.last.kwargs["api_key"] == "sk-neutral"
+
+
+def test_the_request_timeout_matches_the_documented_default(stub_anthropic):
+    """The model-node budget and the transport settings are the same arithmetic.
+
+    §6.5's attempt bound is `request × (1 + retries) + 60 s`; the derived helper and
+    the adapter's default must agree with it, or the hierarchy has silently inverted.
+    """
+
+    from app.agent.models import DEFAULT_REQUEST_TIMEOUT_SECONDS, derived_model_timeout_seconds
+
+    assert DEFAULT_REQUEST_TIMEOUT_SECONDS == 300.0
+    assert derived_model_timeout_seconds() == 960
+    assert AgentBudgets().model_node_timeout_seconds == derived_model_timeout_seconds()
+
+    stub_anthropic([_StubResponse([_StubBlock(type="text", text=_fake_draft_json())])])
+    env = {"ANTHROPIC_API_KEY": "sk-ant-x"}
+    model = build_model_client(resolve_model_mode("live", env=env), inventory=_inventory(), env=env)
+    assert isinstance(model, LiveModel)
+    assert model.timeout_seconds == DEFAULT_REQUEST_TIMEOUT_SECONDS
+    assert model.max_retries == 2
+    model.invoke(_proposal_request())
+    assert _StubAnthropic.last is not None
+    assert _StubAnthropic.last.kwargs["timeout"] == DEFAULT_REQUEST_TIMEOUT_SECONDS
+    assert _StubAnthropic.last.kwargs["max_retries"] == 2
+
+    # an explicit setting still wins: the knob is the level-1 control
+    override = {"ANTHROPIC_API_KEY": "sk-ant-x", "GENLEDGE_LLM_TIMEOUT_SECONDS": "45"}
+    tuned = build_model_client(resolve_model_mode("live", env=override), inventory=_inventory(), env=override)
+    assert isinstance(tuned, LiveModel) and tuned.timeout_seconds == 45.0
 
 
 # --- fake adapter --------------------------------------------------------------

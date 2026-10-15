@@ -20,11 +20,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any
 
 from app.agent import prompts as prompt_module
 from app.agent import state as state_module
 from app.agent.contracts import AgentBudgets, FailureInfo, InventoryView, ModelDraft, ToolResultRef
+from app.agent.deadlines import exceeded, model_node_timeout_seconds
 from app.agent.errors import (
     CATALOGUE_NOT_FOUND,
     COST_BUDGET_EXHAUSTED,
@@ -118,12 +120,27 @@ def _failure_update(
     }
 
 
+def _exceeded(start_time: float, timeout_seconds: float) -> bool:
+    """True when a node's own elapsed time has passed its budget.
+
+    One clock reading per call: `deadlines.exceeded` is pure so this wrapper is the
+    only place that asks the operating system what time it is.
+    """
+
+    return exceeded(start_time, timeout_seconds, now=monotonic())
+
+
 def _budget_counter(state: RoutingJobState, runtime: GraphRuntime) -> int:
     """The model-call count that governs the budget: the durable record wins.
 
     A control-store fault is a typed failure, not an escaping exception — the same
     rule `context` applies to its reads. `AgentFailure` is raised and caught by the
     callers, which are all inside a node.
+
+    The higher of the durable count and the in-state counter is the authority, and the
+    in-state half is not redundant: a store that answers `0` while never recording
+    anything would otherwise disable `max_model_calls` entirely. Reads fail closed
+    here; writes fail closed in `_record_model_call`.
     """
 
     try:
@@ -138,19 +155,37 @@ def _budget_counter(state: RoutingJobState, runtime: GraphRuntime) -> int:
 
 
 def _record_model_call(runtime: GraphRuntime, state: RoutingJobState, response: ModelResponse | None) -> None:
-    """Record one provider call durably. Best effort, but never silently skipped.
+    """Record one provider call durably, or raise the typed failure that ends the run.
 
-    The durable row count is the model budget's authority (`repositories.py`), so a
-    call that happened must be recorded even when the adapter raised: an unrecorded
-    call is a call a crash loop can spend again.
+    The durable row count is the model budget's authority (`repositories.py`), so this
+    write is not advisory. It used to swallow a store fault into a `logger.warning`
+    and let the run continue, which is the one failure mode the budget cannot survive:
+    the provider had already been called, the row that would have charged it does not
+    exist, and the next `propose` re-reads an unchanged count — so `max_model_calls`
+    stops bounding anything at exactly the moment the store is unhealthy, and the run
+    reports its calls as fewer than it made.
+
+    So it fails closed: the caller gets a retryable `repository_unavailable` and ends
+    the job instead of continuing on a call it cannot account for. The exception is
+    raised rather than returned because every call site is inside a node, and the node
+    boundary already owns turning an `AgentFailure` into a typed terminal state.
+
+    What this does **not** claim: the call is not rolled back and the provider is not
+    billed any less. Recording after the fact can only make the *harness* refuse to
+    continue; it cannot make a remote invocation transactional.
     """
 
     try:
         runtime.repository.record_model_call(
             state.get("job_id", ""), node=PROPOSE, tokens=response.tokens if response else 0
         )
-    except Exception as error:  # noqa: BLE001 - the call happened; the record is best effort
-        logger.warning("could not record the model call for %s: %s", state.get("job_id"), error)
+    except Exception as error:  # noqa: BLE001 - the call happened; the record is the authority
+        raise AgentFailure(
+            REPOSITORY_UNAVAILABLE,
+            "the durable model-call record could not be written, so the call could not "
+            f"be charged: {type(error).__name__}: {error}",
+            retryable=True,
+        ) from error
 
 
 # --- context -------------------------------------------------------------------
@@ -395,6 +430,16 @@ def _propose(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, Any]
     # returns typed error codes rather than raising, but a `ModelClient` is an
     # interface: a second implementation, or a bug in the first, must not take the job
     # down with a traceback (master §9.1 rows 4–7).
+    #
+    # `model_node_timeout_seconds` is the deadline for the work this node does, so the
+    # clock starts at the provider call. It is enforced *after* the call returns: a
+    # synchronous SDK call cannot be preempted in-process, so no in-node mechanism can
+    # impose a hard deadline on it, and `deadlines.py` says so rather than pretending
+    # otherwise. What is enforced is the guarantee that matters here — an answer that
+    # overran the node budget is recorded durably, refused, and never becomes the run's
+    # draft. The hard per-attempt bound is the provider client's own request timeout.
+    model_deadline = model_node_timeout_seconds(budgets)
+    node_started = monotonic()
     try:
         response = model.invoke(request)
     except Exception as error:  # noqa: BLE001 - an adapter fault is data, not a crash
@@ -406,7 +451,11 @@ def _propose(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, Any]
         # The provider was called, even though it raised. Recording it durably is what
         # keeps the budget authority honest across a crash: an unrecorded call is a call
         # a crash loop can spend again, which is the opposite of what the module claims.
-        _record_model_call(runtime, state, None)
+        # A record that cannot be written ends the run the same way (fail closed).
+        try:
+            _record_model_call(runtime, state, None)
+        except AgentFailure as unrecorded:
+            return _failure_update(unrecorded, state)
         update = _failure_update(failure, state)
         update.update(
             {
@@ -416,8 +465,26 @@ def _propose(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, Any]
             }
         )
         return update
+    if _exceeded(node_started, model_deadline):
+        try:
+            _record_model_call(runtime, state, response)
+        except AgentFailure as unrecorded:
+            return _failure_update(unrecorded, state)
+        return _failure_update(
+            AgentFailure(
+                MODEL_UNAVAILABLE,
+                f"the model call took longer than model_node_timeout_seconds "
+                f"({model_deadline:g}s); the run does not continue on an over-budget "
+                "answer (the provider request timeout is the hard per-attempt bound)",
+                retryable=True,
+            ),
+            state,
+        )
     runtime.responses.append(response)
-    _record_model_call(runtime, state, response)
+    try:
+        _record_model_call(runtime, state, response)
+    except AgentFailure as unrecorded:
+        return _failure_update(unrecorded, state)
     calls_used = _budget_counter(state, runtime)
     tokens_used = state.get("tokens_used", 0) + response.tokens
 
@@ -469,7 +536,7 @@ def _propose(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, Any]
 
     draft, contract_error = parse_model_draft(response.text)
     if draft is None:
-        repaired, repair_tokens, attempted = _attempt_repair(
+        repaired, repair_tokens, attempted, record_failure = _attempt_repair(
             contract_error or "invalid model output",
             previous_response=response.text,
             runtime=runtime,
@@ -477,6 +544,11 @@ def _propose(state: RoutingJobState, *, runtime: GraphRuntime) -> dict[str, Any]
             calls_used=calls_used,
             budgets=budgets,
         )
+        if record_failure is not None:
+            # The repair provider call happened but its durable record could not be
+            # written. It is not reported as an un-attempted repair, and the run does
+            # not continue on a call the budget cannot see (fail closed).
+            return _failure_update(record_failure, state)
         # A repair is charged as soon as it is attempted: the provider was called,
         # so the in-state counter and the durable count must both see it.
         if attempted:
@@ -526,20 +598,22 @@ def _attempt_repair(
     state: RoutingJobState,
     calls_used: int,
     budgets: AgentBudgets,
-) -> tuple[ModelDraft | None, int, bool]:
+) -> tuple[ModelDraft | None, int, bool, AgentFailure | None]:
     """Exactly one repair call, carrying the same evidence as the proposal call.
 
-    Returns `(draft, tokens, attempted)`. `attempted` is `True` only when the
-    provider was actually called, so the caller charges the budget exactly once and
-    only for a call that happened.
+    Returns `(draft, tokens, attempted, record_failure)`. `attempted` is `True` only
+    when the provider was actually called, so the caller charges the budget exactly once
+    and only for a call that happened. `record_failure` is non-`None` only when the call
+    happened and its durable record could not be written, which the caller must treat as
+    terminal: a repair whose record is missing is a call `max_model_calls` cannot see.
     """
 
     if calls_used >= budgets.max_model_calls:
-        return None, 0, False
+        return None, 0, False, None
     model = runtime.model
     inventory = runtime.inventory
     if model is None or inventory is None:
-        return None, 0, False
+        return None, 0, False, None
     try:
         rendered = prompt_module.render_repair_prompt(
             validation_errors=errors,
@@ -551,7 +625,7 @@ def _attempt_repair(
             budgets=budgets,
         )
     except prompt_module.PromptError:
-        return None, 0, False
+        return None, 0, False, None
     request = ModelRequest(
         node=PROPOSE,
         system=rendered.system,
@@ -562,6 +636,18 @@ def _attempt_repair(
         repair=True,
         results=tuple(runtime.tool_results),
     )
+    repair_deadline = model_node_timeout_seconds(budgets)
+    repair_started = monotonic()
+
+    def record(response_or_none: ModelResponse | None) -> AgentFailure | None:
+        """Record the repair call, returning the failure that ends the run if it cannot."""
+
+        try:
+            _record_model_call(runtime, state, response_or_none)
+        except AgentFailure as failure:
+            return failure
+        return None
+
     try:
         response = model.invoke(request)
     except Exception as error:  # noqa: BLE001 - an adapter fault is data, not a crash
@@ -569,16 +655,25 @@ def _attempt_repair(
         # "no repair was attempted" while two requests had gone out, and left the call
         # out of the durable count.
         logger.warning("the repair call for %s raised: %s", state.get("job_id"), error)
-        _record_model_call(runtime, state, None)
+        failure = record(None)
         runtime.repairs_used += 1
-        return None, 0, True
+        return None, 0, True, failure
+    if _exceeded(repair_started, repair_deadline):
+        # The repair provider call happened and overran the node deadline. It is
+        # charged, and its answer is not used: `parse_model_draft` is never reached, so
+        # an over-budget answer cannot become the run's accepted draft.
+        failure = record(response)
+        runtime.repairs_used += 1
+        return None, response.tokens, True, failure
     runtime.responses.append(response)
-    _record_model_call(runtime, state, response)
+    failure = record(response)
     runtime.repairs_used += 1
+    if failure is not None:
+        return None, response.tokens, True, failure
     if response.error_code or response.tool_calls:
-        return None, response.tokens, True
+        return None, response.tokens, True, None
     draft, _ = parse_model_draft(response.text)
-    return draft, response.tokens, True
+    return draft, response.tokens, True, None
 
 
 def _messages(rendered: prompt_module.RenderedPrompt, response: ModelResponse) -> list[dict[str, Any]]:
