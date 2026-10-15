@@ -705,9 +705,11 @@ def test_the_canonicalisation_matches_the_regeneration_tool():
 
     for path in sorted(PROMPTS_DIR.glob("*.md")):
         raw = path.read_bytes()
+        lf = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        crlf = lf.replace(b"\n", b"\r\n")
         assert module.canonical_prompt_text(raw) == prompts_module.canonical_prompt_text(raw)
         assert module.canonical_prompt_text(raw) == prompts_module.canonical_prompt_text(
-            raw.replace(b"\n", b"\r\n")
+            crlf
         )
 
 
