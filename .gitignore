@@ -8,12 +8,14 @@ __pycache__/
 .pytest_cache/
 .venv/
 .env*
+!src/backend/.env.example
 .vite/
 vite.config.*.timestamp-*
 *.tsbuildinfo
 *-debug.log*
 logs/
 *.log
+src/backend/instance/
 .claude-replay.*
 .tmp-*
 /.figma/design-context/
