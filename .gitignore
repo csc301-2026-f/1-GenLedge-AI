@@ -18,6 +18,17 @@ logs/
 .tmp-*
 /.figma/design-context/
 
+# Throwaway copy used by tools/mutation_check.py when no system temp directory is
+# writable. Never source, and never something to commit.
+/.mutation-scratch/
+
+*.bak
+*.orig
+
+# Raw output kept from review cycles (junit xml, pytest captures, one-off probe
+# scripts). Evidence for a reviewer to read, not project source.
+/.review-artifacts/
+
 # Platform-managed agentplat state, not project source. In the
 # client-initiated single-repo workspace layout (make's `Path: "."` spec) the
 # repo root IS the workspace root, so these land inside this repo rather than
