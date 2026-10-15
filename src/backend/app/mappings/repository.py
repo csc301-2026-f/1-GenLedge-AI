@@ -26,6 +26,20 @@ def from_json(model_type, payload):
     return model_type.model_validate_json(json.dumps(payload))
 
 
+def _same_json(left: object, right: object) -> bool:
+    """Compare normalized JSON without Python's boolean/number aliasing."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, dict) or isinstance(right, dict):
+        return (isinstance(left, dict) and isinstance(right, dict) and left.keys() == right.keys()
+                and all(_same_json(left[key], right[key]) for key in left))
+    if isinstance(left, list) or isinstance(right, list):
+        return (isinstance(left, list) and isinstance(right, list) and len(left) == len(right)
+                and all(_same_json(a, b) for a, b in zip(left, right)))
+    # JSON numbers retain numeric equivalence (1 == 1.0), without float coercion.
+    return left == right
+
+
 class MappingRepository:
     def __init__(self, database: Database, *, organization_id: str):
         self.database = database
@@ -120,11 +134,14 @@ class MappingRepository:
                                           (job_id, model_json["revision"])).fetchone()
             if existing:
                 package = self._revision(connection, existing["id"])
-                if (validated_json(package["model_draft"]) != model_json
-                        or (validated_json(package["mapping_draft"]) if package["mapping_draft"] else None) != mapping_json
-                        or [validated_json(item) for item in package["findings"]] != findings_json
-                        or [validated_json(item) for item in package["coverage"]] != coverage_json
-                        or package["table_is_new"] != flags):
+                stored = {"model": validated_json(package["model_draft"]),
+                          "mapping": validated_json(package["mapping_draft"]) if package["mapping_draft"] else None,
+                          "findings": [validated_json(item) for item in package["findings"]],
+                          "coverage": [validated_json(item) for item in package["coverage"]],
+                          "flags": package["table_is_new"]}
+                requested = {"model": model_json, "mapping": mapping_json, "findings": findings_json,
+                             "coverage": coverage_json, "flags": flags}
+                if not _same_json(stored, requested):
                     raise PersistenceConflict("Revision already identifies different immutable content")
                 return package
             revision_id = str(uuid4())
@@ -176,13 +193,14 @@ class MappingRepository:
 
     def save_catalogue(self, catalog_ref: str, payload: dict) -> dict:
         # No catalogue model exists in contracts.py yet. Store names/types only.
-        if set(payload) != {"tables"} or not isinstance(payload["tables"], list):
+        if not isinstance(payload, dict) or set(payload) != {"tables"} or not isinstance(payload["tables"], list):
             raise ValueError("Catalogue must contain a tables list")
         for table in payload["tables"]:
-            if set(table) != {"name", "columns"} or not isinstance(table["name"], str) or not isinstance(table["columns"], list):
+            if (not isinstance(table, dict) or set(table) != {"name", "columns"}
+                    or not isinstance(table["name"], str) or not isinstance(table["columns"], list)):
                 raise ValueError("Catalogue tables contain name and columns only")
             for column in table["columns"]:
-                if set(column) != {"name", "type"} or not isinstance(column["name"], str):
+                if not isinstance(column, dict) or set(column) != {"name", "type"} or not isinstance(column["name"], str):
                     raise ValueError("Catalogue columns contain name and type only")
                 SourceType(column["type"])
         with self.database.transaction() as connection:

@@ -64,5 +64,39 @@ python -m coverage report -m
 
 ## Final verification
 
-Pending the separate fix commit. Coverage is evidence of exercised branches,
-not a proof that every possible input or failure has been tested.
+The suite alone covers all public persistence functions and reports 99% combined
+statement/branch coverage; the remaining lines are CLI `__main__` entrypoints.
+With `GENLEDGE_DATABASE_URL` configured for your local development database,
+append their execution to the same coverage file:
+
+```powershell
+$env:GENLEDGE_DATABASE_SCHEMA = 'function_audit_smoke'
+python -m coverage run --append --branch --source=app.common.migrations -m app.common.migrations
+python -m coverage run --append --branch --source=app.sources.fixtures -m app.sources.fixtures
+python -m coverage run --append --branch --source=scripts.smoke_persistence -m scripts.smoke_persistence
+python -m coverage run --append --branch --source=scripts.smoke_persistence -m scripts.smoke_persistence
+python -m coverage report -m
+```
+
+These CLI checks create synthetic records in the local `function_audit_smoke`
+schema. The second smoke process must read the first process's job/revision and
+replay its tool result with zero factory calls.
+
+- Error/test commit: `9bf95e1` (`test(us4): record persistence function audit failures`).
+- After fixes: **115 passed**, including **50 passed** in the added audit suite;
+  no skips or warnings.
+- Suite plus migration/fixture/smoke CLI invocations: **100% statement and branch
+  coverage** for the eight measured persistence/smoke modules (423 statements,
+  106 branches). Alembic version scripts and the rest of the backend are outside
+  that coverage percentage; migration behavior and existing backend tests still run.
+- Both smoke processes read the same job/revision and reject decision; the second
+  reports `created=False`, `tool_replayed=True`, and `factory_calls=0`.
+- `git diff --check` passed. No shared contracts or database schema changed;
+  existing databases need no new migration for these fixes.
+
+Fixes validate schema configuration before connecting, guard catalogue dictionary
+containers before inspecting keys, and compare normalized JSON recursively while
+keeping booleans distinct from numbers. Object-key order and equivalent numeric
+forms remain replay-compatible; array order and large integer differences remain
+significant. Coverage is evidence of exercised branches, not a proof that every
+possible input or failure has been tested. The fix commit is recorded by Git.

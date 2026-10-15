@@ -11,7 +11,7 @@ from psycopg.types.json import Jsonb
 
 from app.agent.contracts import CONTRACT_VERSION, PersistedArtifact, ToolCallRequest, ToolResultRef
 from app.common.database import NotFoundError, PersistenceConflict
-from .repository import MappingRepository, validated_json
+from .repository import MappingRepository, _same_json, validated_json
 
 
 class ToolResultRepository(MappingRepository):
@@ -32,7 +32,7 @@ class ToolResultRepository(MappingRepository):
         if not row:
             return None
         PersistedArtifact(contract_version=row["contract_version"])
-        if row["tool"] != call.name or row["arguments_json"] != call.arguments:
+        if row["tool"] != call.name or not _same_json(row["arguments_json"], validated_json(call)["arguments"]):
             raise PersistenceConflict("Tool call ID already identifies a different request")
         return {"ref": ToolResultRef(tool_call_id=call.id, tool=row["tool"], status=row["status"],
                                      result_ref=row["id"], replayed=True), "payload": row["payload_json"]}

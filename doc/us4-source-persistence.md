@@ -34,7 +34,10 @@ use your local host, port, database, and role instead of starting Compose.
 `PGPASSWORD` keeps the password outside the DSN. Do not commit environment secrets.
 
 The default schema is `genledge_control`; override it with
-`GENLEDGE_DATABASE_SCHEMA`. The migration identity is `001_us4_control_plane`.
+`GENLEDGE_DATABASE_SCHEMA`. Schema names must be nonblank strings, contain no NUL
+characters, and fit within 63 UTF-8 bytes; reserved schemas are rejected before
+connecting. An explicitly empty schema is invalid rather than selecting the default.
+The migration identity is `001_us4_control_plane`.
 `python -m alembic upgrade head` is an equivalent command from `src/backend`.
 Migration execution is transactional and serialized by a PostgreSQL advisory lock;
 running it repeatedly is safe. The role needs schema/table/function creation
@@ -190,7 +193,10 @@ caller-owned connector read: its transaction-scoped advisory lock serializes
 duplicate calls across processes, invokes the factory only on a cache miss, and
 stores the returned `('ok'|'error', JSON_payload)` pair. It returns the same
 reference/payload shape as `replay`. A repeated call ID with a changed tool name
-or arguments conflicts. The same call ID is independent in different jobs.
+or arguments conflicts. Replay compares the normalized JSON used for storage:
+booleans differ from numbers, dictionary-key order is ignored, equivalent numbers
+such as `1` and `1.0` match, and array order remains significant. Immutable revision
+replay uses the same comparison. The same call ID is independent in different jobs.
 The factory must apply authorization, tool-specific schema checks, budgets,
 timeouts, and redaction before returning. Only caller-attested redacted payloads
 are accepted. The repository does not perform those other workstreams' rules.

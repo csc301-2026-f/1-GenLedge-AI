@@ -16,7 +16,10 @@ class Database:
         self.dsn = dsn or os.environ.get("GENLEDGE_DATABASE_URL")
         if not self.dsn:
             raise ValueError("Set GENLEDGE_DATABASE_URL to the PostgreSQL control database DSN")
-        self.schema = schema or os.environ.get("GENLEDGE_DATABASE_SCHEMA", "genledge_control")
+        self.schema = schema if schema is not None else os.environ.get("GENLEDGE_DATABASE_SCHEMA", "genledge_control")
+        if (not isinstance(self.schema, str) or not self.schema.strip() or "\x00" in self.schema
+                or len(self.schema.encode("utf-8")) > 63):
+            raise ValueError("Schema must be a nonblank string without NUL characters, at most 63 UTF-8 bytes")
         if self.schema in {"public", "pg_catalog", "information_schema"} or self.schema.startswith("pg_"):
             raise ValueError("Use a dedicated application schema")
 

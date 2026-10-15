@@ -2,6 +2,14 @@
 
 ## US4 source inventory and persistence
 
+- Action: Run `python -m pytest tests/test_persistence_function_audit.py -q` with
+  the local test DSN configured.
+  Expected: 50 audit cases pass, including schema/configuration errors, malformed
+  catalogue containers, boolean/number replay conflicts, normalized argument
+  replay, revision immutability, and two complete smoke invocations. The error
+  history and coverage commands are in
+  [`doc/us4-persistence-function-audit.md`](../doc/us4-persistence-function-audit.md).
+
 Setup commands and interface examples are in
 [`doc/us4-source-persistence.md`](../doc/us4-source-persistence.md).
 
