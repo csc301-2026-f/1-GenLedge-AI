@@ -29,13 +29,39 @@ if not defined PYTHON (
   exit /b 1
 )
 
-%PYTHON% -c "import flask" >nul 2>&1
+%PYTHON% -c "import flask, sqlalchemy" >nul 2>&1
 if errorlevel 1 (
-  echo Flask is not installed for %PYTHON%.
+  echo Flask and SQLAlchemy are required for %PYTHON%.
   echo Install it with: %PYTHON% -m pip install -r "%BACKEND_DIR%\requirements-dev.txt"
   pause
   exit /b 1
 )
+
+pushd "%BACKEND_DIR%"
+echo.
+echo ===== Database connection status =====
+%PYTHON% -m flask --app main auth-db-check
+if errorlevel 1 (
+  popd
+  echo Database connection check failed. The frontend and backend were not started.
+  pause
+  exit /b 1
+)
+echo.
+choice /C YN /N /M "Continue with migrations and start services? [Y/N] "
+if errorlevel 2 (
+  popd
+  echo Startup cancelled.
+  exit /b 0
+)
+%PYTHON% -m flask --app main auth-init-db
+if errorlevel 1 (
+  popd
+  echo Database migration failed. The frontend and backend were not started.
+  pause
+  exit /b 1
+)
+popd
 
 start "GenLedge Frontend" /D "%FRONTEND_DIR%" cmd /k "pnpm dev --host 127.0.0.1 --port 5173 --strictPort"
 start "GenLedge Backend" /D "%BACKEND_DIR%" cmd /k "%PYTHON% main.py"
