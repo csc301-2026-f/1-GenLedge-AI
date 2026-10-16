@@ -6,12 +6,12 @@ checks are in [smoke tests](../docs/smoke-tests.md).
 
 ## Current scope
 
-File parsing/validation, the validation API/UI, metadata, the writer interface,
-and import orchestration are implemented. The source list and database connection
-flow remain prototypes. The web UI only validates: it does not save records,
-create a source, or advance discovery. The import service is tested through a fake
-writer confined to tests; it is not connected to an HTTP import route or database.
-US2 is not complete until real storage and the remaining integrations are verified.
+File parsing/validation, the validation API/UI, metadata, import orchestration and
+a concrete local intake writer are implemented. Internal callers can persist
+parsed records using LocalIntakeStore. The web UI remains validation-only: it does
+not call the import service, save records, create a source, or advance discovery.
+The source list/database connection flow remain prototypes. Real authorization,
+HTTP import/UI and source-reader integration are still required for complete US2.
 
 ## Local setup and testing
 
@@ -43,7 +43,7 @@ http://127.0.0.1:5173, and sign in with a nonempty email/password (demo login).
 Choose Upload File → Choose File → Validate File and use the sample CSV. Success
 shows counts and corrections and explicitly says nothing is saved.
 
-Neither the parser nor the current web API needs a database. Main's demo login
+Neither the parser nor the current web API needs a database. This branch's demo login
 stores a user in the signed session cookie; it is not production credential
 validation or organization authorization. There are no imports from the
 unfinished `feature-login` branch.
@@ -179,8 +179,8 @@ They remain stable when data, row order or worksheet order changes. Renaming a
 worksheet gives it a new collection ID. Batch IDs are fresh UUID hex strings.
 Intake names are `intake_` plus a 64-character hex hash of source, collection and
 batch IDs: bounded, deterministic for that tuple, and independent of raw names.
-The storage adapter still chooses the authorized client's database; a safe name
-is not an authorization check. No customer records are augmented with internal
+The storage adapter still chooses the authorized client's storage scope; a safe
+name is not an authorization check. No customer records are augmented with internal
 metadata, and original `_id`/nested keys must not be overwritten by the adapter.
 
 Batch lifecycle is represented by staging/completion records and the active
@@ -201,7 +201,7 @@ snapshot = import_file(
 )
 ```
 
-There is intentionally no HTTP import route yet. Main's demo login cannot supply
+There is intentionally no HTTP import route yet. This branch's demo login cannot supply
 real organization authorization. The eventual route must authorize scope before
 calling this function and must parse the actual uploaded bytes again rather than
 trusting an earlier browser validation summary.
@@ -242,6 +242,85 @@ pointer the publication boundary and reconcile abandoned staging separately.
 Readers must resolve and pin one batch manifest for an operation. Old-snapshot
 cleanup needs reader retention rules and is not part of this service.
 
+## Persistent local writer
+
+`app.sources.local_store.LocalIntakeStore` implements the existing IntakeWriter
+contract using JSON Lines record files and a standard-library SQLite catalog.
+The caller supplies an absolute storage root outside Git and a trusted
+organization/environment. Construction initializes local directories/catalog;
+importing the module or starting Flask does not initialize this adapter.
+
+```python
+import io
+from pathlib import Path
+from app.sources.local_store import LocalIntakeStore
+from app.sources.service import import_file
+
+store = LocalIntakeStore(
+    Path.home() / ".local" / "share" / "genledge" / "intake",
+    organization_id=authorized_organization_id,
+    environment=authorized_environment,
+)
+manifest = import_file(
+    "orders.json", io.BytesIO(b'[{"id":"001","lines":[{"sku":"A"}]}]'),
+    organization_id=authorized_organization_id,
+    environment=authorized_environment,
+    writer=store,
+)
+print(manifest.source_id, manifest.batch_id)
+```
+
+The root contains a hashed directory per organization/environment. Each scope has
+`catalog.sqlite3` and `records/<hashed-batch>/<hashed-collection>.jsonl`. Raw file
+names, source IDs and batch IDs are never interpolated as filesystem paths.
+The catalog stores complete manifests, collection completion markers, durable
+publication history and the current source pointer; it does not store raw rows.
+`intake_name` remains metadata, not an externally supplied physical path.
+
+The scope must come from an authorized server-side identity. Separate catalogs
+isolate lookups, but constructing an adapter for any organization is possible to
+trusted application code; this is not authentication or filesystem encryption.
+New directories use private permissions where supported. The operator must keep
+the root private and outside Git; do not serve it as static files.
+
+### Publication and cleanup
+
+- `stage` verifies scope and inserts the unpublished manifest/collections together.
+  Duplicate batch/collection IDs fail through catalog constraints.
+- `write_collection` checks membership, row count and unfinished state. It writes
+  one JSON object per line to a partial file, flushes/fsyncs it, replaces the final
+  path and only then commits the completion marker. Empty collections still
+  produce a synced empty file and a completion marker. Parsed values/nesting and
+  original keys are preserved; non-JSON values fail instead of being coerced.
+- `publish` checks all completion markers and the expected old batch under one
+  BEGIN IMMEDIATE transaction, then marks publication and updates the active
+  pointer together. A competing publication raises the existing PublicationConflict.
+  Published batches cannot be written again, re-published or discarded.
+- `discard_unpublished` first removes the catalog manifest/completion rows, then
+  removes its files. Interrupted cleanup leaves unreachable staging files rather
+  than a publishable manifest with missing records. Repeating cleanup is safe;
+  real filesystem errors propagate. Old published batches remain immutable.
+
+Records and the catalog do not share one transaction. Files are completed before
+the atomic catalog publication; readers must use published metadata only. A crash
+before publication can leave unpublished batches or partial/orphan files. A crash
+after publication retains the batch's published flag even after a later refresh
+replaces its active pointer, supporting future reconciliation. This adapter does
+not provide an automatic reconciliation/retention worker.
+
+The SQLite catalog uses FULL synchronization. On POSIX the writer also syncs
+record directories before acknowledging collection completion. Windows directory
+flush behavior, machine power-loss recovery and disk/controller guarantees have
+not been verified; process-restart persistence alone is not a power-loss test.
+Use a single host with a local filesystem that supports SQLite locking, not a
+network share. Writes in one organization/environment serialize through the
+catalog lock, including collection I/O; this is a deliberate bounded-file MVP
+trade-off. SQLite/storage errors propagate rather than silently retrying.
+
+No external database, new runtime dependency, Flask configuration or HTTP endpoint
+is added. This branch still uses its old demo authentication for validation;
+current shared authentication must be integrated before enabling web persistence.
+
 ## Failure semantics
 
 - Parsing or missing scope fails before storage calls. Active-snapshot read errors
@@ -274,13 +353,12 @@ acknowledgements. It deep-copies records to model isolation and rejects incomple
 publication. It is a synchronous test double, not evidence of real database
 atomicity, durability, crash recovery or thread/process safety.
 
-When storage is ready, implement the Protocol, agree on exact filename identity,
-and run integration tests against the chosen database for transactional publication,
-durable acknowledgements, BSON/JSON key and size constraints, reader retention,
-concurrent first imports, refresh conflicts and crash recovery. Then integrate
-the authorized HTTP import route and persistence UI. Mapping reconciliation,
-retry/idempotency, old-snapshot cleanup and MongoDB/DocumentDB connections that
-read in place also remain outstanding; see the working plan for the checklist.
+The concrete local adapter is now available; the fake writer remains useful only
+for orchestration checks. Filename identity, reader retention, authenticated HTTP
+import/UI, reconciliation, retry/idempotency, mapping preservation and external
+source connections remain integration work. Real multi-process contention and
+crash/power-loss behavior require separate verification; the historical fake-writer
+suite does not establish those properties for LocalIntakeStore.
 
 ## Finalized plan and completed-work record
 
@@ -289,7 +367,7 @@ The completed phases were implemented in this order:
 1. Build the six-format parser, validate all collections before returning, and
    add focused boundary/corruption tests.
 2. Connect a protected validation-only endpoint and modal. Adapt the integration
-   to main's demo authentication so US2 can progress independently of login work.
+   to this branch's demo authentication so US2 can progress independently of login work.
 3. Define immutable metadata and the writer Protocol. Implement isolated staging
    and source-level publication with an expected previous batch.
 4. Exercise failure and concurrency scenarios with a fake writer, retaining
@@ -312,5 +390,17 @@ balanced, superseded document references were removed, and whitespace checks are
 clean. Application tests were not rerun for this documentation-only change.
 
 The validation phase was committed as `1d9e6fe`. Metadata/writer work and this
-documentation consolidation extend the same US2 pull request (#15). Real database
-integration remains follow-up work; this delivery does not merge the PR.
+documentation consolidation extend the original US2 pull request (#15). The local
+intake work extends its branch through a separate PR; no PR is merged by this work.
+
+
+### Local writer implementation record
+
+The local adapter implements the five existing writer operations without changing
+the parser/import service or enabling web persistence. Synthetic local inspection
+saved nested JSON, leading-zero identifiers, booleans and null; refreshed the
+same source/collection; retained the original file; rejected writes/cleanup of
+published batches and a foreign-scope manifest; rejected incomplete publication;
+and repeated unpublished cleanup. Compilation and whitespace checks passed.
+No automated tests were added or run for this increment. Reader, fresh-process,
+contention and failure inspection continue in the next part of this delivery.

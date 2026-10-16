@@ -26,7 +26,7 @@ checklist for the whole story rather than duplicating the guide.
 
 - [ ] Agree with the database owner on storage locations, filename identity rules,
   atomic publication, durable completion markers and reader retention.
-- [ ] Implement the real writer and test durability, concurrency and crash recovery.
+- [x] Implement the local writer; complete additional concurrency/crash verification separately.
 - [ ] Integrate real organization authorization and the HTTP import/persistence UI.
 - [ ] Implement reconciliation, retry/idempotency and old-snapshot cleanup.
 - [ ] Agree field identity with the mapping owner and preserve compatible mappings.
@@ -41,3 +41,26 @@ also passed. Consolidation checks passed: local Markdown links resolve, code fen
 are balanced, no superseded document paths remain in the searched repository
 content, and `git diff --check` is clean. No code changed or tests rerun in this
 documentation-only step.
+
+## Local intake delivery
+
+Implement the existing writer contract and a batch-pinned sample reader without changing authentication, HTTP import/UI, source parsers or US4. Records are JSON Lines files under an explicit absolute storage root outside Git. A Python-standard-library SQLite catalog in that root tracks immutable manifests, collection completion, publication history and the active pointer. This is a local adapter, not an external database or a substitute for the control warehouse.
+
+### Success criteria
+
+- Bind each adapter to a trusted organization/environment; isolate catalogs and hashed filesystem paths by scope.
+- Stage new batches without exposing them; flush and sync each collection before recording completion. Preserve parsed values/nesting and reject incomplete/duplicate writes.
+- Publish only complete batches using one SQLite compare-and-swap transaction against the expected active batch. Retain old published batches and their publication history.
+- Discard only unpublished batches, removing their catalog visibility before deleting files so cleanup interruption cannot make an incomplete batch publishable.
+- Read only a published source/batch/collection in the adapter's scope. Sample at most 500 records from that pinned batch without consulting a moving active pointer again.
+- Keep the web path validation-only. Real identity authorization and HTTP import remain separate integration work.
+
+### Checklist
+
+- [x] Inspect current US2 contracts and create an isolated feature branch from its current head.
+- [x] Implement the persistent local writer and record its behavior/limits.
+- [ ] Add the scoped published-batch and bounded sample reader.
+- [ ] Inspect synthetic save/read, restart, isolation, publication conflict and failure behavior; compile and review the diff.
+- [ ] Finalize the existing guide/plan/manual procedures and create a PR targeting us2.
+
+SQLite BEGIN IMMEDIATE serializes publication decisions for a scope; local writes also hold that lock through file completion. This trades write concurrency for a small, explicit publication boundary. Use a single host and local disk, not network/shared filesystems. Directory fsync is performed on POSIX; Windows directory/power-loss behavior is not claimed verified. No distributed transaction, reconciliation daemon or old published-batch deletion is added.
