@@ -39,7 +39,11 @@ class RoutingRepository(Protocol):
     Replays are checked before lifecycle guards and never reset a completed job.
     claim_edit atomically claims edit_requested -> revising and returns the pending
     edit. publish_edit commits the revised package/status and marks that edit
-    consumed in the same transaction. No transaction spans a model call.
+    consumed in the same transaction, including its model revision. release_edit
+    conditionally returns the matching unconsumed edit from revising to
+    edit_requested with safe failure information; it never changes the package,
+    revisions or audit receipt, or reopens an already-consumed edit. Claiming and
+    successful publication clear failure information. No transaction spans a model call.
     """
     def find_job(self, owner: str, key: str) -> JobRecord | None: ...
     def create_job(self, job: JobRecord) -> tuple[JobRecord, bool]: ...
@@ -51,6 +55,7 @@ class RoutingRepository(Protocol):
     def get_package(self, owner: str, job_id: str) -> RoutingReviewPackage | None: ...
     def request_edit(self, owner: str, job_id: str, key: str, edit: EditMappingRequest) -> tuple[EditMappingResponse, bool]: ...
     def claim_edit(self, owner: str, job_id: str) -> EditMappingRequest | None: ...
+    def release_edit(self, owner: str, job_id: str, edit_id: str, failure: FailureInfo) -> None: ...
     def publish_edit(self, owner: str, job_id: str, edit_id: str, package: RoutingReviewPackage, status: JobStatus) -> None: ...
 
 
@@ -167,13 +172,19 @@ class MappingService:
             else:
                 result = self.run_graph(job_id, inventory.snapshot_id, job.request.catalog_ref)
             if isinstance(result, FailureInfo):
-                self.repository.fail(owner, job_id, result)
+                if edit:
+                    self.repository.release_edit(owner, job_id, edit.edit_id, result)
+                else:
+                    self.repository.fail(owner, job_id, result)
                 return
             # Store the canonical model revision before invoking deterministic projection.
             draft = ModelDraft.model_validate(result)
             if edit and draft.revision <= previous.model_draft.revision:
                 raise RuntimeError('Edit resume did not produce a new revision')
-            self.repository.save_model_draft(owner, job_id, draft)
+            # Edit revisions commit only with publish_edit, so failed attempts
+            # cannot leave a duplicate revision ahead of the published package.
+            if edit is None:
+                self.repository.save_model_draft(owner, job_id, draft)
             package = RoutingReviewPackage.model_validate(self.project(draft, inventory, job.request.catalog_ref))
             status = JobStatus.BLOCKED if any(f.severity == Severity.BLOCKER for f in package.findings) else JobStatus.AWAITING_REVIEW
             if edit:
@@ -185,5 +196,9 @@ class MappingService:
                 self.repository.publish(owner, job_id, package, status)
         except Exception:
             # Exceptions can contain provider requests, credentials or raw data.
-            self.repository.fail(owner, job_id, FailureInfo(
-                code='routing_failed', message='Routing could not complete. Create a new job to retry.', retryable=True))
+            if edit:
+                self.repository.release_edit(owner, job_id, edit.edit_id, FailureInfo(
+                    code='edit_resume_failed', message='Edit processing failed. Retry the same edit request.', retryable=True))
+            else:
+                self.repository.fail(owner, job_id, FailureInfo(
+                    code='routing_failed', message='Routing could not complete. Create a new job to retry.', retryable=True))

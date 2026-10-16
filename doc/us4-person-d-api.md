@@ -46,7 +46,7 @@ Table decisions do not remove findings or authorize warehouse execution.
 
 - `repository`: Person A adapter implementing `RoutingRepository` (see its
   atomicity requirements, especially `create_job`, `claim_job`, `publish`, and
-  `request_edit`, `claim_edit`, and `publish_edit`). Storage must persist model/mapping revisions, findings,
+  `request_edit`, `claim_edit`, `release_edit`, and `publish_edit`). Storage must persist model/mapping revisions, findings,
   coverage, decisions, failure and status; ownership applies to every lookup.
 - `inventory(owner, snapshot_id)`: authorize the immutable snapshot, then call
   A's inventory reader; return the canonical `InventoryView` or None.
@@ -82,7 +82,15 @@ before dispatch; `claim_edit` atomically moves it to `revising`. New edits while
 pending/revising are rejected (exact replays remain valid). A dispatch failure
 returns a safe 503 and retains the pending edit: retrying the same request
 re-enqueues it. Multiple queue deliveries are safe because claiming is atomic.
-The old package and unconsumed edit remain available if resume fails.
+If a resume returns FailureInfo or raises (including projection/publication
+failures), `release_edit` returns the matching unconsumed edit to `edit_requested`
+and records safe failure information. Replay the original PUT with the same
+Idempotency-Key and edit_id to requeue it. No automatic retry loop is started;
+provider retryable=false is retained as diagnostic information without making
+the recorded decision unreachable. The old package, model revision and edit
+audit stay unchanged. Edit model revisions commit atomically inside publish_edit,
+not before projection. Claim/publication clears the previous failure. A late
+release must not reopen a consumed edit or a different pending edit.
 
 PostgreSQL migrations, connection variables and fixture setup remain Person A's
 responsibility; this branch defines no replacement schema or database settings.
@@ -181,3 +189,20 @@ concurrent claim/replay, dispatch retry after app reconstruction, preservation o
 unrelated tables and decisions, background-thread resumes, and refusing to mark
 an edit applied if the workflow returns the old revision. Real persistence and
 graph integration remain dependent on the adapters; these are boundary tests.
+
+
+## Failed-edit recovery follow-up (2026-10-16)
+
+The repository adapter now implements `release_edit(owner, job_id, edit_id,
+failure)`: conditionally change revising to edit_requested for that unconsumed
+edit only. `publish_edit` must commit its model revision, package, final status
+and consumption marker together. The existing same-key PUT replay requeues
+pending work without adding an edit or revision.
+
+Verification: 57 backend tests passed. Added recovery regressions for typed
+failures (both retryable values), exceptions, projection failure and publication
+failure, followed by same-request retry through a reconstructed app. They verify
+unchanged audit/package/revision after failure, one successful revision after
+retry, preserved unrelated tables, cleared failure information, and no reopening
+of a consumed edit. Tests use the existing repository double; the production
+adapter must implement these atomic operations during integration.

@@ -18,6 +18,7 @@ class FakeRepository:
     def __init__(self):
         self.jobs, self.keys, self.packages, self.drafts, self.edits = {}, {}, {}, {}, {}
         self.edit_keys, self.pending, self.consumed = {}, {}, set()
+        self.edit_revision_writes = []
         self.lock = RLock()
 
     def find_job(self, owner, key):
@@ -58,7 +59,7 @@ class FakeRepository:
     def publish(self, owner, job_id, package, status):
         with self.lock:
             self.packages[job_id] = package.model_dump_json()
-            self.update(job_id, status=status)
+            self.update(job_id, status=status, failure=None)
 
     def fail(self, owner, job_id, failure):
         with self.lock:
@@ -99,12 +100,21 @@ class FakeRepository:
             job = self.get_job(owner, job_id)
             if not job or job.view.status != JobStatus.EDIT_REQUESTED:
                 return None
-            self.update(job_id, status=JobStatus.REVISING)
+            self.update(job_id, status=JobStatus.REVISING, failure=None)
             return self.pending[job_id]
+
+    def release_edit(self, owner, job_id, edit_id, failure):
+        with self.lock:
+            job = self.get_job(owner, job_id)
+            pending = self.pending.get(job_id)
+            if job and job.view.status == JobStatus.REVISING and pending and pending.edit_id == edit_id:
+                self.update(job_id, status=JobStatus.EDIT_REQUESTED, failure=failure)
 
     def publish_edit(self, owner, job_id, edit_id, package, status):
         with self.lock:
             assert self.pending[job_id].edit_id == edit_id
+            self.save_model_draft(owner, job_id, package.model_draft)
+            self.edit_revision_writes.append((job_id, package.model_draft.revision))
             self.publish(owner, job_id, package, status)
             self.consumed.add((job_id, edit_id))
             del self.pending[job_id]
@@ -398,7 +408,7 @@ def test_edit_resume_failure_does_not_publish_or_consume_edit(setup):
     service.resume_edit = lambda *args: FailureInfo(code='resume_failed', message='Unable to revise.', retryable=True)
     client.put(path + '/edits', headers={'Idempotency-Key': 'key'}, json={'edit_id': 'e', 'target': 'fact_orders', 'decision': 'reject'})
     service.execute(*queue.pop())
-    assert client.get(path).json['status'] == 'failed'
+    assert client.get(path).json['status'] == 'edit_requested'
     assert client.get(path + '/package').json['payload'] == before
     assert (job_id, 'e') not in repo.consumed
 
@@ -440,6 +450,59 @@ def test_edit_cannot_be_marked_applied_with_old_revision(setup):
     service.resume_edit = lambda job_id, package, edit: package.model_draft
     client.put(path + '/edits', headers={'Idempotency-Key': 'key'}, json={'edit_id': 'e', 'target': 'fact_orders', 'decision': 'reject'})
     service.execute(*queue.pop())
-    assert client.get(path).json['status'] == 'failed'
+    assert client.get(path).json['status'] == 'edit_requested'
     assert client.get(path + '/package').json['payload']['decisions'] == {}
     assert (job_id, 'e') not in repo.consumed
+
+
+@pytest.mark.parametrize('failure_stage', ['typed_retryable', 'typed_nonretryable', 'exception', 'projection', 'publication'])
+def test_failed_edit_retries_same_audit_and_publishes_exactly_once(setup, failure_stage):
+    repo, app, service, queue, client = setup
+    job_id = start(client).json['job_id']; service.execute(*queue.pop())
+    path = f'/api/mappings/jobs/{job_id}'
+    edit = {'edit_id': 'recover-me', 'target': 'fact_orders', 'decision': 'reject'}
+    headers = {'Idempotency-Key': 'original-request'}
+    original_package = repo.packages[job_id]
+    original_draft = repo.drafts[job_id]
+    first = client.put(path + '/edits', headers=headers, json=edit)
+    original_audit = dict(repo.edits)
+    def broken(*args):
+        raise RuntimeError('private provider detail')
+    publish = repo.publish_edit
+    if failure_stage.startswith('typed'):
+        service.resume_edit = lambda *args: FailureInfo(code='resume_failed', message='Resume failed.', retryable=failure_stage == 'typed_retryable')
+    elif failure_stage == 'exception':
+        service.resume_edit = broken
+    elif failure_stage == 'projection':
+        service.project = broken
+    else:
+        repo.publish_edit = broken
+    service.execute(*queue.pop())
+    failed = client.get(path)
+    assert failed.json['status'] == 'edit_requested'
+    assert failed.json['failure'] is not None and 'private' not in failed.text
+    assert repo.packages[job_id] == original_package
+    assert repo.drafts[job_id] == original_draft
+    assert repo.edits == original_audit and not repo.consumed
+    assert not repo.edit_revision_writes
+    repo.publish_edit = publish
+    # Reconstruct the application with healthy adapters, replay the exact request.
+    app2, worker, queue2 = make_app(repo)
+    client2 = client_for(app2)
+    replay = client2.put(path + '/edits', headers=headers, json=edit)
+    assert replay.status_code == 202
+    assert replay.json == {**first.json, 'replayed': True}
+    worker.execute(*queue2.pop())
+    worker.execute('demo', job_id)  # Duplicate queue delivery cannot reapply.
+    assert client2.get(path).json['failure'] is None
+    assert client2.get(path).json['status'] == 'blocked'
+    package = client2.get(path + '/package').json['payload']
+    assert package['decisions'] == {'fact_orders': 'reject'}
+    assert len(package['model_draft']['tables']) == 2
+    assert repo.edits == original_audit
+    assert repo.consumed == {(job_id, 'recover-me')}
+    assert repo.edit_revision_writes == [(job_id, 2)]
+    # Late error handling must not reopen an edit that already committed.
+    repo.release_edit('demo', job_id, 'recover-me', FailureInfo(code='late', message='Late failure.', retryable=True))
+    assert client2.get(path).json['status'] == 'blocked'
+    assert client2.get(path).json['failure'] is None
