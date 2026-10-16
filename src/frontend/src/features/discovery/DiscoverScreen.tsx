@@ -9,10 +9,12 @@ type Props = {
   onResample?: () => void
   onAdvance?: () => void
   refreshLabel?: string
+  advanceLabel?: string
+  advanceDisabled?: boolean
 }
 
 // The caller owns source selection, requests, permissions and snapshot persistence.
-export function DiscoverScreen({ sourceName, collectionName, state, onResample, onAdvance, refreshLabel = 'Re-sample' }: Props) {
+export function DiscoverScreen({ sourceName, collectionName, state, onResample, onAdvance, refreshLabel = 'Re-sample', advanceLabel, advanceDisabled }: Props) {
   const [search, setSearch] = useState('')
   const [typeFilter, setTypeFilter] = useState('')
   const [statusFilter, setStatusFilter] = useState('')
@@ -37,7 +39,7 @@ export function DiscoverScreen({ sourceName, collectionName, state, onResample, 
     <div className="fade-in" style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, background: T.bg }}>
       <PageHeader title="Schema Discovery" actions={<>
         <Btn onClick={onResample} disabled={!onResample || state.status === 'loading'}><Ico.Refresh />{state.status === 'loading' ? 'Loading…' : refreshLabel}</Btn>
-        <Btn variant="primary" onClick={onAdvance} disabled={!onAdvance || !result || result.fields.length === 0}><Ico.Sparkle />{onAdvance ? 'Run AI Routing' : 'Routing not connected'}</Btn>
+        <Btn variant="primary" onClick={onAdvance} disabled={!onAdvance || (advanceDisabled ?? (!result || result.fields.length === 0))}><Ico.Sparkle />{advanceLabel ?? (onAdvance ? 'Run AI Routing' : 'Routing not connected')}</Btn>
       </>} />
       <div style={{ padding: '12px 20px', flex: 1, minHeight: 0, overflowY: 'auto' }}>
         <div style={{ marginBottom: 12, color: T.text }}><strong>{sourceName}</strong> / {collectionName}</div>

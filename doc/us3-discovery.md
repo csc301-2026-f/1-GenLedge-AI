@@ -101,7 +101,7 @@ Raw previews can show sampledCount. Saved InventoryView has no sample count/meth
 
 DiscoveryPreview remains an isolated synthetic component using generated core payloads and initial/refreshed/empty/loading/error modes. It is no longer the connected App's default discovery host. The preserved standalone Frontend Demo is unchanged.
 
-Routing remains disconnected in this step: the live view's action is disabled rather than navigating to the still-mocked routing screen. The later job integration must pass the displayed persisted snapshot ID to the mapping job API.
+The live view submits the displayed persisted snapshot ID through the discovery-side routing handoff described below. It does not navigate to the mocked routing screen or render routing results.
 
 ## Shared inventory adapter
 
@@ -220,3 +220,24 @@ Flask reads the existing GENLEDGE_DATABASE_URL and GENLEDGE_DATABASE_SCHEMA sett
 Apply Person A's control-plane migrations separately before serving saved inventory. Its standalone migration command reads process environment, so export the settings as described in doc/us4-source-persistence.md; it does not automatically read Flask's .env. Auth tables/migrations remain separate. Startup does not create snapshots or seed another organization. A snapshot must have been published with the logged-in user's actual organization ID.
 
 The existing auth HOST/PORT/DATABASE/USER/PASSWORD configuration and its known generic USER environment-name collision are unchanged by this feature. The isolated verification process used its own synthetic auth/control configuration, not the team's .env or normal launcher.
+
+
+## Discovery-side routing handoff
+
+After loading a nonempty inventory, Submit snapshot to routing sends the shared CreateMappingJobRequest to POST /api/mappings/jobs. The request body is exactly:
+
+```json
+{"source_snapshot_id": "orders-v1"}
+```
+
+The ID comes from the loaded InventoryView, not from unsubmitted input text. Routing always receives the whole immutable snapshot; resource selection, search and type/status filters only change the displayed fields. No raw rows, sample values, organization identity, default snapshot or catalogue reference are submitted. Empty inventories cannot submit, including before any snapshot is loaded.
+
+The discovery client first obtains the existing /api/auth/csrf token, then sends credentials, X-CSRF-Token and Idempotency-Key with the POST. It accepts only a 202 response containing a nonempty job_id and a canonical JobStatus. The UI shows that receipt and the status reported at handoff. It does not poll, execute a graph, infer completion, fetch a review package or advance to the mocked routing/review screens. A failed job status is displayed as returned; it is not converted into success.
+
+A request is limited to 15 seconds across CSRF retrieval and job submission. Repeated clicks are guarded synchronously, and snapshot editing/loading/reloading is disabled during submission. Resources and filters remain usable because they do not change the snapshot. Network, authentication, API/configuration and malformed-response errors leave the discovered fields visible. A timeout may occur after the server created a job; cancellation never implies server rollback.
+
+The container retains one request key per loaded snapshot and any accepted receipt in memory. Retrying after an error, reloading that immutable snapshot, or switching resources preserves the key while this container stays mounted. After a receipt is accepted, the same snapshot cannot submit again in that container. Leaving Discovery or refreshing the page resets this state; this increment does not provide cross-page job restoration or durable client-side retry identity. Downstream idempotency enforcement belongs to the job API.
+
+### Downstream dependency
+
+PR18 at 79265992 defines the job-creation endpoint, but the US3 branch does not register that endpoint. Submitting against this branch alone therefore displays that the routing API is unavailable. PR18 still needs integration with current login/organization authorization, mutation CSRF protection and its US4 runtime dependencies. This handoff adds no US4 endpoint, runtime adapter, graph, repository change or mock server. A compatible configured API must be supplied by US4 before a real job can be created. No complete routing execution is established by the US3 handoff.

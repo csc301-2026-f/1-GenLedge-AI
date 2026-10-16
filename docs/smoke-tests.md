@@ -88,13 +88,13 @@ Expected: `added` contains `currency`; `missing` contains `paid`; `typeChanges` 
 Prepare an authorized synthetic snapshot using the publication steps below, configure/migrate the control store, and sign in to the working app with an application user in that same organization.
 
 - Action: Choose Discover from the source screen.
-  Expected: The saved snapshot ID form appears with no fabricated source/field data. Load and routing actions are disabled until their required inputs/integration exist.
+  Expected: The saved snapshot ID form appears with no fabricated source/field data. Load requires an ID; routing requires a loaded inventory containing fields.
 - Action: Enter a saved snapshot ID and load it.
   Expected: The displayed snapshot ID is the requested saved ID; resources and fields come from GET /api/sources/snapshots/<id>. Sampling count/method are reported as not recorded. Canonical types, native evidence, stored status and prepared samples appear without invented conversions.
 - Action: Search LINES and select the number type on the 14-field orders fixture.
   Expected: Only lines[].qty matches. Changing resource/snapshot resets filters; an unmatched query shows a no-match message.
 - Action: Load a multi-resource snapshot, select orders.lines[], then load an empty snapshot.
-  Expected: The correct resource fields are shown; empty resources show an explicit empty message. Routing stays disconnected.
+  Expected: The correct resource fields are shown; empty resources show an explicit empty message. An inventory with no fields cannot submit to routing.
 - Action: Edit the snapshot ID, load an unknown/other-organization ID, or stop only the disposable store and load an authorized ID.
   Expected: Old rows clear immediately; 404 or safe503 messages appear with no SQL/DSN/credential details. Reloading after recovery succeeds.
 - Action: Click Reload snapshot after a successful read.
@@ -181,3 +181,25 @@ No raw-source ingestion, HTTP API, browser wiring, sampling metadata persistence
   Expected: Explicit503 snapshot_not_configured or snapshot_unavailable, no secret-bearing response, and no-store headers. Unexpected failures are not converted into an apparent successful empty inventory.
 
 Keep all manual verification data in a disposable local store. Do not reuse team credentials or alter a shared database for these checks.
+
+
+## US3 discovery-side routing handoff
+
+These are manual integration checks to perform with a compatible downstream API. The US3-only branch has no mapping job endpoint; it should show an explicit unavailable message rather than simulated routing results.
+
+- Action: Open Discovery before loading a snapshot, or load an inventory with no fields.
+  Expected: Submit snapshot to routing is disabled. Typing an ID without loading does not enable it.
+- Action: Load an authorized nonempty snapshot and submit to routing on the US3-only branch.
+  Expected: The client reads /api/auth/csrf, then POSTs /api/mappings/jobs. Its missing endpoint produces an explicit error; the inventory remains visible and no mocked routing screen opens.
+- Action: With the compatible US4 API available, filter fields or change Resource, then submit.
+  Expected: The POST body contains only source_snapshot_id equal to the loaded inventory.snapshot_id, regardless of the current filters. Credentials, X-CSRF-Token and Idempotency-Key accompany the POST. The UI explains that the whole snapshot is submitted.
+- Action: Inspect controls while submission is pending and click repeatedly.
+  Expected: Snapshot editing, load/reload and submission are disabled; one request is active. Resource selection and filters remain available.
+- Action: Return a valid 202 job receipt from the downstream API.
+  Expected: The returned job ID/status are displayed as a handoff receipt, not completion/results. Further submission of that snapshot is disabled. No polling, review edits or graph execution is performed by US3.
+- Action: Make the downstream response fail or exceed 15 seconds, then retry without leaving Discovery; also reload the same snapshot after an error.
+  Expected: Errors do not erase fields. Timeout warns that the server may already have received the request. Retry uses the same Idempotency-Key for that snapshot, including after reload. The API owns actual deduplication.
+- Action: Inspect 401, 503, malformed/non-202 success responses and an invalid receipt.
+  Expected: An explicit error appears and no receipt is fabricated. A valid receipt with status failed displays failed, without claiming routing completion.
+
+Retry keys/receipts are held only for the current Discovery container. Leaving Discovery or refreshing clears them; this is not a durable job-restoration mechanism. Do not repeat ambiguous submissions across a page refresh assuming the same key will be restored. Real job creation/execution and these HTTP failure scenarios were not exercised in the handoff increment; its recorded checks are typecheck, build and source/diff review only.
