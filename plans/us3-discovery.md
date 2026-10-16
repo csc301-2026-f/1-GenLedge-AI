@@ -1,45 +1,61 @@
-# US3 source discovery implementation plan
+# US3 source discovery plan
 
-## Scope
+## Goal and current scope
 
-Implement pure Python discovery over parsed JSON-compatible records, a synthetic fixture, a versioned output contract, and sample-to-sample drift comparison. The code lives in `app/sources` and requires no Flask context or database. Source readers, authentication, persistence, HTTP routes, frontend integration, and AI tooling are separate integrations.
+Build structural discovery for parsed records, publish prepared inventory metadata, expose organization-scoped snapshot reads, and let the frontend inspect a saved snapshot and submit its ID to the routing API contract.
 
-## Acceptance criteria
+The implemented components do not yet form a complete upload-to-discovery workflow. Real source reading/re-sampling depends on US2; routing execution depends on US4. This plan tracks US3 work and its interfaces, without implementing those use cases.
 
-- Inspect at most 500 input records without consuming later records.
-- Report observed fields, nested paths, array element paths, types, nullable/repeating flags, and up to three distinct bounded sample values.
-- Preserve strings, including leading-zero identifiers and date text, and distinguish booleans from numbers.
-- Represent objects/arrays without copying their full contents into sample values.
-- Preserve input records and distinguish literal punctuation in field names from structural paths.
-- Compare discovery results by canonical path and report additions, fields missing from the new sample, and observed type changes without modifying mappings.
-- Keep the existing backend tests passing and document the input/output contract and remaining integration boundaries.
+Technical contracts, the finalized implementation record and historical verification are in [Source discovery](../doc/us3-discovery.md). Repeatable manual procedures are in [Smoke tests](../docs/smoke-tests.md). Earlier task-level plans are retained in Git history.
 
-## Sequence
+## Success criteria
 
-- [x] Run the current backend test baseline.
-- [x] Add synthetic discovery tests and confirm they fail because discovery is not implemented.
-- [x] Implement bounded discovery and document its contract; verify and commit the core.
-- [x] Add drift tests, implement comparison, and update documentation; verify the comparison feature.
-- [x] Inspect the final diff and save the finalized plan in `doc/`.
+- Inspect at most 500 parsed JSON-compatible records without reading beyond the bound or changing input values.
+- Report deterministic canonical paths, observed type unions, nullable/repeating flags and at most three bounded samples; preserve date text and leading-zero identifiers.
+- Compare observations by canonical path without deleting source fields or modifying mappings. Sample absence must not be presented as confirmed deletion.
+- Detect distinct valid DD/MM/YYYY and MM/DD/YYYY interpretations in slash dates without choosing a locale or converting values.
+- Adapt to the shared InventoryView with explicit source/resource/snapshot identity, conservative type projection, original type evidence and ambiguity.
+- Publish only after an explicit preparation policy; reuse existing scoped immutable persistence and return the actual saved snapshot ID after deduplication.
+- Read saved snapshots with login_required and server-derived organization scope. Unknown and foreign snapshots share 404; missing configuration/expected database failures produce safe 503 responses with no-store.
+- Validate consumed HTTP data and show loading/error/empty/ready states, resources, filters, samples and ambiguity. Reload must read the same snapshot, not claim to re-sample.
+- Submit only the loaded nonempty snapshot ID to the shared routing contract with credentials, CSRF and an idempotency key. Display an actual receipt/error without implying routing completion.
 
-## Contract decisions
+## Implemented work
 
-Records are already parsed dictionaries containing JSON values. Discovery performs structural type observation, not semantic type conversion. First-N sampling is reported as `head`. Canonical paths are local field references; global IDs and persisted snapshot IDs are supplied by a later integration contract. Dotted identifiers and `[]` represent nesting/repetition; other keys use JSON-quoted brackets so literal dots/brackets remain unambiguous.
+- [x] Bounded discovery, immutable output contract, canonical paths and synthetic fixtures.
+- [x] Sample-to-sample schema comparison and presentation support for changes.
+- [x] Conservative slash-date ambiguity detection and propagation/display.
+- [x] Shared inventory adapter, with no independent duplicate contract.
+- [x] Prepared snapshot publication using the existing repository.
+- [x] Authenticated organization-scoped saved-snapshot GET and API-driven frontend.
+- [x] Discovery-side routing request/receipt handling, isolated from US4 implementation.
 
-Nullable describes observed null/missing values, not a database constraint. Missing fields during comparison are sampling observations, not proof of source deletion. Samples are capped at three values per field and 80 characters per string; containers use size summaries. Results do not redact scalar values and must pass through the caller's access/redaction policy before exposure to a browser or LLM.
+## Documentation consolidation
 
-## Verification
+- [x] Inspect existing task plans, technical documentation, code and references.
+- [x] Consolidate current scope, decisions, completed work, dependencies and qualified verification in this plan and the technical document.
+- [x] Remove superseded task plans and duplicate finalized copies; preserve the manual checks and repair references.
+- [x] Review the documentation-only diff and prepare a function-based PR description.
 
-- Baseline: all 18 existing backend tests passed.
-- Before implementation, the discovery module's tests failed collection because `app.sources.discovery` did not exist.
-- Discovery core: 34 backend tests passed, including 16 discovery cases. Synthetic fixture smoke inspected three records and reported 14 fields. The core was committed as `07d778c`.
-- Before comparison implementation, comparison tests failed collection because `compare_discoveries` did not exist.
-- Final suite: 44 backend tests passed, including 26 US3 discovery/comparison cases. Command: `.venv/bin/python -m pytest tests -q -p no:cacheprovider` from `src/backend`.
-- Refresh smoke reported added `currency`, missing `paid`, and observed `total` types changing from null/number/string to string. No database or API service was involved.
-- `git diff --check` passed. Final scope review found no changes to frontend, authentication, startup scripts, database setup, README files, or historical deliverables.
+## Remaining US3 work and interfaces
 
-## Handoff
+| Work | Prerequisite | Intended outcome |
+| --- | --- | --- |
+| Source/resource selection | US2 exposes authorized listings or upload result identifiers | UI selects real data instead of requiring a manually supplied snapshot ID |
+| Fresh discovery orchestration | US2 provides an authorized bounded reader and stable source/resource/batch identity | Read a pinned batch, discover, prepare and publish, then return the actual saved ID |
+| Re-sample and drift flow | Fresh reader plus previous-version association and retained observation evidence | Compare old/new observations, show drift, preserve old snapshots and mapping references |
+| Sampling metadata | Agreed persistence/API extension | Preserve sample count/method and source batch association without inventing total counts |
+| Sample exposure | Agreed preparation policy | Expose only permitted metadata/sample values; the current helper requires an explicit callback |
+| Downstream field semantics | US4 agrees resource scope, nested arrays and literal-key path support | Shared FieldRef values retain the same meaning across modules |
 
-Entry points are `discover_records` and `compare_discoveries` in `app.sources.discovery`. Input/output semantics and integration requirements are documented in `doc/us3-discovery.md`; repeatable fixture checks are in `docs/smoke-tests.md`.
+## Ownership boundaries
 
-Next integration work requires an authorized collection sample reader, stable collection/field identity policy, schema snapshot persistence/versioning, and an agreed UI/API contract. This change implements the independent US3 core; it does not claim the complete source-to-UI workflow or full harness profiling is implemented.
+- US1 supplies authenticated identity, organization scope, CSRF and role/session policy. US3 reuses these helpers.
+- US2 owns parsing and persistent raw storage. An upload batch and a schema snapshot are different artifacts; US3 must pin the intended batch and avoid reading another organization or a changing source version.
+- Shared persistence already provides inventory transactions, scoped reads, deduplication and immutability. Control and auth migrations remain separate; application startup does not migrate/seed inventory.
+- US4 owns the mapping job API, durable idempotency, authorization and configured execution runtime. This branch has only its client-side request consumer, not a working endpoint/graph.
+- US5 owns reviewer-controlled ambiguity/mapping decisions; US6 applies approved transformation rules. US3 only reports observed evidence.
+
+## Verification approach and limits
+
+The finalized evidence table in the technical document distinguishes earlier automated core checks, manual PostgreSQL/API/browser inspection and frontend build checks. Historical results are not a current full-suite pass. The routing request has not been verified against a real job API. This documentation change runs no tests or build; checks are limited to diff scope, whitespace, surviving references and PR description consistency.

@@ -1,10 +1,16 @@
 # US3 — Source discovery
 
-## Scope and entry point
+## Current scope
 
-`app.sources.discovery.discover_records(records, sample_limit=500)` performs structural discovery over parsed JSON-compatible records. It needs no Flask context, database, credentials, or LLM. It observes fields without converting values or modifying the input.
+US3 contains structural discovery and comparison functions, date ambiguity evidence, an adapter to the shared InventoryView, a prepared snapshot publication helper, an authenticated saved-snapshot GET, an API-driven discovery screen, and a client-side routing handoff. The control database stores inventory metadata; raw upload persistence is not implemented by US3.
 
-This module supplies the independent US3 discovery core. Source selection, authorized reading, persisted schema snapshots, re-sample endpoints, and frontend integration are separate work. It does not implement the full profiling/tool layer described in the harness architecture.
+The connected frontend currently loads an already published snapshot by ID. It does not yet discover a real uploaded source or re-sample it. The routing client consumes the shared job-creation contract, but this branch has no mapping job endpoint or execution runtime.
+
+The maintained [US3 plan](../plans/us3-discovery.md) tracks remaining work. [Smoke tests](../docs/smoke-tests.md) contain executable examples and manual procedures. The finalized implementation record and verification limits are at the end of this document.
+
+## Entry point
+
+`app.sources.discovery.discover_records(records, sample_limit=500)` performs structural discovery over parsed JSON-compatible records. The core needs no Flask context, database, credentials or LLM. It observes fields without converting values or modifying the input. Snapshot publication and authenticated reads use the existing shared persistence/authentication modules.
 
 ## Input
 
@@ -74,23 +80,6 @@ It returns immutable `DiscoveryChanges` with `added_paths`, `missing_paths`, and
 
 This is a sample-to-sample comparison. `missing` means not observed in the current sample, not confirmed deletion from the full source. Types describe observed values, not a declared database schema. Changes in values, sample order, or nullable flags alone do not change canonical path identity or produce a type change. The function neither deletes field references nor changes mappings; persistence/review must preserve and display references to paths no longer observed.
 
-## Integration handoff
-
-The core receives records after authorized source reading. The integration must pin a source/collection/batch, attach the discovery result to a schema snapshot, and retain previous field references for existing mappings. An upload batch manifest and a discovery schema snapshot are different artifacts.
-
-Before connecting the UI or AI harness, agree on the sample reader, stable global IDs, persistence/versioning, access/redaction policy, and error envelope. The module does not create alternate versions of teammates' source entities, auth helpers, or storage adapters.
-
-## Verification
-
-From `src/backend`, run:
-
-```bash
-.venv/bin/python -m pytest tests/test_discovery.py tests/test_discovery_changes.py -q
-.venv/bin/python -m pytest tests -q
-```
-
-The fixtures `tests/fixtures/us3/orders.json` and `orders-refreshed.json` contain synthetic nested orders. Their comparison reports added `currency`, missing `paid`, and changed observed types for `total`. Tests cover mixed types, missing/null values, arrays, sampling bounds, bounded samples, literal punctuation in keys, input preservation, deterministic comparisons, and JSON serialization.
-
 ## Frontend presentation
 
 The connected App now uses DiscoveryContainer to load a saved snapshot by ID from the authenticated API. It shows idle/loading/error/ready states, selects resources returned by that snapshot, clears stale results when the ID changes, cancels replaced/unmounted requests and bounds requests to 15 seconds. Reload snapshot re-reads the same immutable artifact; it does not sample a source or publish a new snapshot.
@@ -154,7 +143,7 @@ This detector is deliberately narrow: hyphen/dot separators, two-digit years, ti
 
 ## Snapshot publication
 
-`app.sources.snapshot_service.publish_discovery` connects an existing DiscoveryResult to the inventory adapter and Person A's InventoryRepository. Supply the configured repository, server-authorized organization/source identity, candidate snapshot/resource metadata, and an explicit prepare_inventory callback. The function does not open a second storage implementation or infer identity from request data.
+`app.sources.snapshot_service.publish_discovery` connects an existing DiscoveryResult to the inventory adapter and the shared InventoryRepository. Supply the configured repository, server-authorized organization/source identity, candidate snapshot/resource metadata, and an explicit prepare_inventory callback. The function does not open a second storage implementation or infer identity from request data.
 
 ```python
 from app.common.database import Database
@@ -190,7 +179,7 @@ Repository fingerprinting applies to prepared inventory, including resource meta
 
 Use InventoryService(repository, organization_id=authorized_organization_id).get_inventory(saved.snapshot_id) for application reads. The global unscoped inventory helper is for trusted workers. Source authorization and choosing the correct organization's fixture remain the application's responsibility; the service is not a public HTTP boundary.
 
-The persistence-only dependency retains Person A's original commits through 45e81f2. Its source repository, database adapter and migrations match the newer combined persistence branch at integration time, without importing that branch's LangGraph merge. Configure and migrate the control database using doc/us4-source-persistence.md; auth and control-plane migration histories remain separate. Neither importing nor calling this helper applies migrations automatically.
+The shared contracts and persistence dependency were integrated with their original contributor history; no graph implementation is included. Configure and migrate the control database using [Source persistence](us4-source-persistence.md). Auth and control-plane migration histories remain separate. Neither importing nor calling this helper applies migrations automatically.
 
 ## Saved snapshot HTTP API
 
@@ -217,12 +206,12 @@ The client sends credentials and validates the response's major contract version
 
 Flask reads the existing GENLEDGE_DATABASE_URL and GENLEDGE_DATABASE_SCHEMA settings from its private .env or process environment, with process values taking precedence. The optional .env.example fields contain no credentials. Use the assigned developer database, a PostgreSQL/psycopg DSN with the required TLS settings, and the existing dedicated control schema (default genledge_control). No fallback to an unrelated auth/demo database is introduced.
 
-Apply Person A's control-plane migrations separately before serving saved inventory. Its standalone migration command reads process environment, so export the settings as described in doc/us4-source-persistence.md; it does not automatically read Flask's .env. Auth tables/migrations remain separate. Startup does not create snapshots or seed another organization. A snapshot must have been published with the logged-in user's actual organization ID.
+Apply the shared control-plane migrations separately before serving saved inventory. Its standalone migration command reads process environment, so export the settings as described in [Source persistence](us4-source-persistence.md); it does not automatically read Flask's .env. Auth tables/migrations remain separate. Startup does not create snapshots or seed another organization. A snapshot must have been published with the logged-in user's actual organization ID.
 
 The existing auth HOST/PORT/DATABASE/USER/PASSWORD configuration and its known generic USER environment-name collision are unchanged by this feature. The isolated verification process used its own synthetic auth/control configuration, not the team's .env or normal launcher.
 
 
-## Discovery-side routing handoff
+## Routing handoff
 
 After loading a nonempty inventory, Submit snapshot to routing sends the shared CreateMappingJobRequest to POST /api/mappings/jobs. The request body is exactly:
 
@@ -240,4 +229,51 @@ The container retains one request key per loaded snapshot and any accepted recei
 
 ### Downstream dependency
 
-PR18 at 79265992 defines the job-creation endpoint, but the US3 branch does not register that endpoint. Submitting against this branch alone therefore displays that the routing API is unavailable. PR18 still needs integration with current login/organization authorization, mutation CSRF protection and its US4 runtime dependencies. This handoff adds no US4 endpoint, runtime adapter, graph, repository change or mock server. A compatible configured API must be supplied by US4 before a real job can be created. No complete routing execution is established by the US3 handoff.
+[PR18](https://github.com/csc301-2026-f/1-GenLedge-AI/pull/18), inspected at 79265992, defines the downstream job-creation endpoint. This branch does not register it, so submission here alone reports an unavailable API. US4 must supply compatible login/organization authorization, mutation CSRF protection and a configured runtime before a real job can be created. The US3 client does not implement that endpoint, a graph or a mock server.
+
+
+## Integration dependencies and remaining work
+
+| Boundary | Required interface or decision | Current US3 behavior |
+| --- | --- | --- |
+| US1 identity | Authenticated user, organization scope, CSRF and agreed roles | Reuses login_required/g.user and CSRF; does not change role/session policy |
+| US2 source access | Authorized bounded reader; stable source/resource identifiers and pinned batch/version | Accepts parsed records internally; no real reader, source listing or fresh-discovery endpoint |
+| Raw storage | US2 persists the upload and can read the requested batch | Control PostgreSQL holds inventory metadata, not the source records |
+| Snapshot identity | Associate upload batches and previous observations with discovery metadata | Returns the repository's actual saved ID; no batch association or latest pointer is added |
+| Re-sampling/drift | Reader, previous-version association and retained observation evidence | Pure comparison and presentation exist; real refresh/publish workflow is not wired |
+| Sample exposure | Agreed organization access and sample preparation policy | Explicit preparation callback required; scalar discovery samples are not inherently redacted |
+| US4 field semantics | Agree resource grain, repeating-array extraction and downstream literal-key/Unicode path support | Preserves canonical paths in one caller-scoped resource; does not silently relabel/split them |
+| US4 execution | Authenticated, organization-scoped/CSRF-protected job API and configured runtime | Client request/receipt handling only; no polling, review UI or graph integration |
+| US5/US6 review and execution | Reviewer chooses date interpretation and downstream applies approved rules | Reports ambiguity without resolving it or changing source values |
+
+Next US3 implementation should connect the agreed US2 reader to discover_records, preparation and publish_discovery, return the saved ID to the UI, then add authorized re-sampling and drift display. An upload batch manifest and a schema snapshot are different artifacts. Stable identity must not be derived from row position or sample values, and refresh must retain prior snapshot/mapping references.
+
+## Finalized implementation plan
+
+The implemented slice follows this sequence; outstanding integration remains in the dependency table above and the maintained plan.
+
+- [x] Observe bounded parsed records and compare canonical field/type observations.
+- [x] Preserve structural values/types, flag narrow slash-date ambiguity, and adapt to the shared InventoryView.
+- [x] Require explicit sample preparation and publish metadata through existing immutable scoped persistence.
+- [x] Expose authenticated saved-snapshot reads and render actual API data with resource selection, filters and safe errors.
+- [x] Submit only the loaded snapshot ID through the routing contract, retaining request identity while the discovery container stays mounted.
+- [x] Consolidate the task-level plans into one maintained story plan and this finalized technical record; retain manual procedures separately.
+
+No complete upload-to-discovery or routing-execution workflow is claimed by this slice. Each component's behavior and limits are documented above. Earlier task plans and their implementation history remain available in Git.
+
+## Verification record
+
+These are previously performed checks, not tests rerun during documentation consolidation.
+
+| Area | Recorded evidence | Limits |
+| --- | --- | --- |
+| Original discovery/comparison | 44 backend tests passed, including 26 US3 cases; synthetic orders produced 14 fields and refresh showed currency added, paid missing and total type changes | Predates the latest main/dependency synchronization; not a current full-suite result |
+| Inventory/date evidence | Manual mixed/null-only/nullable type projection, sample JSON distinctions, literal-key paths, shared-contract round-trip, valid/invalid date cases, ambiguity beyond three display samples and unread 501st record | Synthetic parsed inputs, without live source readers or reviewer resolution |
+| Snapshot publication | Disposable Unix-socket-only PostgreSQL 16.14 save/read, canonical-ID deduplication, immutable new versions, scoped read/write rejection, occupied-ID conflict, sealed-field rejection, preparation failure, restart read and repeat migration | Synthetic local metadata; no team database or real raw storage |
+| Snapshot HTTP/UI | Real browser login through Vite proxy to Flask and disposable PostgreSQL; 14 fields, date warning, canonical/native types, prepared samples, search/filter, multi-resource 8/6/4 fields, empty/error states, immutable reload and database 503/recovery | Isolated synthetic users/data; normal team launcher/host and PostgreSQL 17 were not verified |
+| API access/errors | Anonymous 401, own 200, identical missing/cross-org 404 including forged organization query, logout then 401, no-store and missing-configuration 503 | Unexpected network bodies and timeout/race fault injection were not exercised |
+| Routing client | TypeScript check, Vite production build, source/contract review and whitespace check | No browser/HTTP job success, real execution or timeout fault injection; no downstream endpoint in this branch |
+
+Python compilation and frontend TypeScript/build checks passed during the relevant implementation work. The full automated suite was not rerun after the original core stage; later work did not add or run new automated tests. Temporary databases, servers and synthetic users used for manual inspection were cleaned up; no team credentials or existing databases were used. Existing tests/fixtures and repeatable manual procedures are linked from [Smoke tests](../docs/smoke-tests.md).
+
+Documentation consolidation changes no runtime code. Its checks cover Markdown references, whitespace, current status consistency and the documentation-only Git diff.

@@ -51,6 +51,8 @@ Setup commands and interface examples are in
 
 ## US3 discovery core
 
+US3 contracts, current scope and recorded verification are in [Source discovery](../doc/us3-discovery.md). Remaining implementation work is tracked in the [US3 plan](../plans/us3-discovery.md). The procedures below are instructions, not a claim that every check has been run on the current branch.
+
 From `src/backend`, run the synthetic fixture through discovery:
 
 ```bash
@@ -82,6 +84,14 @@ PYTHON
 ```
 
 Expected: `added` contains `currency`; `missing` contains `paid`; `typeChanges` reports `total` changing from null/number/string to string. These are sample observations; the comparison does not delete source fields or mappings.
+
+Existing automated core checks can be run separately from `src/backend`:
+
+```bash
+.venv/bin/python -m pytest tests/test_discovery.py tests/test_discovery_changes.py -q
+```
+
+The full backend suite is `.venv/bin/python -m pytest tests -q`; consult the persistence setup above before running database-dependent checks. The historical core result predates later dependency integration and does not establish a current full-suite pass.
 
 ## US3 saved snapshot presentation
 
