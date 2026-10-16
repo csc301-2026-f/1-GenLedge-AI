@@ -44,3 +44,17 @@ Browser setup from `src/frontend`: `pnpm install --frozen-lockfile`, then
 `pnpm exec playwright install chromium` and `pnpm test:routing`. An installed
 Chrome may instead be selected with `CHROME_BIN`; no global Playwright package
 or NODE_PATH is required.
+
+- Action: Cause edit processing to fail, then refresh the routing page.
+  Expected: The server's failure message and **Retry edit** appear. Published
+  decisions remain unchanged, and new Accept/Reject actions remain disabled.
+- Action: Click **Retry edit**; interrupt its response, refresh and retry again.
+  Expected: Every PUT uses the same edit ID, body and Idempotency-Key. No POST
+  creates a replacement job. On success, the original job shows the applied
+  decision and unrelated tables remain intact.
+- Action: Simulate a 503 dispatch error after recording an edit, then refresh.
+  Expected: **Retry edit** remains available even if status is edit_requested
+  without a server failure message.
+- Action: Submit an edit that receives a validation rejection (400/422).
+  Expected: The error is shown and other decision controls become usable;
+  refresh does not restore a permanently rejected pending request.

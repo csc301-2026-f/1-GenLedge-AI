@@ -109,8 +109,9 @@ retry and connection-error states. Lifecycle pills have deliberate colors and
 readable labels. Decision controls are disabled until edits finish.
 `ROUTE_DATA` is removed from the live routing screen. The standalone demo is intact.
 
-Session storage contains job/request IDs scoped to the login, never review
-packages. Refresh restores the job and reads its current server state. Network
+Session storage contains job/request IDs and the minimal pending edit request
+(edit ID, header key, target table, decision and confirmation state), scoped to
+the login/job; it never contains review packages. Refresh restores the job and reads its current server state. Network
 retries retain idempotency IDs; a new decision intent receives a fresh edit ID.
 If session storage is disabled, IDs survive only within the current page lifetime.
 The US4 screen does not advance into the still-mocked US5 Mapping Studio.
@@ -206,3 +207,34 @@ unchanged audit/package/revision after failure, one successful revision after
 retry, preserved unrelated tables, cleared failure information, and no reopening
 of a consumed edit. Tests use the existing repository double; the production
 adapter must implement these atomic operations during integration.
+
+
+## Frontend edit recovery follow-up (2026-10-16)
+
+A failed pending edit displays the safe server error and **Retry edit**. The
+client persists the exact request before sending it, then reuses its edit ID,
+Idempotency-Key, target and decision on every recovery attempt, including after
+refresh. An unconfirmed submission (lost response, network or dispatch failure)
+also retains a retry action after refresh even when the job has no failure field.
+Retry edit uses PUT on the existing job; it never creates a new job.
+
+Published decisions remain visible and new decisions stay disabled until the
+pending request is resolved. Polls that began before a submission cannot clear
+its saved request. Once the published package confirms the decision in a reviewable
+state, its pending record clears; the original successful receipt key remains
+available for idempotent re-submission. Definitive HTTP 400/422 rejections clear
+the pending record so users can continue reviewing. Retry uses no automatically
+regenerated ID. If browser storage is missing or disabled across refresh, the UI
+reports that the original tab/request is required instead of inventing a retry.
+
+The browser smoke covers worker failure, refresh, a failed retry, another refresh,
+successful retry, original body/header reuse, no duplicate job/edit, unchanged
+published decisions until success, dispatch failure without server FailureInfo,
+and validation rejection without locked controls. These HTTP fixture checks
+complement the backend's repository-boundary tests; real A/B/C integration is
+still required to certify production persistence and graph behavior.
+
+Verification for this frontend follow-up: 57 backend tests passed, TypeScript
+check and production build passed, and the expanded `pnpm test:routing` passed
+with project-declared Playwright and installed Chrome. No dependency changes
+were required. The production A/B/C integration limitation above still applies.

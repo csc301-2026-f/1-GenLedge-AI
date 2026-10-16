@@ -15,10 +15,12 @@ const root = path.resolve(__dirname, '..');
     const errors = []; page.on('pageerror', e => errors.push(e.message));
     let user = null, status = 'queued', attempts = [], edits = [], failFirst = true;
     let modelMode = 'fake', pendingEdit = null, loseEditResponse = true;
+    let editFailure = null, failNextEditRetry = false, recoveredEdits = 0;
+    let failNextDispatch = false, rejectNextEdit = false;
     const editHeaders = [];
     function finishEdit() {
       packageData.decisions[pendingEdit.target] = pendingEdit.decision;
-      pendingEdit = null; status = 'blocked';
+      pendingEdit = null; editFailure = null; status = 'blocked';
     }
     const packageData = {
       contract_version: '1',
@@ -43,15 +45,27 @@ const root = path.resolve(__dirname, '..');
         const edit = req.postDataJSON(); edits.push(edit);
         const key = req.headers()['idempotency-key']; editHeaders.push(key);
         if (!key) return send(400, { error: { message: 'Idempotency-Key required.' } });
-        if (receipts.has(key)) return send(202, { ...receipts.get(key), replayed: true });
+        if (rejectNextEdit) {
+          rejectNextEdit = false;
+          return send(422, { error: { message: 'This decision was not recorded.' } });
+        }
+        if (receipts.has(key)) {
+          if (failNextEditRetry) { failNextEditRetry = false; return route.abort(); }
+          if (pendingEdit && editFailure) { editFailure = null; recoveredEdits += 1; }
+          return send(202, { ...receipts.get(key), replayed: true });
+        }
         pendingEdit = edit; status = 'edit_requested';
         const receipt = { job_id: 'job-1', edit_id: edit.edit_id, status, payload: null, replayed: false };
         receipts.set(key, receipt);
         if (loseEditResponse) { loseEditResponse = false; return route.abort(); }
+        if (failNextDispatch) {
+          failNextDispatch = false;
+          return send(503, { error: { message: 'Worker dispatch is temporarily unavailable.' } });
+        }
         return send(202, receipt);
       }
-      if (url.endsWith('/package')) return send(200, { status, failure: status === 'failed' ? { code: 'routing_failed', message: 'Routing failed.', retryable: true } : null, payload: ['queued', 'running', 'failed'].includes(status) ? null : packageData });
-      return send(200, { job_id: 'job-1', status, source_snapshot_id: 'snapshot-1', model_mode: modelMode, failure: null });
+      if (url.endsWith('/package')) return send(200, { status, failure: status === 'failed' ? { code: 'routing_failed', message: 'Routing failed.', retryable: true } : editFailure, payload: ['queued', 'running', 'failed'].includes(status) ? null : packageData });
+      return send(200, { job_id: 'job-1', status, source_snapshot_id: 'snapshot-1', model_mode: modelMode, failure: editFailure });
     });
     await page.goto(server.resolvedUrls.local[0]);
     await page.locator('input[type=email]').fill('demo');
@@ -85,10 +99,11 @@ const root = path.resolve(__dirname, '..');
     assert.match(await orders.innerText(), /90%/);
     await orders.getByRole('button', { name: 'Reject', exact: true }).click();
     await page.getByRole('alert').filter({ hasText: 'Unable to connect' }).waitFor();
-    await orders.getByRole('button', { name: 'Reject', exact: true }).click();
+    await page.getByRole('button', { name: 'Retry edit', exact: true }).click();
     await page.getByText('Your edit is pending.', { exact: false }).waitFor();
     assert.equal(editHeaders[0], editHeaders[1]);
     assert.equal(editHeaders[0], edits[0].edit_id);
+    assert.deepEqual(edits[0], edits[1]);
     const pendingColor = await page.getByText('Edit requested', { exact: true }).evaluate(el => getComputedStyle(el).backgroundColor);
     assert.equal(new Set([queuedColor, waitingColor, blockedColor, pendingColor]).size, 4);
     assert.equal(await orders.getByRole('button', { name: 'Accept', exact: true }).isDisabled(), true);
@@ -99,6 +114,40 @@ const root = path.resolve(__dirname, '..');
     await orders.getByText('reject', { exact: true }).waitFor();
     await lines.getByRole('button', { name: 'Accept', exact: true }).click();
     await page.getByText('Your edit is pending.', { exact: false }).waitFor();
+    const failedEditIndex = edits.length - 1;
+    const publishedBeforeFailure = JSON.stringify(packageData);
+    const creationAttemptsBeforeRecovery = attempts.length;
+    editFailure = { code: 'resume_failed', message: 'Temporary model failure while applying your edit.', retryable: true };
+    await page.getByRole('alert').filter({ hasText: editFailure.message }).waitFor();
+    await page.getByRole('button', { name: 'Retry edit', exact: true }).waitFor();
+    assert.equal(await page.getByRole('button', { name: 'Retry routing', exact: true }).count(), 0);
+    assert.equal(await lines.getByRole('button', { name: 'Accept', exact: true }).isDisabled(), true);
+    assert.equal(await orders.getByRole('button', { name: 'Reject', exact: true }).isDisabled(), true);
+    await orders.getByText('reject', { exact: true }).waitFor();
+    await lines.getByText('Not reviewed', { exact: true }).waitFor();
+    await page.reload();
+    await page.getByRole('alert').filter({ hasText: editFailure.message }).waitFor();
+    await page.getByRole('button', { name: 'Retry edit', exact: true }).waitFor();
+    failNextEditRetry = true;
+    await page.getByRole('button', { name: 'Retry edit', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: 'Unable to connect' }).waitFor();
+    assert.deepEqual(edits.at(-1), edits[failedEditIndex]);
+    assert.equal(editHeaders.at(-1), editHeaders[failedEditIndex]);
+    assert.equal(recoveredEdits, 0);
+    assert.equal(JSON.stringify(packageData), publishedBeforeFailure);
+    // A failed retry must not discard the saved request. Refresh and try again.
+    await page.reload();
+    await page.getByRole('alert').filter({ hasText: editFailure.message }).waitFor();
+    await page.getByRole('button', { name: 'Retry edit', exact: true }).click();
+    await page.getByText('Your edit is pending.', { exact: false }).waitFor();
+    assert.deepEqual(edits.at(-1), edits[failedEditIndex]);
+    assert.equal(editHeaders.at(-1), editHeaders[failedEditIndex]);
+    assert.equal(recoveredEdits, 1);
+    assert.equal(receipts.size, 2); // Retries preserve the same two recorded edits.
+    assert.equal(attempts.length, creationAttemptsBeforeRecovery); // Recovery resumes this job.
+    assert.equal(JSON.stringify(packageData), publishedBeforeFailure);
+    await orders.getByText('reject', { exact: true }).waitFor();
+    await lines.getByText('Not reviewed', { exact: true }).waitFor();
     finishEdit();
     await page.waitForFunction(() => document.querySelector('section[aria-label="fact_lines"]').textContent.includes('Decision: accept'));
     await page.reload();
@@ -106,14 +155,56 @@ const root = path.resolve(__dirname, '..');
     await lines.getByText('accept', { exact: true }).waitFor();
     await orders.getByRole('button', { name: 'Reject', exact: true }).click();
     await page.getByText('Edit already submitted; replay confirmed.', { exact: true }).waitFor();
-    assert.equal(edits[0].edit_id, edits[3].edit_id);
-    assert.equal(editHeaders[0], editHeaders[3]);
+    assert.equal(edits[0].edit_id, edits.at(-1).edit_id);
+    assert.equal(editHeaders[0], editHeaders.at(-1));
     await lines.getByText('accept', { exact: true }).waitFor(); // Old receipt must not replace current package.
+
+    // A dispatch failure can leave a recorded edit queued with no worker failure.
+    // Its uncertain request must remain retryable after refresh as well.
+    const receiptsBeforeDispatch = receipts.size;
+    const publishedBeforeDispatch = JSON.stringify(packageData);
+    failNextDispatch = true;
+    await orders.getByRole('button', { name: 'Accept', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: 'Worker dispatch is temporarily unavailable.' }).waitFor();
+    const dispatchEditIndex = edits.length - 1;
+    assert.equal(status, 'edit_requested');
+    assert.equal(editFailure, null);
+    assert.equal(receipts.size, receiptsBeforeDispatch + 1);
+    await page.reload();
+    await page.getByText('Edit requested', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Retry edit', exact: true }).waitFor();
+    assert.equal(await orders.getByRole('button', { name: 'Accept', exact: true }).isDisabled(), true);
+    await orders.getByText('reject', { exact: true }).waitFor();
+    await lines.getByText('accept', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Retry edit', exact: true }).click();
+    await page.getByRole('button', { name: 'Retry edit', exact: true }).waitFor({ state: 'hidden' });
+    await page.getByText('Your edit is pending.', { exact: false }).waitFor();
+    assert.deepEqual(edits.at(-1), edits[dispatchEditIndex]);
+    assert.equal(editHeaders.at(-1), editHeaders[dispatchEditIndex]);
+    assert.equal(receipts.size, receiptsBeforeDispatch + 1);
+    assert.equal(attempts.length, creationAttemptsBeforeRecovery);
+    assert.equal(JSON.stringify(packageData), publishedBeforeDispatch);
+    finishEdit();
+    await orders.getByText('accept', { exact: true }).waitFor();
+
+    // A definite validation rejection does not leave an uncertain edit or lock
+    // the page into replaying a request that the server never accepted.
+    const receiptsBeforeRejection = receipts.size;
+    rejectNextEdit = true;
+    await lines.getByRole('button', { name: 'Reject', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: 'This decision was not recorded.' }).waitFor();
+    assert.equal(receipts.size, receiptsBeforeRejection);
+    assert.equal(await lines.getByRole('button', { name: 'Reject', exact: true }).isEnabled(), true);
+    assert.equal(await page.getByRole('button', { name: 'Retry edit', exact: true }).count(), 0);
+    await page.reload();
+    await lines.getByText('accept', { exact: true }).waitFor();
+    assert.equal(await lines.getByRole('button', { name: 'Reject', exact: true }).isEnabled(), true);
+    assert.equal(await page.getByRole('button', { name: 'Retry edit', exact: true }).count(), 0);
     modelMode = 'live'; status = 'failed';
     await page.reload();
     await page.getByRole('button', { name: 'Retry routing', exact: true }).waitFor();
     await page.getByText('live', { exact: true }).waitFor();
     assert.deepEqual(errors, []);
-    console.log('Routing browser smoke passed: login, creation/edit network retries, lifecycle colors, pending edits, disabled controls, refresh, async completion, replay, live mode, failure state. HTTP fixtures only.');
+    console.log('Routing browser smoke passed: login, creation/edit network retries, lifecycle colors, failed-edit recovery across refresh and retry failure, queued dispatch failure recovery, validation rejection, unchanged published decisions until completion, idempotent replay, live mode, failure state. HTTP fixtures only.');
   } finally { if (browser) await browser.close(); await server.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

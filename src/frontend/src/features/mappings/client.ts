@@ -43,9 +43,9 @@ export async function readPackage(id: string): Promise<PackageResponse> {
   if (result.payload && result.payload.contract_version.split('.')[0] !== '1') throw new Error('Unsupported routing package version.')
   return result
 }
-export const editJob = (id: string, edit_id: string, target: string, decision: Decision) => request<{ job_id: string; edit_id: string; status: JobStatus; replayed: boolean }>(`/${encodeURIComponent(id)}/edits`, 'PUT', { edit_id, target, decision }, edit_id)
+export const editJob = (id: string, edit_id: string, target: string, decision: Decision, idempotencyKey = edit_id) => request<{ job_id: string; edit_id: string; status: JobStatus; replayed: boolean }>(`/${encodeURIComponent(id)}/edits`, 'PUT', { edit_id, target, decision }, idempotencyKey)
 
-// Only opaque request/job identifiers are retained in this tab, never packages or credentials.
+// This tab retains request IDs and minimal pending edit intent, never packages or credentials.
 const fallbackStorage = new Map<string, string>()
 export function stored(key: string): string | null {
   try { return sessionStorage.getItem(`routing:${key}`) ?? fallbackStorage.get(key) ?? null } catch { return fallbackStorage.get(key) ?? null }
