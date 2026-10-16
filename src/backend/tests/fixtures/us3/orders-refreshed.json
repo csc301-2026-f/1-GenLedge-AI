@@ -1,0 +1,54 @@
+[
+  {
+    "order_no": "ORD-001",
+    "customer_code": "00123",
+    "order_date": "03/04/2026",
+    "total": "120.50",
+    "shipping_address": {
+      "city": "Toronto",
+      "zip": "M5V"
+    },
+    "lines": [
+      {
+        "sku": "SKU-001",
+        "qty": 2
+      },
+      {
+        "sku": "SKU-002"
+      }
+    ],
+    "tags": [
+      "rush",
+      "retail"
+    ],
+    "currency": "CAD"
+  },
+  {
+    "order_no": "ORD-002",
+    "customer_code": "00456",
+    "order_date": "04/05/2026",
+    "total": "99.00",
+    "shipping_address": {
+      "city": "Ottawa"
+    },
+    "lines": [
+      {
+        "sku": "SKU-003",
+        "qty": 1
+      }
+    ],
+    "tags": [],
+    "currency": "CAD"
+  },
+  {
+    "order_no": "ORD-003",
+    "customer_code": "00789",
+    "order_date": "2026-10-12",
+    "total": "0.00",
+    "lines": [],
+    "tags": [
+      "retail"
+    ],
+    "currency": "CAD"
+  }
+]

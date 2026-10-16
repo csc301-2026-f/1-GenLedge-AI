@@ -4,7 +4,7 @@ import type { Screen, Nav } from './app/types'
 import { TopBar, Sidebar } from './shared'
 import { LoginScreen } from './features/auth/LoginScreen'
 import { SourcesScreen } from './features/sources/SourcesScreen'
-import { DiscoverScreen } from './features/discovery/DiscoverScreen'
+import { DiscoveryContainer } from './features/discovery/DiscoveryContainer'
 import { RouteScreen } from './features/mappings/RouteScreen'
 import { MappingScreen } from './features/mappings/MappingScreen'
 import { RunScreen } from './features/runs/RunScreen'
@@ -95,7 +95,7 @@ export default function App() {
         <Sidebar current={screen} onNav={navigateWorkflow} completedThrough={completedThrough} />
         <main style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
           {screen === 'sources'  && <SourcesScreen  onNav={navigateWorkflow} onAdvance={() => advance('sources', 'discover')} onInvalidate={() => invalidateAfter('sources')} />}
-          {screen === 'discover' && <DiscoverScreen onNav={navigateWorkflow} onAdvance={() => advance('discover', 'route')} onInvalidate={() => invalidateAfter('discover')} />}
+          {screen === 'discover' && <DiscoveryContainer onInvalidate={() => invalidateAfter('discover')} />}
           {screen === 'route'    && <RouteScreen    onNav={navigateWorkflow} onAdvance={() => advance('route', 'mapping')} onInvalidate={() => invalidateAfter('route')} />}
           {screen === 'mapping'  && <MappingScreen  onNav={navigateWorkflow} onAdvance={() => advance('mapping', 'run')} onInvalidate={() => invalidateAfter('mapping')} />}
           {screen === 'run'      && <RunScreen      onNav={navigateWorkflow} onAdvance={() => advance('run', 'monitor')} onInvalidate={() => invalidateAfter('run')} />}

@@ -11,4 +11,6 @@ def create_app(config_object: object | None = None) -> Flask:
         app.config.from_object(config_object)
     from .auth import init_auth
     init_auth(app)
+    from .sources import init_sources
+    init_sources(app)
     return app

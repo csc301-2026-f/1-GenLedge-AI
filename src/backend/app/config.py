@@ -28,6 +28,8 @@ class Config:
 
         self.AUTH_ENV = setting('APP_ENV', 'development')
         self.ENV_FILE_PATH = str(ENV_FILE)
+        self.GENLEDGE_DATABASE_URL = setting('GENLEDGE_DATABASE_URL')
+        self.GENLEDGE_DATABASE_SCHEMA = setting('GENLEDGE_DATABASE_SCHEMA', 'genledge_control')
         self.SECRET_KEY = setting('SECRET_KEY')
         database_values = {name: setting(name) for name in DATABASE_FIELDS}
         configured_database = any(value is not None for value in database_values.values())

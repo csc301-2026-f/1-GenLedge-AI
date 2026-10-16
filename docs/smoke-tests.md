@@ -1,5 +1,35 @@
 # Smoke Tests
 
+## US4 source inventory and persistence
+
+- Action: Run `python -m pytest tests/test_persistence_function_audit.py -q` with
+  the local test DSN configured.
+  Expected: 50 audit cases pass, including schema/configuration errors, malformed
+  catalogue containers, boolean/number replay conflicts, normalized argument
+  replay, revision immutability, and two complete smoke invocations. The error
+  history and coverage commands are in
+  [`doc/us4-persistence-function-audit.md`](../doc/us4-persistence-function-audit.md).
+
+Setup commands and interface examples are in
+[`doc/us4-source-persistence.md`](../doc/us4-source-persistence.md).
+
+- Action: Configure a local PostgreSQL control database and run
+  `python -m app.common.migrations` twice from `src/backend`.
+  Expected: Both upgrades complete, with Alembic at `001_us4_control_plane` and no
+  duplicate tables.
+- Action: Run `python -m app.sources.fixtures`, then call
+  `app.sources.service.get_inventory('demo-orders-snapshot-v1')`.
+  Expected: An `InventoryView` contains `orders`, `orders.lines[]`, `customers`,
+  18 fields, at most three samples per field, and ambiguous `order_date` metadata.
+- Action: Run `python -m scripts.smoke_persistence` twice in separate processes.
+  Expected: The same job and revision are read on the second run, its stored tool
+  result replays with zero factory calls, and the `reject` edit remains visible.
+- Action: Set `GENLEDGE_TEST_DATABASE_URL` to a separate local database and run
+  `python -m pytest tests`.
+  Expected: Inventory round-trip, SQL immutability, concurrent replay, package
+  persistence, and cross-process reads pass. Without the test DSN, persistence
+  tests report explicit skips.
+
 ## Development launchers
 
 - Action: Run `./src/start-demo.sh` or `src\start-demo.bat` and open `http://127.0.0.1:5174`.
@@ -18,3 +48,168 @@
   Expected: Flask returns 403.
 - Action: Stop each launcher with `Ctrl+C` on Unix or by closing its service window on Windows.
   Expected: The processes started by that launcher stop and the ports are released.
+
+## US3 discovery core
+
+US3 contracts, current scope and recorded verification are in [Source discovery](../doc/us3-discovery.md). Remaining implementation work is tracked in the [US3 plan](../plans/us3-discovery.md). The procedures below are instructions, not a claim that every check has been run on the current branch.
+
+From `src/backend`, run the synthetic fixture through discovery:
+
+```bash
+.venv/bin/python - <<'PYTHON'
+import json
+from pathlib import Path
+from app.sources.discovery import discover_records
+records = json.loads(Path("tests/fixtures/us3/orders.json").read_text())
+result = discover_records(records)
+print(result.sampled_count)
+print({field.path: field.types for field in result.fields})
+PYTHON
+```
+
+Expected: three sampled records; nested paths such as `shipping_address.city` and `lines[].sku`; `total` has null/number/string types; date and leading-zero identifier values remain strings. No database or API service is used.
+
+For sample-to-sample comparison, run from `src/backend`:
+
+```bash
+.venv/bin/python - <<'PYTHON'
+import json
+from pathlib import Path
+from app.sources.discovery import compare_discoveries, discover_records
+fixtures = Path("tests/fixtures/us3")
+previous = discover_records(json.loads((fixtures / "orders.json").read_text()))
+current = discover_records(json.loads((fixtures / "orders-refreshed.json").read_text()))
+print(json.dumps(compare_discoveries(previous, current).as_dict(), indent=2))
+PYTHON
+```
+
+Expected: `added` contains `currency`; `missing` contains `paid`; `typeChanges` reports `total` changing from null/number/string to string. These are sample observations; the comparison does not delete source fields or mappings.
+
+Existing automated core checks can be run separately from `src/backend`:
+
+```bash
+.venv/bin/python -m pytest tests/test_discovery.py tests/test_discovery_changes.py -q
+```
+
+The full backend suite is `.venv/bin/python -m pytest tests -q`; consult the persistence setup above before running database-dependent checks. The historical core result predates later dependency integration and does not establish a current full-suite pass.
+
+## US3 saved snapshot presentation
+
+Prepare an authorized synthetic snapshot using the publication steps below, configure/migrate the control store, and sign in to the working app with an application user in that same organization.
+
+- Action: Choose Discover from the source screen.
+  Expected: The saved snapshot ID form appears with no fabricated source/field data. Load requires an ID; routing requires a loaded inventory containing fields.
+- Action: Enter a saved snapshot ID and load it.
+  Expected: The displayed snapshot ID is the requested saved ID; resources and fields come from GET /api/sources/snapshots/<id>. Sampling count/method are reported as not recorded. Canonical types, native evidence, stored status and prepared samples appear without invented conversions.
+- Action: Search LINES and select the number type on the 14-field orders fixture.
+  Expected: Only lines[].qty matches. Changing resource/snapshot resets filters; an unmatched query shows a no-match message.
+- Action: Load a multi-resource snapshot, select orders.lines[], then load an empty snapshot.
+  Expected: The correct resource fields are shown; empty resources show an explicit empty message. An inventory with no fields cannot submit to routing.
+- Action: Edit the snapshot ID, load an unknown/other-organization ID, or stop only the disposable store and load an authorized ID.
+  Expected: Old rows clear immediately; 404 or safe503 messages appear with no SQL/DSN/credential details. Reloading after recovery succeeds.
+- Action: Click Reload snapshot after a successful read.
+  Expected: GET reads the same immutable ID. No source sampling, write or new snapshot occurs.
+
+The standalone Frontend Demo and isolated DiscoveryPreview remain synthetic; they are not the connected App's live snapshot path.
+
+## US3 shared inventory adapter
+
+From `src/backend`, run a synthetic conversion without Flask startup or a database:
+
+```bash
+.venv/bin/python - <<'PYTHON'
+import json
+from pathlib import Path
+from app.sources.discovery import discover_records
+from app.sources.inventory_adapter import to_inventory
+
+result = discover_records(json.loads(Path("tests/fixtures/us3/orders.json").read_text()))
+inventory = to_inventory(result, snapshot_id="snapshot-orders-1", source_id="source-orders-1",
+                         resource_id="orders", resource_name="Orders", resource_kind="collection")
+print(inventory.snapshot_id, inventory.resources[0].field_count)
+for field in inventory.fields:
+    print(field.ref.field_path, field.type.value, field.native_type, field.samples, field.status)
+PYTHON
+```
+
+Expected: 14 fields in the orders resource; `total` is json with `observed:null|number|string`; `order_date` is text; `customer_code` preserves JSON-quoted leading-zero strings; `lines[].sku` keeps its path and repeating flag. Every status is unknown. No source read, semantic date detection, redaction or snapshot persistence is performed by this adapter.
+
+## US3 date ambiguity
+
+From `src/backend`, inspect the detector and inventory propagation without starting services:
+
+```bash
+.venv/bin/python - <<'PYTHON'
+from app.sources.date_ambiguity import detect_date_ambiguity
+from app.sources.discovery import discover_records
+from app.sources.inventory_adapter import to_inventory
+
+for value in ('03/04/2026', '13/04/2026', '04/04/2026', '31/02/2026', '2026-04-03'):
+    print(value, detect_date_ambiguity(value))
+result = discover_records([{'date': value} for value in
+                           ('2026-01-01', '2026-01-02', '2026-01-03', '03/04/2026')])
+inventory = to_inventory(result, snapshot_id='dates-1', source_id='source-1',
+                         resource_id='dates', resource_name='Dates', resource_kind='collection')
+print(result.as_dict())
+print(inventory.fields[0].model_dump(mode='json'))
+PYTHON
+```
+
+Expected: only 03/04/2026 is flagged in the first list. The four-record discovery result carries ambiguity even though its three display samples are the ISO strings. Its type remains string, inventory type remains text, and the same marker appears in InventoryField. No date values are changed.
+
+- Action: Load a saved snapshot published from the orders discovery fixture.
+  Expected: order_date displays Date format ambiguous with a confirmation notice; stored canonical type/native evidence are unchanged. The isolated synthetic preview still supports its original initial/refreshed cases.
+
+## US3 snapshot publication
+
+Use a disposable local control database, apply its existing control-plane migration, and create InventoryRepository(Database(explicit_local_dsn)). Do not use a shared/team database for this check. From src/backend, pass the synthetic orders DiscoveryResult to publish_discovery with an explicit preparation callback such as withhold_samples in doc/us3-discovery.md.
+
+- Action: Publish the orders fixture with candidate snapshot ID orders-v1, then read it through InventoryService scoped to the same organization.
+  Expected: One resource, 14 fields, preserved canonical paths/types/nullable/repeating/native_type and order_date ambiguity. Samples reflect the explicit policy; withhold_samples saves empty sample lists.
+- Action: Publish identical prepared metadata under candidate orders-retry.
+  Expected: The returned ID is orders-v1 and only one snapshot exists for this source. Use that returned ID in later calls.
+- Action: Publish orders-refreshed.json under orders-v2, then read both IDs.
+  Expected: Two immutable snapshots. The old one retains paid; the new one has currency and the changed total type evidence. Neither is deleted or rewritten.
+- Action: Read orders-v1 from another process and after restarting only the disposable server.
+  Expected: The same stored inventory remains readable with the correct organization scope.
+- Action: Attempt a read/save under another organization, reuse orders-v1 for different content, or update a sealed snapshot's field directly.
+  Expected: Scoped not-found, source/ID conflict or immutability error; existing saved metadata remains intact.
+- Action: Supply a preparation callback that raises before returning an inventory.
+  Expected: The error propagates and no source/snapshot is created for that attempt. No silent retry or success response is produced.
+
+No raw-source ingestion, HTTP API, browser wiring, sampling metadata persistence or model call is established by these checks. Remove only the disposable database/cluster after inspection.
+
+## US3 saved snapshot API
+
+- Action: Request a saved snapshot without a valid login, then with a valid login in its organization.
+  Expected:401 then200 with contract_version/inventory and Cache-Control:no-store.
+- Action: Request an unknown ID and another organization's ID, including a forged organization_id query parameter.
+  Expected: Identical404 snapshot_not_found envelopes; identity is taken from the session.
+- Action: Sign out and retry the read.
+  Expected:401.
+- Action: Use a logged-in app without control-store configuration, or stop only its disposable control database.
+  Expected: Explicit503 snapshot_not_configured or snapshot_unavailable, no secret-bearing response, and no-store headers. Unexpected failures are not converted into an apparent successful empty inventory.
+
+Keep all manual verification data in a disposable local store. Do not reuse team credentials or alter a shared database for these checks.
+
+
+## US3 discovery-side routing handoff
+
+These are manual integration checks to perform with a compatible downstream API. The US3-only branch has no mapping job endpoint; it should show an explicit unavailable message rather than simulated routing results.
+
+- Action: Open Discovery before loading a snapshot, or load an inventory with no fields.
+  Expected: Submit snapshot to routing is disabled. Typing an ID without loading does not enable it.
+- Action: Load an authorized nonempty snapshot and submit to routing on the US3-only branch.
+  Expected: The client reads /api/auth/csrf, then POSTs /api/mappings/jobs. Its missing endpoint produces an explicit error; the inventory remains visible and no mocked routing screen opens.
+- Action: With the compatible US4 API available, filter fields or change Resource, then submit.
+  Expected: The POST body contains only source_snapshot_id equal to the loaded inventory.snapshot_id, regardless of the current filters. Credentials, X-CSRF-Token and Idempotency-Key accompany the POST. The UI explains that the whole snapshot is submitted.
+- Action: Inspect controls while submission is pending and click repeatedly.
+  Expected: Snapshot editing, load/reload and submission are disabled; one request is active. Resource selection and filters remain available.
+- Action: Return a valid 202 job receipt from the downstream API.
+  Expected: The returned job ID/status are displayed as a handoff receipt, not completion/results. Further submission of that snapshot is disabled. No polling, review edits or graph execution is performed by US3.
+- Action: Make the downstream response fail or exceed 15 seconds, then retry without leaving Discovery; also reload the same snapshot after an error.
+  Expected: Errors do not erase fields. Timeout warns that the server may already have received the request. Retry uses the same Idempotency-Key for that snapshot, including after reload. The API owns actual deduplication.
+- Action: Inspect 401, 503, malformed/non-202 success responses and an invalid receipt.
+  Expected: An explicit error appears and no receipt is fabricated. A valid receipt with status failed displays failed, without claiming routing completion.
+
+Retry keys/receipts are held only for the current Discovery container. Leaving Discovery or refreshing clears them; this is not a durable job-restoration mechanism. Do not repeat ambiguous submissions across a page refresh assuming the same key will be restored. Real job creation/execution and these HTTP failure scenarios were not exercised in the handoff increment; its recorded checks are typecheck, build and source/diff review only.

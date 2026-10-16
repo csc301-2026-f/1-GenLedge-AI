@@ -133,6 +133,14 @@ Keep the execution boundary behind `runs.execution`: it accepts a run's pipeline
 
 ## Decisions to validate with prototypes
 
+The US4 Person A control-plane subset is implemented with Alembic/SQLAlchemy
+migrations and psycopg capability repositories. It stores immutable source
+snapshots, optional catalogues, jobs, revisions, findings, coverage, tool results,
+and table-decision edits in the dedicated `genledge_control` schema. Configuration,
+public repository interfaces, and local verification commands are documented in
+[`us4-source-persistence.md`](us4-source-persistence.md). Routes, graph execution,
+proposal validation, and warehouse execution remain separate workstreams.
+
 - Confirm supported upload formats, upload storage, and how file-backed data is presented to discovery and execution.
 - Test DocumentDB schema sampling and nested/repeating fields against representative mock data.
 - Test worker claiming and recovery behavior with the selected deployment setup; retain the PostgreSQL-backed queue for the MVP unless measured concurrency requires a broker.
