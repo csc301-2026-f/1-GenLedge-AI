@@ -59,8 +59,21 @@ Implement the existing writer contract and a batch-pinned sample reader without 
 
 - [x] Inspect current US2 contracts and create an isolated feature branch from its current head.
 - [x] Implement the persistent local writer and record its behavior/limits.
-- [ ] Add the scoped published-batch and bounded sample reader.
-- [ ] Inspect synthetic save/read, restart, isolation, publication conflict and failure behavior; compile and review the diff.
-- [ ] Finalize the existing guide/plan/manual procedures and create a PR targeting us2.
+- [x] Add the scoped published-batch and bounded sample reader.
+- [x] Inspect synthetic save/read, fresh-process reads, isolation, publication conflict and failure behavior; compile and review the diff.
+- [x] Finalize the existing guide/plan/manual procedures for a PR targeting us2.
 
 SQLite BEGIN IMMEDIATE serializes publication decisions for a scope; local writes also hold that lock through file completion. This trades write concurrency for a small, explicit publication boundary. Use a single host and local disk, not network/shared filesystems. Directory fsync is performed on POSIX; Windows directory/power-loss behavior is not claimed verified. No distributed transaction, reconciliation daemon or old published-batch deletion is added.
+
+
+### Recorded local verification
+
+Manual synthetic inspection covered old/new pinned reads in a fresh process,
+empty collections, limits and the unparsed 501st record, organization/environment
+isolation, incomplete/immutable publication, two-process first-import and refresh
+conflicts, an acknowledgement lost after commit, retained publication history,
+invalid serialization and truncated/malformed sampled files. Compilation and
+whitespace checks passed. No automated tests were added/run; the earlier 80-test
+result was not rerun. Windows, forced process-kill, power-loss, network filesystem,
+HTTP/auth integration and broader crash/stress verification remain unverified.
+See the finalized implementation record in the guide for details and limits.

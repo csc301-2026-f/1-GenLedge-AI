@@ -69,3 +69,35 @@ procedures, not a claim that all failure modes have been exercised.
 
 The web UI continues to return persisted:false. No database credentials, team
 storage, HTTP import or source connector is needed for this internal adapter.
+
+
+## Pinned intake samples for US3
+
+Use the disposable LocalIntakeStore and returned SnapshotMetadata from the writer
+steps above. Read published_snapshot(source_id, batch_id), then
+read_sample(source_id, batch_id, collection_id, limit=500).
+
+- Action: Reopen the store in a fresh Python process after an import/refresh.
+  Expected: Metadata and old/new pinned samples remain readable. Reading an old
+  published batch returns its own records even when a newer batch is active.
+- Action: Import 501 synthetic JSON objects and request 500, then a smaller limit.
+  Expected: The returned lists contain 500 and the requested smaller count. An
+  invalid 501st line in a disposable copy is not parsed. Restore any modified data.
+- Action: Import a header-only CSV.
+  Expected: Its published collection returns an empty list, not invented fields.
+- Action: Read with another organization/environment, wrong source, unknown
+  collection or unpublished batch; request limits 0 or 501.
+  Expected: IntakeNotFoundError for inaccessible artifacts or ValueError for limits.
+- Action: Truncate or corrupt a sampled JSON line in disposable storage.
+  Expected: A clear decode/row-count error, never a successful partial sample.
+  Restore the data; do not perform this check on real storage.
+- Action: Publish two staged batches against the same expected active version
+  from separate processes, including a source that has no previous import.
+  Expected: One wins; the other raises PublicationConflict and cannot clobber it.
+- Action: Simulate a lost acknowledgement after publication, then refresh again.
+  Expected: The old acknowledged-or-not published batch remains readable by its
+  pinned ID. Checking only the latest pointer is not sufficient reconciliation.
+
+These are documented manual checks. Recorded local observations and unverified
+platform/crash/auth scenarios are listed in the guide. No real US3 discovery or
+HTTP import is enabled by this storage adapter alone.

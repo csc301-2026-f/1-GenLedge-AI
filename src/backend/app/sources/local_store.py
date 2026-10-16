@@ -7,6 +7,7 @@ import sqlite3
 from contextlib import closing, contextmanager
 from dataclasses import asdict
 from datetime import datetime
+from itertools import islice
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
 
@@ -188,3 +189,33 @@ class LocalIntakeStore:
         except FileNotFoundError:
             pass  # An absent staging directory is the desired idempotent result.
         _sync_directory(self.records)
+
+    def published_snapshot(self, source_id: str, batch_id: str) -> SnapshotMetadata:
+        """Read a published batch, including one superseded by a newer import."""
+        with self._connection() as connection:
+            row = connection.execute("""SELECT manifest FROM batches
+                WHERE id = ? AND source_id = ? AND published = 1""", (batch_id, source_id)).fetchone()
+        if row is None:
+            raise IntakeNotFoundError("Published batch not found.")
+        return _decode(row["manifest"])
+
+    def read_sample(self, source_id: str, batch_id: str, collection_id: str,
+                    *, limit: int = 500) -> list[dict[str, object]]:
+        """Read first-N parsed records from one published, explicitly pinned batch."""
+        if not 1 <= limit <= 500:
+            raise ValueError("Sample limit must be between 1 and 500.")
+        snapshot = self.published_snapshot(source_id, batch_id)
+        collection = next((item for item in snapshot.collections if item.collection_id == collection_id), None)
+        if collection is None:
+            raise IntakeNotFoundError("Collection not found.")
+        expected = min(limit, collection.row_count)
+        records: list[dict[str, object]] = []
+        with self._collection_path(batch_id, collection_id).open(encoding="utf-8") as stream:
+            for line in islice(stream, expected):
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError("Stored collection must contain JSON objects.")
+                records.append(record)
+        if len(records) != expected:
+            raise ValueError("Stored collection ended before its manifest row count.")
+        return records

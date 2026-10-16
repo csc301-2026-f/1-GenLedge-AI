@@ -7,11 +7,11 @@ checks are in [smoke tests](../docs/smoke-tests.md).
 ## Current scope
 
 File parsing/validation, the validation API/UI, metadata, import orchestration and
-a concrete local intake writer are implemented. Internal callers can persist
-parsed records using LocalIntakeStore. The web UI remains validation-only: it does
+a concrete local intake writer and published-batch sample reader are implemented. Internal callers can persist
+parsed records using LocalIntakeStore and read a pinned published batch. The web UI remains validation-only: it does
 not call the import service, save records, create a source, or advance discovery.
 The source list/database connection flow remain prototypes. Real authorization,
-HTTP import/UI and source-reader integration are still required for complete US2.
+HTTP import/UI and US3 discovery integration are still required for complete US2.
 
 ## Local setup and testing
 
@@ -273,6 +273,10 @@ print(manifest.source_id, manifest.batch_id)
 The root contains a hashed directory per organization/environment. Each scope has
 `catalog.sqlite3` and `records/<hashed-batch>/<hashed-collection>.jsonl`. Raw file
 names, source IDs and batch IDs are never interpolated as filesystem paths.
+Stored JSON Lines contain parser-produced records, not a byte-for-byte archive of
+the original upload. CSV values remain strings, header corrections remain in
+metadata, and nested JSON values retain their types.
+
 The catalog stores complete manifests, collection completion markers, durable
 publication history and the current source pointer; it does not store raw rows.
 `intake_name` remains metadata, not an externally supplied physical path.
@@ -291,7 +295,8 @@ the root private and outside Git; do not serve it as static files.
   one JSON object per line to a partial file, flushes/fsyncs it, replaces the final
   path and only then commits the completion marker. Empty collections still
   produce a synced empty file and a completion marker. Parsed values/nesting and
-  original keys are preserved; non-JSON values fail instead of being coerced.
+  original keys are preserved; unsupported values and non-finite numbers fail
+  during JSON serialization instead of being silently replaced.
 - `publish` checks all completion markers and the expected old batch under one
   BEGIN IMMEDIATE transaction, then marks publication and updates the active
   pointer together. A competing publication raises the existing PublicationConflict.
@@ -320,6 +325,48 @@ trade-off. SQLite/storage errors propagate rather than silently retrying.
 No external database, new runtime dependency, Flask configuration or HTTP endpoint
 is added. This branch still uses its old demo authentication for validation;
 current shared authentication must be integrated before enabling web persistence.
+
+### Published-batch reader
+
+The same store exposes these internal interfaces:
+
+| Method | Result |
+| --- | --- |
+| active_snapshot(source_id) | Current published SnapshotMetadata, or None for an unknown source in this scope |
+| published_snapshot(source_id, batch_id) | That exact published manifest, including a superseded batch |
+| read_sample(source_id, batch_id, collection_id, limit=500) | First N parsed records, with an integer limit from 1 to 500 |
+
+Resolve the active batch once, then pin its ID throughout the operation:
+
+```python
+manifest = store.active_snapshot(authorized_source_id)
+if manifest is None:
+    raise LookupError("Source not found.")
+collection = manifest.collections[0]  # Or an authorized collection selected by the caller.
+records = store.read_sample(
+    manifest.source_id, manifest.batch_id, collection.collection_id, limit=500,
+)
+# Pass records to US3 discovery once that application integration is connected.
+```
+
+Every read uses the constructor's organization/environment scope. Unknown or
+foreign batches/sources, unpublished batches and collections absent from the
+manifest raise IntakeNotFoundError. No unscoped lookup or caller-supplied path is
+available. This scope must still be authorized by a future request/worker caller.
+Published files are retained and never modified by this adapter, so a concurrent
+refresh cannot redirect the pinned read to a different batch.
+
+The reader consumes at most min(limit, manifest.row_count) JSON Lines; it does not
+parse record 501 or scan the full collection. A header-only CSV collection returns
+an empty list. Malformed JSON/non-object lines, missing files or truncation before
+the expected sampled count fail explicitly instead of producing empty/partial
+success. Corruption beyond the sample is not inspected. The manifest's row_count
+is the full parsed batch count; len(records) is only the sampled count.
+
+Upload batch IDs and US3 inventory snapshot IDs remain distinct. This adapter
+provides parsed records plus stable source/collection/batch identity, not a
+DiscoveryResult or an InventoryView. It does not publish discovery metadata,
+provide source-listing endpoints or change the upload UI.
 
 ## Failure semantics
 
@@ -394,13 +441,49 @@ documentation consolidation extend the original US2 pull request (#15). The loca
 intake work extends its branch through a separate PR; no PR is merged by this work.
 
 
-### Local writer implementation record
+### Local intake implementation record
 
-The local adapter implements the five existing writer operations without changing
-the parser/import service or enabling web persistence. Synthetic local inspection
-saved nested JSON, leading-zero identifiers, booleans and null; refreshed the
-same source/collection; retained the original file; rejected writes/cleanup of
-published batches and a foreign-scope manifest; rejected incomplete publication;
-and repeated unpublished cleanup. Compilation and whitespace checks passed.
-No automated tests were added or run for this increment. Reader, fresh-process,
-contention and failure inspection continue in the next part of this delivery.
+The implemented slice follows this sequence:
+
+- [x] Implement the five existing writer operations with persistent JSON Lines and a scoped local catalog.
+- [x] Provide exact published-batch metadata and a bounded sample reader for downstream discovery.
+- [x] Keep parser/import orchestration unchanged and preserve the validation-only HTTP/UI boundary.
+- [x] Document publication, scope, cleanup, retry/reconciliation and filesystem limits in this guide and the maintained story plan.
+
+Recorded manual inspection used a disposable local root with synthetic data:
+
+- Nested JSON, leading-zero strings, booleans, null and metadata round-tripped;
+  a separate Python process read both old and refreshed published batches.
+- Source/collection IDs stayed stable on refresh; old files and publication history
+  remained readable. A header-only CSV returned an empty sample.
+- A 501-record collection returned 500 records without parsing a deliberately invalid
+  unsampled 501st line; smaller requested limits worked. The temporary corruption
+  was restored before subsequent inspection.
+- Other organizations/environments, wrong source, unpublished batches and unknown
+  collections were rejected. Limits 0 and 501 were rejected.
+- Published writes/cleanup, incomplete publication and a foreign-scope manifest
+  were rejected. Unpublished cleanup was repeatable. A non-JSON serialization
+  failure left the collection incomplete and could not publish.
+- Two separate processes racing both a first import and an existing source refresh
+  produced one winner and one PublicationConflict; the loser did not replace the
+  active pointer. This is an exercised contention scenario, not a stress suite.
+- A synthetic lost acknowledgement after committed publication propagated as an
+  ImportStorageError; the published batch remained readable, including after a
+  later refresh replaced the active pointer. No automatic cleanup removed it.
+- Truncated and malformed sampled files failed explicitly; original synthetic data
+  was restored. A complete but unpublished batch did not move the active pointer.
+
+Compilation, diff/whitespace, existing local documentation links and request-scope
+review passed. No automated tests were added/run for this delivery, and the old
+80-test result above was not rerun. No HTTP/browser/auth integration, Windows,
+network filesystem, forced process-kill, power-loss, disk-full or broader stress
+verification was performed. Only disposable data was used; no team database,
+credentials or existing local storage was accessed. Temporary inspection data
+was removed after review.
+
+
+Publication uses [SQLite transactions](https://www.sqlite.org/lang_transaction.html)
+and its [atomic commit model](https://www.sqlite.org/atomiccommit.html); record
+flushes follow [Python os.fsync](https://docs.python.org/3/library/os.html#os.fsync).
+These references describe mechanisms, not verification of this application's
+hardware or all crash scenarios.
