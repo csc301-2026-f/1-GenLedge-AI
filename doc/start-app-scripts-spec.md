@@ -29,7 +29,7 @@ It does not require Python, Flask, a database, or an API service.
 
 ### Full stack
 
-The full-stack launcher starts the current `backend-1` frontend and its Flask
+The full-stack launcher starts the connected frontend and its Flask
 backend. The frontend's Vite development server proxies `/api` requests to
 Flask, so browser authentication uses the local backend.
 
@@ -38,10 +38,9 @@ Flask, so browser authentication uses the local backend.
 | Connected frontend | `src/frontend/` | `pnpm dev --host 127.0.0.1 --port 5173 --strictPort` | `http://127.0.0.1:5173` |
 | Flask backend | `src/backend/` | `main.py` | `http://127.0.0.1:5000` |
 
-The current backend uses demo authentication: any non-empty username and
-password are accepted. The later `feature-login` integration will replace this
-with database-backed authentication, password hashing, and credential
-verification.
+The connected frontend uses database-backed authentication. Initialize the
+database and provision an account before signing in, as described in
+`doc/auth-implementation.md`.
 
 ## Prerequisites
 
@@ -50,8 +49,8 @@ Dependencies are not installed automatically.
 - `pnpm` must be installed and available on `PATH`.
 - For the full-stack launcher, Python 3 must be installed and available on
   `PATH`, unless `src/backend/.venv` exists.
-- For the full-stack launcher, Flask must be installed for the selected Python
-  interpreter.
+- For the full-stack launcher, install all packages in
+  `src/backend/requirements-dev.txt` for the selected Python interpreter.
 - Frontend dependencies must already be installed in each frontend's
   `node_modules` directory with `pnpm install`.
 
@@ -61,8 +60,8 @@ The full-stack scripts prefer the backend virtual environment when present:
 - Windows: `src/backend/.venv/Scripts/python.exe`
 
 The demo scripts stop with setup guidance when `pnpm` is unavailable. The
-full-stack scripts also validate Python and Flask and show the dependency
-installation command when either is unavailable.
+full-stack scripts validate Python, Flask, and SQLAlchemy and show the dependency
+installation command when a requirement is unavailable.
 
 ## Usage
 

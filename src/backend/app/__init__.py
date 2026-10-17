@@ -1,7 +1,6 @@
 from flask import Flask
 
 from .config import Config
-from .auth.routes import bp as auth_bp
 
 
 def create_app(config_object: object | None = None) -> Flask:
@@ -13,4 +12,6 @@ def create_app(config_object: object | None = None) -> Flask:
     app.register_blueprint(auth_bp)
     from .sources.routes import bp as sources_bp
     app.register_blueprint(sources_bp)
+    from .auth import init_auth
+    init_auth(app)
     return app
