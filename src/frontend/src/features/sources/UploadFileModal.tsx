@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { Alert, Btn, Modal, T } from '../../shared'
-import { ACCEPTED_FILES, MAX_FILE_BYTES, validateFile } from './client'
-import type { ValidationResult } from './client'
+import { ACCEPTED_FILES, MAX_FILE_BYTES, importFile } from './client'
+import type { SavedSource } from './client'
 
-export function UploadFileModal({ onClose }: { onClose: () => void }) {
+export function UploadFileModal({ onClose, onImported }: { onClose: () => void; onImported: () => void }) {
   const [file, setFile] = useState<File | null>(null)
   const [error, setError] = useState('')
-  const [result, setResult] = useState<ValidationResult | null>(null)
+  const [result, setResult] = useState<SavedSource | null>(null)
   const [busy, setBusy] = useState(false)
   const input = useRef<HTMLInputElement | null>(null)
   const active = useRef<AbortController | null>(null)
@@ -26,7 +26,7 @@ export function UploadFileModal({ onClose }: { onClose: () => void }) {
     setFile(selected)
   }
 
-  async function validate() {
+  async function save() {
     if (!file || active.current) return
     const controller = new AbortController()
     active.current = controller
@@ -35,11 +35,11 @@ export function UploadFileModal({ onClose }: { onClose: () => void }) {
     setResult(null)
     const timeout = setTimeout(() => controller.abort(), 120_000)
     try {
-      const data = await validateFile(file, controller.signal)
-      if (!controller.signal.aborted) setResult(data)
+      const data = await importFile(file, controller.signal)
+      if (!controller.signal.aborted) { setResult(data); onImported() }
     } catch (error) {
-      setError(controller.signal.aborted ? 'Validation was cancelled or timed out. Please try again.'
-        : error instanceof Error ? error.message : 'Unable to validate this file.')
+      setError(controller.signal.aborted ? 'Import completion could not be confirmed. Refresh the source list before retrying.'
+        : error instanceof Error ? error.message : 'Unable to import this file.')
     } finally {
       clearTimeout(timeout)
       active.current = null
@@ -48,9 +48,9 @@ export function UploadFileModal({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <Modal title="Validate Source File" onClose={onClose} width={540}>
+    <Modal title="Import Source File" onClose={() => { if (!busy) onClose() }} width={540}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-        <Alert type="info">Validate a file before importing it. Data is not saved yet. Supported: CSV, TSV, XLSX, XLS, JSON, NDJSON. Maximum 25 MB per file and 50,000 records per collection.</Alert>
+        <Alert type="info">Files are fully validated before saving. Uploading the same filename updates its existing source. Supported: CSV, TSV, XLSX, XLS, JSON, NDJSON. Maximum 25 MB per file and 50,000 records per collection.</Alert>
         <div onDragOver={event => event.preventDefault()} onDrop={event => {
           event.preventDefault()
           if (!busy) select(event.dataTransfer.files)
@@ -62,10 +62,10 @@ export function UploadFileModal({ onClose }: { onClose: () => void }) {
           {file && <p style={{ marginTop: 12, overflowWrap: 'anywhere' }}>Selected: {file.name} ({file.size.toLocaleString()} bytes)</p>}
         </div>
         {error && <div role="alert"><Alert type="error">{error}</Alert></div>}
-        {busy && <p role="status">Uploading and validating all collections…</p>}
+        {busy && <p role="status">Validating and saving all collections…</p>}
         {result && <div role="status" style={{ maxHeight: 280, overflow: 'auto' }}>
-          <Alert type="success">Validation passed. {result.collections.length} collection(s) ready for future import. Nothing has been saved.</Alert>
-          {result.collections.map(collection => <div key={collection.key} style={{ marginTop: 12 }}>
+          <Alert type="success">Import complete. {result.collections.length} collection(s) saved.</Alert>
+          {result.collections.map(collection => <div key={collection.collectionId} style={{ marginTop: 12 }}>
             <strong>{collection.name}</strong> — {collection.rowCount.toLocaleString()} record{collection.rowCount === 1 ? '' : 's'}
             {collection.warnings.length > 0 && <details>
               <summary>{collection.warnings.length} header correction(s)</summary>
@@ -74,8 +74,8 @@ export function UploadFileModal({ onClose }: { onClose: () => void }) {
           </div>)}
         </div>}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, paddingTop: 8, borderTop: `1px solid ${T.border}` }}>
-          <Btn variant="secondary" onClick={onClose}>{busy ? 'Cancel' : 'Close'}</Btn>
-          <Btn variant="primary" disabled={!file || busy} onClick={validate}>{busy ? 'Validating…' : 'Validate File'}</Btn>
+          <Btn variant="secondary" disabled={busy} onClick={onClose}>Close</Btn>
+          <Btn variant="primary" disabled={!file || busy || !!result} onClick={save}>{busy ? 'Importing…' : 'Import File'}</Btn>
         </div>
       </div>
     </Modal>

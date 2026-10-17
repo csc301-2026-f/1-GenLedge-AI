@@ -141,6 +141,15 @@ class LocalIntakeStore:
                 JOIN batches b ON b.id = a.batch_id WHERE a.source_id = ?""", (source_id,)).fetchone()
         return _decode(row["manifest"]) if row else None
 
+    def list_sources(self) -> list[SnapshotMetadata]:
+        """Return only active published manifests in this authorized scope."""
+        with self._connection() as connection:
+            rows = connection.execute("""SELECT b.manifest FROM active_sources a
+                JOIN batches b ON b.id = a.batch_id WHERE b.published = 1
+                ORDER BY a.source_id""").fetchall()
+        return sorted((_decode(row["manifest"]) for row in rows),
+                      key=lambda snapshot: snapshot.uploaded_at, reverse=True)
+
     def stage(self, snapshot: SnapshotMetadata) -> None:
         if (snapshot.source.organization_id, snapshot.source.environment) != (self.organization_id, self.environment):
             raise PermissionError("Snapshot does not belong to this storage scope.")

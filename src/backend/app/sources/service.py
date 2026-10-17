@@ -20,7 +20,7 @@ class ImportStorageError(RuntimeError):
 def import_file(filename: str, stream: BinaryIO, *, organization_id: str,
                 environment: str, writer: IntakeWriter) -> SnapshotMetadata:
     """Validate, stage, then publish. Organization/environment must be authorized
-    by the future caller, never trusted directly from browser form fields.
+    by the caller, never trusted directly from browser form fields.
     """
     parsed = parse_file(filename, stream)
     source = SourceIdentity(organization_id, environment, parsed.filename)

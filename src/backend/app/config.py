@@ -27,6 +27,11 @@ class Config:
             return os.environ.get(name, values.get(name, default))
 
         self.AUTH_ENV = setting('APP_ENV', 'development')
+        self.INTAKE_ENVIRONMENT = setting('GENLEDGE_INTAKE_ENVIRONMENT', self.AUTH_ENV)
+        self.INTAKE_KEEP_PREVIOUS = int(setting('GENLEDGE_INTAKE_KEEP_PREVIOUS', '1'))
+        self.INTAKE_GRACE_DAYS = int(setting('GENLEDGE_INTAKE_GRACE_DAYS', '7'))
+        if self.INTAKE_KEEP_PREVIOUS < 0 or self.INTAKE_GRACE_DAYS < 0:
+            raise RuntimeError('Intake retention settings must be nonnegative.')
         self.ENV_FILE_PATH = str(ENV_FILE)
         self.SECRET_KEY = setting('SECRET_KEY')
         database_values = {name: setting(name) for name in DATABASE_FIELDS}

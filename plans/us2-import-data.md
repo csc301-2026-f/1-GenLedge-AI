@@ -4,6 +4,19 @@ Implementation details, decisions, test commands and the completed-work record
 live in [the US2 guide](../doc/us2-import-data.md). Keep this file as the working
 checklist for the whole story rather than duplicating the guide.
 
+## Mapping preservation and snapshot retention
+
+User approved a small US2 mapping persistence API because US5 is currently a mock.
+
+- [x] Add per-batch field identity metadata and scoped mapping persistence/API.
+- [x] Reconcile mappings atomically with publication; retain definitions and flag incompatible fields.
+- [x] Add retention migration, reader locks, durable pins, automatic post-import sweep and a scoped maintenance command.
+- [x] Verify preservation, failed imports, scope/CAS, retention and PostgreSQL read/publish races; update guide and smoke checks.
+
+Default retention: active plus one previous snapshot, seven days after supersession.
+Keep publication manifests; sweep record payloads only. Mappings requiring review
+retain their last valid batch. Durable pins protect longer-running consumers.
+
 ## Local intake review fixes (completed)
 
 - [x] Reproduce Windows long-path import failure, discarded-batch reuse during
@@ -17,6 +30,32 @@ checklist for the whole story rather than duplicating the guide.
 
 Verification: eight regression cases failed before the fixes. All 91 backend
 tests now pass on Windows, including 11 local-store tests. Diff whitespace checks pass.
+
+## PostgreSQL intake migration (implemented and tested)
+
+- [x] Add versioned intake tables and database-backed writer/reader.
+- [x] Switch HTTP import/list to the configured application database; no local-file fallback.
+- [x] Test data preservation, isolation, publication, cleanup and HTTP flow.
+- [x] Document deployment migration, existing-local-data boundary and verification limits.
+
+Preserve all existing working changes, including the user's deleted .env.example.
+Do not commit or push. Do not apply migrations to shared databases automatically.
+
+Verification: 102 tests passed in the local suite (12 environment-specific skips).
+All 10 PostgreSQL intake tests passed separately in disposable developer-owned schemas,
+including row-lock publication races and the authenticated HTTP flow. Test schemas
+were removed. Existing application schema migration remains a deployment step.
+
+## Authenticated file import integration (historical local-storage phase)
+
+- [x] Replace demo upload authentication and CSRF with shared auth.
+- [x] Configure scoped local storage and add POST /api/sources/uploads.
+- [x] Add GET /api/sources for published active snapshots.
+- [x] Connect import UI and persistent source list with explicit error states.
+- [x] Verify actual login/import/list/refresh/isolation/sample flow and frontend behavior.
+
+That initial slice used local intake; MongoDB/DocumentDB, Mapping Studio UI integration and
+final deployment verification remain separate. No commits or merges requested.
 
 ## Completed implementation
 
@@ -41,9 +80,11 @@ tests now pass on Windows, including 11 local-store tests. Diff whitespace check
 - [ ] Agree with the database owner on storage locations, filename identity rules,
   atomic publication, durable completion markers and reader retention.
 - [x] Implement the local writer; complete additional concurrency/crash verification separately.
-- [ ] Integrate real organization authorization and the HTTP import/persistence UI.
-- [ ] Implement reconciliation, retry/idempotency and old-snapshot cleanup.
-- [ ] Agree field identity with the mapping owner and preserve compatible mappings.
+- [x] Integrate real organization authorization and the HTTP import/persistence UI.
+- [x] Implement PostgreSQL old-snapshot cleanup with reader and mapping protection.
+- [ ] Implement abandoned-staging reconciliation and automatic retry/idempotency.
+- [x] Add conservative field identity and preserve definitions through the approved US2 mapping API.
+- [ ] Integrate the mapping UI/owner workflow with the US2 API.
 - [ ] Add MongoDB/DocumentDB connections that read source data in place.
 - [ ] Run end-to-end acceptance checks against real storage before marking US2 done.
 
@@ -91,3 +132,23 @@ whitespace checks passed. No automated tests were added/run; the earlier 80-test
 result was not rerun. Windows, forced process-kill, power-loss, network filesystem,
 HTTP/auth integration and broader crash/stress verification remain unverified.
 See the finalized implementation record in the guide for details and limits.
+
+Integration verification: 93 backend tests passed, 1 optional PostgreSQL test skipped.
+TypeScript/build and mocked browser import smoke passed. A disposable real browser-to-Flask import flow also passed. Live team database
+verification remains outstanding; see the guide.
+
+Current storage: PostgreSQL via revision 0002_intake. Existing local imports are
+not automatically migrated. No commit/push performed.
+
+
+Mapping/retention verification (2026-10-17): the full backend run passed 112 tests
+with 24 environment-specific skips and the existing development-secret warning.
+After adding the scoped maintenance-command check and final request guards, the
+focused mapping/configuration run passed 16 tests with 12 skips. All 20 real
+PostgreSQL variants (10 intake, 10 mapping/retention) passed in disposable schemas,
+covering existing-data migration, reader locks and publication racing with cleanup.
+The first PostgreSQL test selection also selected a SQLite variant that hit a
+Windows temporary-directory permission error; corrected PostgreSQL-only selection
+passed. Test schemas were removed. Diff whitespace checks passed. No existing
+application schema, private .env, or team data was changed; no commit/push occurred.
+The US5 UI remains a separate integration task. The legacy local adapter is unchanged.

@@ -6,12 +6,15 @@ checks are in [smoke tests](../docs/smoke-tests.md).
 
 ## Current scope
 
-File parsing/validation, the validation API/UI, metadata, import orchestration and
-a concrete local intake writer and published-batch sample reader are implemented. Internal callers can persist
-parsed records using LocalIntakeStore and read a pinned published batch. The web UI remains validation-only: it does
-not call the import service, save records, create a source, or advance discovery.
-The source list/database connection flow remain prototypes. Real authorization,
-HTTP import/UI and US3 discovery integration are still required for complete US2.
+Authenticated file validation/import, organization-scoped source listing, metadata,
+PostgreSQL intake storage and the published-batch sample reader are implemented.
+The web UI saves validated files and reloads published sources. Shared authentication
+supplies organization identity; storage environment comes from server configuration.
+Mapping persistence/reconciliation and PostgreSQL snapshot retention are implemented.
+MongoDB/DocumentDB connections, discovery/mapping UI integration and deployment
+verification remain outstanding. The web flow now uses intake tables
+in the configured application PostgreSQL database. Local JSON Lines storage is
+retained for compatibility/testing but is no longer selected by HTTP routes.
 
 ## Local setup and testing
 
@@ -39,15 +42,40 @@ backend tests; see the verification records below for subsequent changes.
 The optional `-p no:cacheprovider` avoids local pytest cache permission warnings
 without changing test execution.
 
-For the web flow, run `src\start-app.bat` from the repository root, open
-http://127.0.0.1:5173, and sign in with a nonempty email/password (demo login).
-Choose Upload File → Choose File → Validate File and use the sample CSV. Success
-shows counts and corrections and explicitly says nothing is saved.
+For the web flow, provision a real account using [the auth guide](auth-api.md).
+Configure these settings in `src/backend/.env` (an existing private file; do not
+commit credentials), or in the environment inherited by the backend:
 
-Neither the parser nor the current web API needs a database. This branch's demo login
-stores a user in the signed session cookie; it is not production credential
-validation or organization authorization. There are no imports from the
-unfinished `feature-login` branch.
+```dotenv
+GENLEDGE_INTAKE_ENVIRONMENT=development
+```
+
+Keep the existing HOST, PORT, DATABASE, USER, PASSWORD and TLS settings used by
+authentication. Intake uses that same configured PostgreSQL engine, in separate
+`intake_*` tables. GENLEDGE_INTAKE_ROOT is no longer read by the web application.
+The intake environment defaults to APP_ENV. A non-PostgreSQL runtime or missing
+migrations produces 503 on import/list; it never silently saves to local files.
+SQLite remains available only in isolated tests (Flask TESTING=True).
+
+From `src/backend`, apply migrations to your authorized developer database before
+starting the server (this existing command applies all application migrations):
+
+```powershell
+.\.venv\Scripts\python.exe -m flask --app main auth-db-check
+.\.venv\Scripts\python.exe -m flask --app main auth-init-db
+```
+
+Revision `0002_intake` follows `0001_auth_tables`; it creates intake tables and
+preserves existing auth data. Startup/import requests do not automatically migrate.
+Existing local files/catalogs are untouched and are not automatically imported.
+Re-upload originals to populate PostgreSQL, or arrange a separate migration if old
+batch IDs and their downstream references need to be preserved.
+
+Run `src\start-app.bat`, sign in at http://127.0.0.1:5173, then choose Upload File,
+Choose File and Import File. The server parses the complete file before writing,
+reports success only after publication and refreshes the source list. Reloading the
+page or restarting the backend retains sources when the same database/environment are
+used. Same-filename imports update the source; old published batches remain readable.
 
 ## Code walkthrough
 
@@ -59,39 +87,66 @@ unfinished `feature-login` branch.
 3. The result is a `ParsedFile` with `ParsedCollection` objects containing full
    records. The import service passes these to an intake writer after
    parsing returns successfully. Do not use the summary as the import payload.
-4. `routes.py` checks the demo session, verifies its upload-specific CSRF token,
-   and returns `summary()`. Its session check is the boundary to update when the
-   shared authentication helper lands; no parser changes should be necessary.
-5. `UploadFileModal.tsx` displays validation progress, errors, counts and corrections.
-   It does not navigate or add a fake saved source on success.
+4. `routes.py` verifies the shared revocable session and CSRF token. It derives
+   organization from `g.user`, never submitted form fields, and calls `import_file`.
+5. `UploadFileModal.tsx` shows publication results and header corrections; the source
+   screen reloads saved manifests. Discovery/connect actions remain disabled until
+   their actual integrations are implemented.
 
 ## API
 
-Two US2 endpoints are currently implemented on the Flask backend (default port
+Eight US2 endpoints are currently implemented on the Flask backend (default port
 5000). The frontend uses relative `/api/...` URLs, proxied by Vite on port 5173.
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
 | GET | `/api/sources/uploads/csrf` | Obtain the session's upload CSRF token |
 | POST | `/api/sources/uploads/validate` | Parse and validate one uploaded file without saving it |
+| POST | `/api/sources/uploads` | Validate and publish a file import |
+| GET | `/api/sources` | List this organization/environment's active published sources |
+| GET | `/api/sources/<sourceId>/fields` | Active field identities, paths and observed types |
+| GET | `/api/sources/<sourceId>/mappings` | Persisted mapping definitions and validity status |
+| PUT | `/api/sources/<sourceId>/mappings/<mappingId>` | Save mapping work against an expected active batch |
+| DELETE | `/api/sources/<sourceId>/mappings/<mappingId>` | Delete mapping work against an expected active batch |
 
-Request order: sign in through the existing auth API, fetch the upload token,
-then send the file with that token using the same session cookie. There is no
-HTTP endpoint for persisting imports or registering database connections yet;
-the writer interface is an internal Python contract, not an HTTP API.
+Request order: fetch the auth CSRF token, sign in through the existing auth API,
+fetch the rotated token, then upload using the same session cookie. The upload
+CSRF route is an authenticated compatibility alias for the shared token.
+There is no database-connection registration endpoint yet.
+
+### POST /api/sources/uploads and GET /api/sources
+
+Import accepts exactly one multipart `file`, with the shared X-CSRF-Token header.
+It re-parses the uploaded bytes regardless of any earlier validation. Organization
+and environment fields submitted by callers do not select storage scope.
+Success is HTTP 201: `{"status":"imported","persisted":true,"source":{...}}`.
+The source contains sourceId, batchId, filename, environment, format, sizeBytes,
+uploadedAt (UTC ISO timestamp), and collections with collectionId, name, rowCount,
+headers and warnings. No records, intake paths or credentials are returned.
+
+Listing is HTTP 200: `{"sources":[...]}` using the same source representation,
+newest upload first. It includes only active published batches, not staged/failed
+imports or historical snapshots. An empty scope returns an empty list.
+All routes require current authentication and return Cache-Control: no-store.
+
+Import uses the validation error statuses below, plus 409 publication_conflict
+and 503 for unavailable storage or import failures. A publication_unknown result
+includes batchId because publication may have committed despite a lost acknowledgement.
+Refresh the source list before retrying; requests are never retried automatically.
+The UI likewise treats a timeout/network failure as an uncertain outcome.
 
 ### GET /api/sources/uploads/csrf
 
 - Requires a signed-in session; no request body or CSRF header is needed.
 - Returns 200 with `{"csrfToken": "<token>"}`, or 401 if signed out.
 - Creates a token if the session has none; otherwise returns the existing token.
-- Tokens are stored under `sources_csrf_token` in the session. Existing login
+- Tokens are stored under `csrf_token` in the session. Existing login
   and logout clear the session, invalidating the token for subsequent requests.
 - Returns `Cache-Control: no-store`.
 
 ### POST /api/sources/uploads/validate
 
-- Signed-in demo session and `X-CSRF-Token` from
+- Signed-in authenticated session and `X-CSRF-Token` from
   `GET /api/sources/uploads/csrf` required. The token endpoint also requires a
   signed-in session. Both endpoints return `Cache-Control: no-store`.
 - Multipart form with exactly one file in the `file` field.
@@ -134,7 +189,7 @@ return 401 before CSRF validation.
 - Blank headings become `column_N`; whitespace is trimmed. Duplicate headings get
   suffixes without stealing another original heading: `name,name,name_2` becomes
   `name,name_3,name_2`. Original headings, column positions and corrections remain
-  in metadata. These are parser keys, not a finalized mapping identity contract.
+  in metadata. PostgreSQL field identity uses the conservative rules in the mapping section below.
 - XLSX/XLS: each worksheet becomes a collection, including hidden sheets. Empty
   sheets fail; header-only sheets are valid with zero records. Missing trailing
   cells become null; dates/times become ISO strings. XLSX formulas and Excel error
@@ -202,10 +257,9 @@ snapshot = import_file(
 )
 ```
 
-There is intentionally no HTTP import route yet. This branch's demo login cannot supply
-real organization authorization. The eventual route must authorize scope before
-calling this function and must parse the actual uploaded bytes again rather than
-trusting an earlier browser validation summary.
+The HTTP import route authorizes identity through shared login, selects server-side
+scope and passes the actual uploaded bytes to this service. It never trusts a
+browser validation summary as stored data.
 
 The service performs these steps:
 
@@ -241,9 +295,91 @@ If metadata and intake records live in separate databases, do not assume a
 cross-database transaction exists. Store immutable data first; make the metadata
 pointer the publication boundary and reconcile abandoned staging separately.
 Readers must resolve and pin one batch manifest for an operation. Old-snapshot
-cleanup needs reader retention rules and is not part of this service.
+cleanup is separate from publication; the PostgreSQL adapter now implements the retention policy below.
 
-## Persistent local writer
+## PostgreSQL intake writer (current HTTP storage)
+
+`PostgresIntakeStore(engine, organization_id=..., environment=...)` implements the
+same writer and read_sample/published_snapshot/list_sources methods. HTTP callers
+use the shared authenticated organization; changing submitted organization or
+environment fields does not change storage scope. Do not expose the adapter to
+untrusted code or give end users direct database credentials: application scoping
+is not PostgreSQL row-level security.
+
+| Table | Contents |
+| --- | --- |
+| intake_sources | Scoped source identity and active published batch pointer |
+| intake_batches | Immutable manifest, publication status, retained discard markers |
+| intake_collections | Collection identity, row count and completion marker |
+| intake_records | Parsed object per row, ordered by ordinal, in payload JSON |
+| intake_fields | Per-batch field paths, stable IDs and observed non-null types |
+| source_mappings | Definitions, validity and last-valid/last-checked batch references |
+| intake_pins | Durable consumer pins preventing payload cleanup |
+
+Each worksheet is a separate logical collection, not a dynamically named SQL table.
+Use source/collection/batch IDs to group records. Published history is retained.
+Data and metadata now live in PostgreSQL; no record files or local catalog are used.
+The existing safe intake_name stays metadata rather than becoming a SQL identifier.
+
+Records use PostgreSQL JSON rather than JSONB, with ASCII-escaped serialization,
+to preserve parser-accepted Unicode escapes and numeric values. No JSON operators
+or casts to JSONB are applied by the sample reader. Some PostgreSQL JSON processing
+functions impose stricter Unicode rules; see [PostgreSQL JSON documentation](https://www.postgresql.org/docs/17/datatype-json.html).
+Original keys, nested arrays/objects, leading-zero strings, null and booleans are
+preserved. Non-finite values are rejected before commit. This stores parsed values,
+not an exact copy of the uploaded file bytes.
+
+Collection records are inserted in chunks inside one transaction and completion
+is committed with them. Batch row locks serialize writing, publishing and discard.
+Publication locks the source row (created during staging, including first imports),
+checks expected_batch_id, then updates status and active pointer atomically. A
+competing publisher receives PublicationConflict. Reads pin a published batch and
+use ORDER BY ordinal LIMIT (at most 500). The read holds a shared batch lock through
+record retrieval. Published manifests remain; eligible old record payloads may be swept.
+Discard deletes only staged rows in one transaction and retains a batch tombstone;
+reuse of a discarded ID fails. Acknowledgement loss after publication retains data
+for reconciliation. No automatic import retry or orphan reconciliation worker is
+introduced. After successful HTTP import, a separate retention sweep can remove
+eligible superseded payloads. A failed sweep never rolls back a published import.
+
+For database inspection, using your authorized database account:
+
+```sql
+SELECT scope_id, source_id, active_batch_id FROM intake_sources;
+SELECT scope_id, batch_id, source_id, status FROM intake_batches;
+SELECT collection_id, row_count, complete FROM intake_collections;
+SELECT r.collection_id, r.ordinal, r.payload
+FROM intake_records r
+JOIN intake_sources s ON s.scope_id = r.scope_id AND s.active_batch_id = r.batch_id
+ORDER BY r.batch_id, r.collection_id, r.ordinal
+LIMIT 20;
+```
+
+These administrative queries can see all organizations accessible to that database
+role. Application API queries always select the authorized organization/environment.
+
+### Database integration tests
+
+Run the normal suite without external services. For PostgreSQL-specific tests, set
+TEST_DATABASE_URL privately to a developer-owned PostgreSQL URL (role name equals
+database name, non-superuser) and use DB_SSLMODE=require/verify-ca/verify-full plus
+DB_SSLROOTCERT where required. Never commit the URL. Then run:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_postgres_intake.py tests/test_postgres_integration.py -q -p no:cacheprovider
+```
+
+The PostgreSQL fixtures create a random intake_test_* schema and drop only that
+schema afterward. They test migrations, JSON edge cases, authenticated HTTP imports,
+isolation, rollback, pinned sampling and concurrent first publication/refresh.
+SQLite variants cover application behavior but do not establish PostgreSQL locking,
+JSON compatibility or durability. Never point tests at a shared integration database.
+
+## Persistent local writer (legacy internal adapter)
+
+The following describes the retained local adapter, not the current web storage.
+
+
 
 `app.sources.local_store.LocalIntakeStore` implements the existing IntakeWriter
 contract using JSON Lines record files and a standard-library SQLite catalog.
@@ -335,9 +471,8 @@ network share. Writes in one organization/environment serialize through the
 catalog lock, including collection I/O; this is a deliberate bounded-file MVP
 trade-off. SQLite/storage errors propagate rather than silently retrying.
 
-No external database, new runtime dependency, Flask configuration or HTTP endpoint
-is added. This branch still uses its old demo authentication for validation;
-current shared authentication must be integrated before enabling web persistence.
+The local adapter itself requires no external database. HTTP integration now uses
+shared authentication, configured intake storage and the endpoints described above.
 
 ### Published-batch reader
 
@@ -381,7 +516,8 @@ is the full parsed batch count; len(records) is only the sampled count.
 Upload batch IDs and US3 inventory snapshot IDs remain distinct. This adapter
 provides parsed records plus stable source/collection/batch identity, not a
 DiscoveryResult or an InventoryView. It does not publish discovery metadata,
-provide source-listing endpoints or change the upload UI.
+run discovery itself. Source listing and upload UI integration are implemented by
+the HTTP layer described above.
 
 ## Failure semantics
 
@@ -402,10 +538,11 @@ provide source-listing endpoints or change the upload UI.
 ## Mapping boundary
 
 Stable source/collection IDs give the mapping feature a durable reference across
-refreshes. Header metadata is retained for later field matching. This does not
-implement field discovery, stable duplicate-header identity, type compatibility,
-or mapping reconciliation. Those rules must be agreed with the mapping owner;
-the import service does not delete or rewrite mappings.
+refreshes. Header metadata and per-batch field profiles now support conservative identity and
+type checks. PostgreSQL publication reconciles saved US2 mapping definitions in
+the same transaction as the active-batch switch. Definitions are never rewritten
+by refresh. See the mapping API contract below. The existing US5 Mapping Studio
+still uses fixtures and must adopt this API; it is not connected automatically.
 
 ## Verification and database handoff
 
@@ -416,9 +553,9 @@ publication. It is a synchronous test double, not evidence of real database
 atomicity, durability, crash recovery or thread/process safety.
 
 The concrete local adapter is now available; the fake writer remains useful only
-for orchestration checks. Filename identity, reader retention, authenticated HTTP
-import/UI, reconciliation, retry/idempotency, mapping preservation and external
-source connections remain integration work. Real multi-process contention and
+for orchestration checks. Filename identity, reader retention, reconciliation, retry/idempotency,
+external source connections remain integration work. PostgreSQL mapping
+preservation and snapshot retention are implemented below. Real multi-process contention and
 crash/power-loss behavior require separate verification; the historical fake-writer
 suite does not establish those properties for LocalIntakeStore.
 
@@ -516,3 +653,189 @@ and its [atomic commit model](https://www.sqlite.org/atomiccommit.html); record
 flushes follow [Python os.fsync](https://docs.python.org/3/library/os.html#os.fsync).
 These references describe mechanisms, not verification of this application's
 hardware or all crash scenarios.
+
+
+## Historical local-adapter HTTP integration verification
+
+Completed in order: shared authentication/CSRF (including removal of a stale merge
+registration that prevented startup), import endpoint, published source listing,
+UI integration, then workflow verification. Backend tests use actual password login,
+revocable sessions, disposable SQLite auth and real local intake storage; they do
+not mock the writer. They cover refresh identity, validation leaving old data intact,
+organization isolation, restart/reopen persistence, pinned US3 reads, storage errors,
+publication conflicts and lost publication acknowledgements.
+
+Verification: 93 backend tests passed, 1 optional PostgreSQL test skipped. TypeScript
+and production build passed. Browser smoke with mocked HTTP responses passed for
+multipart/CSRF, file limits, errors, saved-list reload and no duplicate row. A separate real browser-to-Flask run using disposable SQLite auth/local intake
+also passed login, import, reload, same-filename refresh and invalid-refresh preservation.
+This is not a live team PostgreSQL test. No team credentials
+or data were accessed. Discovery and Mapping Studio UI integration remain follow-up work.
+
+
+## PostgreSQL implementation verification
+
+The initial connection probe failed inside the restricted network sandbox. A
+read-only probe outside that sandbox succeeded and confirmed a non-superuser
+account in its own developer database. All 10 PostgreSQL intake integration tests
+then passed using randomly named temporary schemas; fixture cleanup removed them.
+They covered incremental/idempotent migration preserving auth data, JSON Unicode
+edge cases, 500-record sampling, scope isolation, atomic write rollback, publication
+conflicts, lost acknowledgements, concurrent first imports/refreshes and real
+password-authenticated HTTP upload/list requests. Existing application tables and
+local intake files were not migrated or modified by these tests.
+
+The default local suite passed 102 tests with 12 environment-specific skips; SQLite
+variants use the same database adapter, not LocalIntakeStore. The PostgreSQL test
+run separately executed all 10 PostgreSQL variants. No power-loss or broad load test
+was performed. Apply auth-init-db to the intended application schema before normal
+use. The UI/API response contract is unchanged. Nothing was committed or pushed.
+
+
+## Mapping preservation API and retention (revision 0003_mapping_retention)
+
+Apply pending migrations with the existing `auth-init-db` command before starting
+the updated backend. This adds intake_fields, source_mappings and intake_pins,
+plus retired_at/purged on intake_batches. Existing records and accounts remain.
+Previously superseded snapshots receive a retirement timestamp at migration time
+so they get the full grace period. Field profiles for older active snapshots are
+built lazily on first field/mapping access, under the source lock. New uploads
+profile all records in the same transaction as collection completion.
+
+### Field identity and saved work
+
+Fetch `GET /api/sources/<sourceId>/fields` using an authenticated session. The result
+contains sourceId, batchId and fields. Each field has fieldId, collectionId, path,
+kinds and matchable. Path segments are exact JSON object keys; null denotes any
+array element. For example `["lines", null, "sku"]` is different from a literal
+key `["lines[].sku"]`. Types are string, number, boolean, object and array; null
+adds no observed type. Integers and floating-point values share number.
+
+IDs use stable collection identity and structural path. Unique spreadsheet/CSV
+headings use their trimmed original name, so column reordering preserves identity.
+Blank or duplicate headings are ambiguous: their field IDs include the batch and
+cannot be automatically matched on refresh, even if parser-generated names look
+identical. They can still be explicitly mapped within the current batch.
+JSON keys preserve their exact spelling. Matching fields must have unchanged
+observed non-null types; new null-only data is allowed, while unknown-to-known or
+changed/mixed types require review. Renames are not guessed.
+
+Save a mapping with PUT, the session cookie and X-CSRF-Token:
+
+```text
+PUT /api/sources/<sourceId>/mappings/customer-name
+```
+
+```json
+{
+  "expectedBatchId": "<batchId returned with fields>",
+  "collectionId": "<collectionId>",
+  "fieldIds": ["<fieldId>"],
+  "definition": {
+    "target": "customer_name",
+    "transform": {"operation": "uppercase"},
+    "humanNote": "Keep the reviewer decision"
+  }
+}
+```
+
+Mapping IDs accept 1-128 letters, digits, underscores or hyphens. Supply 1-1000
+distinct field IDs, all from the same current collection. definition is a nonempty
+JSON object limited to 100 KB. It is stored verbatim as JSON data, not interpreted
+or executed. The mapping feature must list every source-field dependency in
+fieldIds and validate its own target/transform language. Cross-collection joins
+and approved model-version semantics are outside this small US2 persistence API.
+
+GET `/api/sources/<sourceId>/mappings` returns batchId and mappings with mappingId,
+collectionId, fieldIds, definition, status, validBatchId and checkedBatchId.
+On refresh, matching fields keep definition unchanged and move validBatchId to the
+new batch. Removed, ambiguous or incompatible fields become needs_review; their
+original definition and last valid batch remain. checkedBatchId identifies the
+latest refresh. A field restored with a compatible identity can validate again.
+Downstream execution must use only mappings with status=valid and matching
+checkedBatchId/validBatchId for its chosen batch; this API does not execute them.
+
+PUT explicitly saves/reviews the mapping against the latest batch. DELETE uses
+the same URL and a JSON body containing only expectedBatchId; both require CSRF.
+Stale-batch writes/deletes return 409, unknown or foreign-scope sources return 404,
+and malformed definitions/references return 400. Concurrent mapping edits on the
+same batch use last-write-wins semantics. US5's fixture UI is not connected to this
+API yet, and existing browser-only fixture edits are not migrated into it.
+
+Publication locks the source and reconciles mappings in the same transaction as
+the active pointer change. Failed parsing, staging or publication leaves the old
+snapshot and mappings intact. Mapping definitions do not automatically change
+when data changes. There is no full schema-discovery or mapping assistant here.
+
+### Safe snapshot cleanup
+
+Defaults, optionally configurable in the existing private backend `.env`:
+
+```dotenv
+GENLEDGE_INTAKE_KEEP_PREVIOUS=1
+GENLEDGE_INTAKE_GRACE_DAYS=7
+```
+
+Both are nonnegative integers. Active data is always protected. The newest N
+superseded snapshots are kept regardless of age; additional snapshots become
+eligible only after the grace period measured from supersession, not upload time.
+A sweep runs after successful HTTP publication in a separate transaction. Its
+failure produces an import-success response with a maintenance warning and a
+server log entry; it does not report a failed upload. The current upload dialog
+continues to show publication success. No scheduled background worker is installed.
+For a source that receives no further uploads, an administrator can run:
+
+```powershell
+.\.venv\Scripts\python.exe -m flask --app main intake-sweep --organization ORG_ID --source SOURCE_ID
+```
+
+The command uses the configured environment and policy, and is intentionally
+scoped to one organization/source. It requires trusted operator database access.
+For a disposable test only, set both policy values to zero to make the first
+superseded snapshot immediately eligible. This permanently removes its record
+payloads; do not use that setting on data you need to retain.
+
+A sweep takes the source lock, verifies the active batch, and attempts exclusive
+locks on eligible old batches with SKIP LOCKED. read_sample holds a shared batch
+lock from metadata validation through record retrieval, so active reads are never
+truncated by cleanup. Sweeps skip busy batches and can retry on the next import or
+maintenance invocation. SQLite tests cover behavior only, not these row-lock guarantees.
+
+Longer workflows spanning multiple reads must pin before relying on old data:
+
+```python
+store.pin_snapshot(source_id, batch_id, "discovery-job-123")
+try:
+    snapshot = store.published_snapshot(source_id, batch_id)
+    records = store.read_sample(source_id, batch_id, collection_id, limit=500)
+finally:
+    store.release_pin(batch_id, "discovery-job-123")
+```
+
+Use a unique pin ID per consumer. Pins are durable, scoped and idempotent; they do
+not expire automatically. A crashed consumer's pin must be explicitly released
+once the operator confirms its data is no longer needed. Pin acquisition and
+cleanup serialize on the batch lock; pinning already expired data fails explicitly.
+Mapping rows also protect their validBatchId. In particular, needs_review mappings
+keep their last usable data until the mapping is explicitly updated or deleted.
+
+Cleanup removes intake_records rows and sets purged=true, retaining manifests,
+collection/field metadata, batch IDs and publication history. published_snapshot
+can still return that metadata for reconciliation; read_sample and pin_snapshot
+raise SnapshotExpiredError for expired payloads. They never silently redirect to
+the current batch. Metadata continues to grow and is not swept in this slice.
+The legacy LocalIntakeStore remains unchanged and retains its old file snapshots.
+Abandoned staging reconciliation and automatic import retries remain separate work.
+
+
+Mapping/retention verification (2026-10-17): the full backend run passed 112 tests
+with 24 environment-specific skips and the existing development-secret warning.
+After adding the scoped maintenance-command check and final request guards, the
+focused mapping/configuration run passed 16 tests with 12 skips. All 20 real
+PostgreSQL variants (10 intake, 10 mapping/retention) passed in disposable schemas,
+covering existing-data migration, reader locks and publication racing with cleanup.
+The first PostgreSQL test selection also selected a SQLite variant that hit a
+Windows temporary-directory permission error; corrected PostgreSQL-only selection
+passed. Test schemas were removed. Diff whitespace checks passed. No existing
+application schema, private .env, or team data was changed; no commit/push occurred.
+The US5 UI remains a separate integration task. The legacy local adapter is unchanged.
