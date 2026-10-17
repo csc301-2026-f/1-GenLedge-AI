@@ -1,144 +1,162 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react'
-import { T, cx, StatusPill, Btn, TextInput, SelectInput, Ico, Pager, SortIcon, TH, TR, TD, FilterBar, SearchBox, FilterSelect, PageHeader, Panel, InfoRow, Modal, Alert, TypeTag } from '../../shared'
-import type { Screen, Nav } from '../../app/types'
+import { useEffect, useRef, useState } from 'react'
+import { T, Btn, StatusPill, PageHeader, Alert, TypeTag } from '../../shared'
+import type { Nav } from '../../app/types'
+import { clearPendingEdit, readPendingEdit, savePendingEdit, type SavedEditRequest } from './editRequests'
+import { createJob, editJob, forget, readJob, readPackage, requestKey, RoutingError, store, type Decision, type Job, type ReviewPackage } from './client'
 
-// ─── US4 — AI Routing ─────────────────────────────────────────────────────────
-const ROUTE_DATA = [
-  {
-    table: 'fact_orders', isNew: false, confidence: 92, mergeKey: 'order_id',
-    reason: 'Top-level order document fields map cleanly to existing fact_orders table. Recommend reuse with 5 new columns held for approval.',
-    fields: [
-      { src: 'order_no', tgt: 'order_number', type: 'string' },
-      { src: 'customer_id', tgt: 'customer_id', type: 'ObjectId' },
-      { src: 'total', tgt: 'total_amount', type: 'number' },
-      { src: 'order_date', tgt: 'order_date', type: '!ambiguous' },
-      { src: 'status', tgt: 'order_status', type: 'string' },
-    ],
-  },
-  {
-    table: 'fact_order_lines', isNew: true, confidence: 87, mergeKey: 'order_id + sku',
-    reason: 'Repeating lines[] array should be expanded: each array element produces one row in a new fact_order_lines table, linked by order_id.',
-    fields: [
-      { src: 'lines[].sku', tgt: 'sku', type: 'string' },
-      { src: 'lines[].qty', tgt: 'quantity', type: 'number' },
-      { src: 'lines[].unit_price', tgt: 'unit_price', type: 'number' },
-      { src: 'lines[].discount_pct', tgt: 'discount_pct', type: 'number' },
-    ],
-  },
-  {
-    table: 'dim_customers', isNew: false, confidence: 78, mergeKey: 'customer_id',
-    reason: 'customer_id and customer_name link to existing dim_customers. Low confidence due to incomplete customer attribute data in this source.',
-    fields: [
-      { src: 'customer_id', tgt: 'customer_id', type: 'ObjectId' },
-      { src: 'customer_name', tgt: 'customer_name', type: 'string' },
-    ],
-  },
-]
+export function RouteScreen({ jobId, owner, onJob, onNav, onInvalidate }: {
+  jobId: string; owner: string; onJob: (id: string) => void; onNav: Nav; onInvalidate: () => void
+}) {
+  const [job, setJob] = useState<Job | null>(null)
+  const [review, setReview] = useState<ReviewPackage | null>(null)
+  const [error, setError] = useState('')
+  const [loadError, setLoadError] = useState('')
+  const [pendingEdit, setPendingEdit] = useState(() => readPendingEdit(owner, jobId))
+  const pendingEditRef = useRef(pendingEdit)
+  const requestEpoch = useRef(0)
+  const [notice, setNotice] = useState('')
+  const [attempt, setAttempt] = useState(0)
+  const [saving, setSaving] = useState(false)
+  const busy = useRef(false)
 
-export function RouteScreen({ onNav, onAdvance, onInvalidate }: { onNav: Nav; onAdvance: () => void; onInvalidate: () => void }) {
-  const [decisions, setDecisions] = useState<Record<string, 'accept' | 'reject' | null>>({})
-  const decide = (table: string, dec: 'accept' | 'reject') => {
-    onInvalidate()
-    setDecisions(d => ({ ...d, [table]: d[table] === dec ? null : dec }))
+  useEffect(() => {
+    let active = true
+    let timer: ReturnType<typeof setTimeout>
+    async function refresh() {
+      const epoch = requestEpoch.current
+      try {
+        const status = await readJob(jobId)
+        const result = await readPackage(jobId)
+        if (!active) return
+        // A response started before a submission must not erase its retry record.
+        if (busy.current || epoch !== requestEpoch.current) {
+          timer = setTimeout(refresh, 1000)
+          return
+        }
+        setLoadError('')
+        setJob({ ...status, status: result.status, failure: result.failure })
+        setReview(result.payload)
+        const saved = pendingEditRef.current
+        if (saved && ['blocked', 'awaiting_review'].includes(result.status) &&
+            result.payload?.decisions[saved.target] === saved.decision) {
+          clearPendingEdit(owner, jobId)
+          pendingEditRef.current = null
+          setPendingEdit(null)
+          setError('')
+        }
+        if (['queued', 'running', 'revising', 'edit_requested', 'approval_requested', 'cancelling'].includes(result.status)) timer = setTimeout(refresh, 1000)
+      } catch (e) {
+        if (active && epoch === requestEpoch.current && !busy.current) setLoadError(e instanceof Error ? e.message : 'Unable to load routing.')
+        else if (active) timer = setTimeout(refresh, 1000)
+      }
+    }
+    void refresh()
+    return () => { active = false; clearTimeout(timer) }
+  }, [jobId, owner, attempt])
+
+  async function submitEdit(edit: SavedEditRequest) {
+    if (busy.current) return
+    busy.current = true; requestEpoch.current += 1
+    setSaving(true); setError(''); setNotice('')
+    // Save before dispatch: an accepted response can be lost or the page reloaded.
+    const sending = { ...edit, uncertain: true }
+    savePendingEdit(owner, jobId, sending)
+    pendingEditRef.current = sending
+    setPendingEdit(sending)
+    try {
+      const result = await editJob(jobId, edit.edit_id, edit.target, edit.decision, edit.idempotency_key)
+      const accepted = { ...edit, uncertain: false }
+      savePendingEdit(owner, jobId, accepted)
+      pendingEditRef.current = accepted
+      setPendingEdit(accepted)
+      setJob(current => current ? { ...current, status: result.status, failure: null } : current)
+      setAttempt(n => n + 1)
+      setNotice(result.replayed ? 'Edit already submitted; replay confirmed.' : 'Edit submitted for processing.')
+      onInvalidate()
+    } catch (e) {
+      // A validation rejection never accepted this request. Other errors can
+      // have an unknown outcome, so retain the exact request across reloads.
+      if (e instanceof RoutingError && [400, 422].includes(e.status)) {
+        clearPendingEdit(owner, jobId)
+        pendingEditRef.current = null
+        setPendingEdit(null)
+        forget(`edit:${owner}:${jobId}:${edit.target}:${edit.decision}`)
+      }
+      setError(e instanceof Error ? e.message : 'Unable to save decision.')
+    } finally { busy.current = false; setSaving(false) }
   }
 
-  return (
-    <div className="fade-in" style={{ display: 'flex', flexDirection: 'column', height: '100%', background: T.bg }}>
-      <PageHeader
-        title="AI Routing Results — AMER_Orders_2026Q3.xlsx / orders"
-        subtitle="AI-proposed warehouse destinations. Review each proposal and accept or reject before proceeding."
-        breadcrumb={['Data Sources', 'SRC-0041', 'Schema Discovery', 'AI Routing']}
-        actions={
-          <Btn variant="primary" onClick={() => { setDecisions(Object.fromEntries(ROUTE_DATA.map(r => [r.table, 'accept']))); setTimeout(onAdvance, 300) }}>
-            <Ico.Check /> Accept All & Open Mapping Studio
-          </Btn>
-        }
-      />
+  function decide(target: string, decision: Decision) {
+    if (busy.current || pendingEditRef.current) return
+    const scope = `edit:${owner}:${jobId}:${target}`
+    forget(`${scope}:${decision === 'accept' ? 'reject' : 'accept'}`)
+    const key = requestKey(`${scope}:${decision}`)
+    return submitEdit({ edit_id: key, idempotency_key: key, target, decision, uncertain: true })
+  }
 
-      <div style={{ padding: '12px 20px', flexShrink: 0 }}>
-        <Alert type="info">
-          The AI model received field paths, inferred types, repeating-field status, and up to 3 sample values per field. No full row data, database credentials, connection strings, or client identifiers were sent to the model.
-        </Alert>
-      </div>
+  const failedEdit = job?.status === 'edit_requested' && Boolean(job.failure)
+  const canRetryEdit = pendingEdit && (pendingEdit.uncertain || failedEdit || Boolean(error) ||
+    ['blocked', 'awaiting_review'].includes(job?.status ?? ''))
 
-      <div style={{ flex: 1, overflow: 'auto', padding: '0 20px 20px' }}>
-        {/* Decisions table */}
-        <div style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 3, overflow: 'hidden', marginBottom: 16 }}>
-          <div style={{ padding: '10px 14px', borderBottom: `1px solid ${T.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ fontSize: `calc(${13}px * var(--font-scale, 1))`, fontWeight: 600, color: T.text }}>Proposed Warehouse Routing ({ROUTE_DATA.length} proposals)</span>
-            <span style={{ fontSize: `calc(${12}px * var(--font-scale, 1))`, color: T.textMid }}>
-              {Object.values(decisions).filter(d => d === 'accept').length} accepted · {Object.values(decisions).filter(d => d === 'reject').length} rejected
-            </span>
+  async function retry() {
+    if (!job || busy.current) return
+    busy.current = true; setSaving(true); setError('')
+    const scope = `retry:${owner}:${jobId}`
+    try {
+      const result = await createJob(job.source_snapshot_id, requestKey(scope))
+      store(`active:${owner}`, result.job_id)
+      onJob(result.job_id)
+    } catch (e) {
+      if (e instanceof RoutingError && e.status < 500) forget(scope)
+      setError(e instanceof Error ? e.message : 'Unable to retry routing.')
+    } finally { busy.current = false; setSaving(false) }
+  }
+
+  return <div className="fade-in" style={{ height: '100%', overflow: 'auto', background: T.bg, color: T.text }}>
+    <PageHeader title="AI Routing Results" subtitle="Review the saved proposals and record a decision for each table."
+      actions={<Btn disabled={saving} onClick={() => onNav('discover')}>Schema Discovery</Btn>} />
+    <div style={{ padding: 20, display: 'grid', gap: 16 }}>
+      <div role="status" aria-live="polite">{job ? <><StatusPill status={job.status} /> · Model mode: <strong>{job.model_mode ?? 'Not resolved'}</strong> · Snapshot: {job.source_snapshot_id}</> : 'Loading routing job…'}</div>
+      {loadError && <div role="alert"><Alert type="error">{loadError}</Alert><Btn onClick={() => setAttempt(n => n + 1)} disabled={saving}>Reload status</Btn></div>}
+      {error && <div role="alert"><Alert type="error">{error}</Alert></div>}
+      {failedEdit && <div role="alert"><Alert type="error">{job?.failure?.message} Your previous published decisions are unchanged.</Alert>
+        {!pendingEdit && <p>The original edit request is not available in this tab. Open the tab where you submitted it to retry.</p>}
+      </div>}
+      {pendingEdit?.uncertain && !failedEdit && !saving && <p>The last edit submission was not confirmed. You can retry it safely.</p>}
+      {canRetryEdit && <Btn disabled={saving} onClick={() => void submitEdit(pendingEdit)}>Retry edit</Btn>}
+      {notice && <div role="status">{notice}</div>}
+      {job && !failedEdit && ['edit_requested', 'revising'].includes(job.status) && <Alert type="info">Your edit is pending. The previous published decisions remain visible until processing completes.</Alert>}
+      {job?.status === 'blocked' && <Alert type="warning">This proposal has blockers. Review the findings below. Decisions are saved without clearing validation blockers.</Alert>}
+      {job?.status === 'failed' && <div role="alert"><Alert type="error">{job.failure?.message ?? 'Routing failed.'}</Alert>{job.failure?.retryable && <Btn onClick={() => void retry()} disabled={saving}>Retry routing</Btn>}</div>}
+      {job && ['queued', 'running'].includes(job.status) && <p>Routing is {job.status}. You can refresh this page; the saved job will be reopened.</p>}
+      {job?.status === 'cancelled' && <p>This routing job was cancelled.</p>}
+      {review && <>
+        <h2>Proposed tables ({review.model_draft.tables.length})</h2>
+        {review.model_draft.tables.map(table => <section key={table.id} aria-label={table.name} style={{ background: T.surface, border: `1px solid ${T.border}`, padding: 16, borderRadius: 4 }}>
+          <h3>{table.name} · {review.is_new[table.id] === true ? 'New table' : review.is_new[table.id] === false ? 'Reuse table' : 'Table action unavailable'}</h3>
+          <p>{table.rationale}</p>
+          <p>Merge key: <code>{table.key.join(' + ')}</code></p>
+          <p>Decision: <strong>{review.decisions[table.id] ?? 'Not reviewed'}</strong></p>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+            <Btn disabled={saving || Boolean(pendingEdit) || !['blocked', 'awaiting_review'].includes(job?.status ?? '')} onClick={() => void decide(table.id, 'accept')}>Accept</Btn>
+            <Btn disabled={saving || Boolean(pendingEdit) || !['blocked', 'awaiting_review'].includes(job?.status ?? '')} onClick={() => void decide(table.id, 'reject')}>Reject</Btn>
           </div>
-          <table>
-            <thead>
-              <tr>
-                <TH label="Target Table" col="table" />
-                <TH label="Table Action" col="new" width={110} />
-                <TH label="Confidence" col="confidence" width={100} align="right" />
-                <TH label="Merge Key" col="mergeKey" width={180} />
-                <TH label="Fields Mapped" col="fields" width={110} align="right" />
-                <TH label="Decision" col="decision" width={160} />
-              </tr>
-            </thead>
-            <tbody>
-              {ROUTE_DATA.map(row => (
-                <TR key={row.table} selected={decisions[row.table] === 'accept'}>
-                  <TD><span style={{ fontFamily: "'Consolas','Menlo',monospace", fontSize: `calc(${12}px * var(--font-scale, 1))`, fontWeight: 600, color: T.text }}>{row.table}</span></TD>
-                  <TD><StatusPill status={row.isNew ? 'proposed' : 'connected'} /></TD>
-                  <TD mono right>
-                    <span style={{ fontWeight: 700, color: row.confidence >= 85 ? 'var(--c-027a48)' : row.confidence >= 70 ? 'var(--c-b54708)' : 'var(--c-b42318)' }}>{row.confidence}%</span>
-                  </TD>
-                  <TD mono>{row.mergeKey}</TD>
-                  <TD mono right>{row.fields.length}</TD>
-                  <td style={{ padding: '0 12px', height: 38, borderBottom: `1px solid ${T.borderLight}` }}>
-                    <div style={{ display: 'flex', gap: 6 }}>
-                      <Btn variant={decisions[row.table] === 'accept' ? 'primary' : 'secondary'} onClick={() => decide(row.table, 'accept')}><Ico.Check /> Accept</Btn>
-                      <Btn variant={decisions[row.table] === 'reject' ? 'danger' : 'ghost'} onClick={() => decide(row.table, 'reject')}><Ico.X /> Reject</Btn>
-                    </div>
-                  </td>
-                </TR>
-              ))}
-            </tbody>
+          <table><thead><tr><th>Source fields</th><th>Target column</th><th>Type</th><th>Confidence</th><th>Reason</th></tr></thead>
+            <tbody>{table.attributes.map(attribute => {
+              const mapping = review.mapping_draft.mappings.find(m => m.target === `${table.id}.${attribute.id}`)
+              return <tr key={attribute.id}><td>{mapping?.sources.join(', ') ?? 'No validated mapping'}</td><td>{attribute.id}</td><td><TypeTag type={attribute.type} /></td><td>{Math.round(attribute.confidence * 100)}%</td><td>{mapping?.rationale ?? '—'}</td></tr>
+            })}</tbody>
           </table>
-        </div>
-
-        {/* Field assignment detail */}
-        {ROUTE_DATA.map(row => (
-          <div key={row.table} style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 3, overflow: 'hidden', marginBottom: 12, opacity: decisions[row.table] === 'reject' ? 0.5 : 1 }}>
-            <div style={{ padding: '10px 14px', borderBottom: `1px solid ${T.border}`, display: 'flex', alignItems: 'center', gap: 12, background: decisions[row.table] === 'accept' ? 'var(--c-ecfdf3)' : T.tableHead }}>
-              <span style={{ fontFamily: "'Consolas','Menlo',monospace", fontSize: `calc(${12}px * var(--font-scale, 1))`, fontWeight: 700, color: T.text }}>{row.table}</span>
-              {row.isNew && <StatusPill status="proposed" />}
-              {decisions[row.table] === 'accept' && <StatusPill status="accept" />}
-              <span style={{ fontSize: `calc(${12}px * var(--font-scale, 1))`, color: T.textMid, flex: 1 }}>{row.reason}</span>
-            </div>
-            <table>
-              <thead>
-                <tr>
-                  <TH label="Source Field" col="src" width="40%" />
-                  <TH label="" col="arrow" width={32} />
-                  <TH label="Target Column" col="tgt" />
-                  <TH label="Type" col="type" width={100} />
-                </tr>
-              </thead>
-              <tbody>
-                {row.fields.map(f => (
-                  <tr key={f.src} style={{ background: T.surface }} onMouseEnter={e => (e.currentTarget.style.background = T.rowHover)} onMouseLeave={e => (e.currentTarget.style.background = T.surface)}>
-                    <td style={{ padding: '0 12px', height: 34, fontFamily: "'Consolas','Menlo',monospace", fontSize: `calc(${12}px * var(--font-scale, 1))`, borderBottom: `1px solid ${T.borderLight}`, color: T.text }}>{f.src}</td>
-                    <td style={{ padding: '0 4px', height: 34, borderBottom: `1px solid ${T.borderLight}`, color: T.textMuted, textAlign: 'center' }}><Ico.ArrowR /></td>
-                    <td style={{ padding: '0 12px', height: 34, fontFamily: "'Consolas','Menlo',monospace", fontSize: `calc(${12}px * var(--font-scale, 1))`, borderBottom: `1px solid ${T.borderLight}`, color: T.textMid }}>{f.tgt}</td>
-                    <td style={{ padding: '0 12px', height: 34, borderBottom: `1px solid ${T.borderLight}` }}>
-                      {f.type === '!ambiguous'
-                        ? <span style={{ fontSize: `calc(${11}px * var(--font-scale, 1))`, background: 'var(--c-fff8e6)', border: '1px solid var(--c-ffd591)', color: 'var(--c-7a4800)', padding: '1px 6px', borderRadius: 2, fontWeight: 600 }}>⚠ Review in mapping</span>
-                        : <TypeTag type={f.type} />}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ))}
-      </div>
+        </section>)}
+        <section aria-label="Findings"><h2>Findings ({review.findings.length})</h2>
+          {review.findings.length === 0 && <p>No validation findings.</p>}
+          {review.findings.map((finding, index) => <p key={index}><strong>{finding.severity} · {finding.code}</strong>{finding.target && ` · ${finding.target}`} — {finding.message}</p>)}
+        </section>
+        <section aria-label="Coverage"><h2>Source coverage</h2><table><thead><tr><th>Source field</th><th>Disposition</th><th>Reason</th></tr></thead><tbody>
+          {review.coverage.map((field, i) => <tr key={i}><td>{field.resource_id}.{field.field_path}</td><td>{field.disposition}</td><td>{field.reason}</td></tr>)}
+        </tbody></table></section>
+        {[...review.model_draft.unresolved, ...review.mapping_draft.unresolved].length > 0 && <section><h2>Unresolved</h2>{[...review.model_draft.unresolved, ...review.mapping_draft.unresolved].map((text, i) => <p key={i}>{text}</p>)}</section>}
+      </>}
     </div>
-  )
+  </div>
 }

@@ -20,7 +20,7 @@ The current frontend prototype demonstrates the planned MVP workflow:
 6. Pipeline transform-and-load progress.
 7. Pipeline scheduling and run monitoring.
 
-The prototype currently uses mocked data and interactions. The Flask backend is a scaffold and is not connected to the frontend yet.
+Authentication is connected to Flask. US4 routing now has an API and live frontend client, with repository/graph/validator composition still required on the contract-only integration base. Other prototype screens continue to use mocked data and interactions. See [US4 Person D integration](doc/us4-person-d-api.md) for endpoints, runtime setup, tests, and current limitations.
 
 ## Instructions
 
@@ -55,7 +55,7 @@ The current prototype can be run locally by installing the frontend and backend 
    src\start-app.bat
    ```
 
-5. Open the frontend at `http://127.0.0.1:5173`. The Flask placeholder runs at `http://127.0.0.1:5000`.
+5. Open the frontend at `http://127.0.0.1:5173`. The Flask API runs at `http://127.0.0.1:5000`.
 
 To build the frontend, run `pnpm build` from `src/frontend/`. Vite writes the browser-ready output to the ignored `compiled/` directory. To run the backend smoke test, run `python -m pytest tests` from `src/backend/`.
 

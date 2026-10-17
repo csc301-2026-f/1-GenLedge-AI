@@ -6,7 +6,10 @@ from typing import Literal
 
 from pydantic import Field
 
-from app.agent.contracts import FailureInfo, Identifier, JobStatus, StrictModel
+from app.agent.contracts import (
+    CoverageRecord, FailureInfo, Identifier, JobStatus, MappingDraft, ModelDraft,
+    PersistedArtifact, StrictModel, ValidationFinding,
+)
 
 
 class CreateMappingJobRequest(StrictModel):
@@ -40,5 +43,18 @@ class EditMappingRequest(StrictModel):
 
 
 class EditMappingResponse(StrictModel):
+    job_id: str
+    edit_id: str
+    status: JobStatus
     payload: dict[str, object] | None = None
     replayed: bool = False
+
+
+# HTTP package composition belongs to Person D; all domain values remain canonical.
+class RoutingReviewPackage(PersistedArtifact):
+    model_draft: ModelDraft
+    mapping_draft: MappingDraft
+    findings: list[ValidationFinding]
+    coverage: list[CoverageRecord]
+    is_new: dict[str, bool]
+    decisions: dict[str, Literal['accept', 'reject']] = Field(default_factory=dict)

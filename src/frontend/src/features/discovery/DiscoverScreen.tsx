@@ -2,6 +2,7 @@ import React, { useState, useMemo, useEffect, useRef } from 'react'
 import { T, cx, StatusPill, Btn, TextInput, SelectInput, Ico, Pager, SortIcon, TH, TR, TD, FilterBar, SearchBox, FilterSelect, PageHeader, Panel, InfoRow, Modal, Alert, TypeTag } from '../../shared'
 import type { Screen, Nav } from '../../app/types'
 import { SOURCES_DATA } from '../sources/data'
+import { createJob, forget, requestKey, RoutingError } from '../mappings/client'
 
 // ─── US3 — Schema Discovery ───────────────────────────────────────────────────
 type CollectionName = 'orders' | 'order_lines' | 'customers'
@@ -41,7 +42,24 @@ const FIELD_DATA: Record<CollectionName, { path: string; type: string; nullable:
   ],
 }
 
-export function DiscoverScreen({ onNav, onAdvance, onInvalidate }: { onNav: Nav; onAdvance: () => void; onInvalidate: () => void }) {
+export function DiscoverScreen({ owner, onNav, onAdvance, onInvalidate }: { owner: string; onNav: Nav; onAdvance: (jobId: string) => void; onInvalidate: () => void }) {
+  const [snapshot, setSnapshot] = useState('')
+  const [starting, setStarting] = useState(false)
+  const [routingError, setRoutingError] = useState('')
+  const submitting = useRef(false)
+  const startRouting = async () => {
+    if (submitting.current) return
+    submitting.current = true; setStarting(true); setRoutingError('')
+    const scope = `create:${owner}:${snapshot.trim()}`
+    try {
+      const job = await createJob(snapshot.trim() || null, requestKey(scope))
+      forget(scope)
+      onAdvance(job.job_id)
+    } catch (error) {
+      if (error instanceof RoutingError && error.status < 500) forget(scope)
+      setRoutingError(error instanceof Error ? error.message : 'Unable to start routing.')
+    } finally { submitting.current = false; setStarting(false) }
+  }
   const [selectedSrcId, setSelectedSrcId] = useState('SRC-0041')
   const [srcSearch, setSrcSearch] = useState('')
   const [srcDropOpen, setSrcDropOpen] = useState(false)
@@ -86,11 +104,16 @@ export function DiscoverScreen({ onNav, onAdvance, onInvalidate }: { onNav: Nav;
         actions={
           <>
             <Btn variant="secondary" onClick={() => { onInvalidate(); resample() }} disabled={resampling}><Ico.Refresh />{resampling ? 'Resampling…' : 'Re-sample'}</Btn>
-            <Btn variant="primary" onClick={onAdvance}><Ico.Sparkle /> Run AI Routing</Btn>
+            <Btn variant="primary" onClick={() => void startRouting()} disabled={starting}><Ico.Sparkle />{starting ? 'Starting routing…' : 'Find where this data belongs'}</Btn>
           </>
         }
       />
 
+      <div style={{ padding: '12px 20px' }}>
+        <label>Source snapshot ID <input aria-label="Source snapshot ID" value={snapshot} disabled={starting} onChange={e => setSnapshot(e.target.value)} placeholder="Use configured demo snapshot" /></label>
+        <p>The discovery preview below is illustrative. Routing uses the saved snapshot above, or the configured synthetic demo snapshot when blank.</p>
+        {routingError && <div role="alert"><Alert type="error">{routingError}</Alert></div>}
+      </div>
       {/* Source selector */}
       <div style={{ padding: '12px 20px 0', flexShrink: 0 }}>
         <div style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 3, padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 12 }}>

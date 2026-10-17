@@ -30,6 +30,8 @@ export const T = {
 export type StatusKind = 'success' | 'warning' | 'error' | 'info' | 'neutral' | 'purple'
 
 export const STATUS_MAP: Record<string, StatusKind> = {
+  queued: 'info', awaiting_review: 'warning', blocked: 'error', edit_requested: 'purple',
+  revising: 'info', approval_requested: 'purple', approved: 'success', cancelling: 'warning', cancelled: 'neutral',
   ready: 'success', success: 'success', active: 'success', connected: 'success',
   parked: 'warning', pending: 'warning', scheduled: 'warning',
   failed: 'error', error: 'error',
@@ -55,7 +57,7 @@ export function StatusPill({ status, size = 'sm' }: { status: string; size?: 'xs
   const kind = STATUS_MAP[status.toLowerCase()] ?? 'neutral'
   const [text, bg, border] = STATUS_STYLE[kind]
   const dot = DOT_COLOR[kind]
-  const label = status.charAt(0).toUpperCase() + status.slice(1)
+  const label = (status.charAt(0).toUpperCase() + status.slice(1)).replace(/_/g, ' ')
   return (
     <span style={{
       display: 'inline-flex', alignItems: 'center', gap: 5,
