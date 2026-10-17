@@ -24,6 +24,12 @@ import pytest
 BACKEND = Path(__file__).resolve().parents[2]
 APP = BACKEND / "app"
 
+# The mapping runtime is the documented application-composition seam for loading
+# an injected service factory from GENLEDGE_MAPPING_RUNTIME_FACTORY. It is allowed
+# to resolve that external application module dynamically; agent and execution
+# packages remain covered by the strict rule below.
+ALLOWED_DYNAMIC_IMPORT_FILES = {"app/mappings/runtime.py"}
+
 
 def _imports_in_source(source: str, package: tuple[str, ...]) -> set[str]:
     """Static imports named by a source string, resolved against its package path."""
@@ -159,6 +165,8 @@ def test_no_module_uses_an_unresolvable_dynamic_import():
         if not (APP / package).is_dir():
             continue
         for path in _python_files(package):
+            if path.relative_to(BACKEND).as_posix() in ALLOWED_DYNAMIC_IMPORT_FILES:
+                continue
             if "<unresolvable dynamic import>" in _all_imports(path):
                 offenders.append(str(path.relative_to(BACKEND)))
     assert not offenders, (
