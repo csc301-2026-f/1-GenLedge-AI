@@ -1,6 +1,7 @@
 """Single-host intake storage: JSON Lines records and a transactional local catalog."""
 
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -18,6 +19,17 @@ from .writer import PublicationConflict
 
 class IntakeNotFoundError(LookupError):
     """No accessible intake artifact exists in this store's scope."""
+
+
+def _reject_constant(value: str):
+    raise ValueError(f"Stored JSON contains a non-finite number: {value}")
+
+
+def _finite_float(value: str) -> float:
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError("Stored JSON number exceeds the finite float range.")
+    return result
 
 
 def _encode(snapshot: SnapshotMetadata) -> str:
@@ -63,6 +75,13 @@ class LocalIntakeStore:
         self.organization_id = organization_id
         self.environment = environment
         self.root = root.resolve()
+        # Explicit extended-length paths work even without Windows' global
+        # long-path setting. Preserve already-prefixed paths and UNC syntax.
+        if os.name == "nt":
+            path = str(self.root)
+            if not path.startswith("\\\\?\\"):
+                self.root = Path("\\\\?\\UNC\\" + path[2:] if path.startswith("\\\\")
+                                 else "\\\\?\\" + path)
         self.scope = self.root / stable_id("scope", organization_id, environment)
         self.records = self.scope / "records"
         for directory in (self.root, self.scope, self.records):
@@ -84,6 +103,9 @@ class LocalIntakeStore:
                 CREATE TABLE IF NOT EXISTS active_sources (
                     source_id TEXT PRIMARY KEY,
                     batch_id TEXT NOT NULL REFERENCES batches(id)
+                );
+                CREATE TABLE IF NOT EXISTS discarded_batches (
+                    id TEXT PRIMARY KEY
                 );
             """)
         for directory in (self.records, self.scope, self.root, self.root.parent):
@@ -123,6 +145,9 @@ class LocalIntakeStore:
         if (snapshot.source.organization_id, snapshot.source.environment) != (self.organization_id, self.environment):
             raise PermissionError("Snapshot does not belong to this storage scope.")
         with self._connection(write=True) as connection:
+            if connection.execute("SELECT 1 FROM discarded_batches WHERE id = ?",
+                                  (snapshot.batch_id,)).fetchone():
+                raise ValueError("Cannot reuse a discarded batch ID.")
             connection.execute("INSERT INTO batches (id, source_id, manifest) VALUES (?, ?, ?)",
                                (snapshot.batch_id, snapshot.source_id, _encode(snapshot)))
             connection.executemany("INSERT INTO collections (batch_id, id) VALUES (?, ?)",
@@ -183,6 +208,9 @@ class LocalIntakeStore:
                 raise ValueError("Cannot discard a published batch.")
             # Remove visibility before file cleanup; interrupted cleanup leaves only
             # unreachable files, never a complete manifest pointing at missing data.
+            # Retain the ID forever, including unknown IDs, so another worker
+            # cannot stage it between this commit and filesystem cleanup.
+            connection.execute("INSERT OR IGNORE INTO discarded_batches (id) VALUES (?)", (batch_id,))
             connection.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
         try:
             shutil.rmtree(self._batch_path(batch_id))
@@ -212,7 +240,7 @@ class LocalIntakeStore:
         records: list[dict[str, object]] = []
         with self._collection_path(batch_id, collection_id).open(encoding="utf-8") as stream:
             for line in islice(stream, expected):
-                record = json.loads(line)
+                record = json.loads(line, parse_constant=_reject_constant, parse_float=_finite_float)
                 if not isinstance(record, dict):
                     raise ValueError("Stored collection must contain JSON objects.")
                 records.append(record)

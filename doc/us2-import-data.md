@@ -34,7 +34,8 @@ If `.venv` already exists, reuse it. Run the parser and tests with that interpre
 
 The sample produces `status: validated`, `persisted: false`, one `orders`
 collection and two records. Invalid files exit with code 1 and a validation
-message. The workflow suite has 17 tests; the full backend suite has 80 tests.
+message. The historical pre-local-store run passed 17 workflow tests and 80
+backend tests; see the verification records below for subsequent changes.
 The optional `-p no:cacheprovider` avoids local pytest cache permission warnings
 without changing test execution.
 
@@ -273,6 +274,10 @@ print(manifest.source_id, manifest.batch_id)
 The root contains a hashed directory per organization/environment. Each scope has
 `catalog.sqlite3` and `records/<hashed-batch>/<hashed-collection>.jsonl`. Raw file
 names, source IDs and batch IDs are never interpolated as filesystem paths.
+On Windows, the absolute storage root is normalized to an extended-length path
+before creating directories or opening SQLite and record files. This supports
+the long paths produced by scoped hashes without shortening stable identities.
+It does not establish Windows directory-flush or power-loss guarantees.
 Stored JSON Lines contain parser-produced records, not a byte-for-byte archive of
 the original upload. CSV values remain strings, header corrections remain in
 metadata, and nested JSON values retain their types.
@@ -290,7 +295,8 @@ the root private and outside Git; do not serve it as static files.
 ### Publication and cleanup
 
 - `stage` verifies scope and inserts the unpublished manifest/collections together.
-  Duplicate batch/collection IDs fail through catalog constraints.
+  Duplicate batch/collection IDs fail through catalog constraints. Batch IDs in
+  the catalog's `discarded_batches` tombstones cannot be staged again.
 - `write_collection` checks membership, row count and unfinished state. It writes
   one JSON object per line to a partial file, flushes/fsyncs it, replaces the final
   path and only then commits the completion marker. Empty collections still
@@ -301,10 +307,17 @@ the root private and outside Git; do not serve it as static files.
   BEGIN IMMEDIATE transaction, then marks publication and updates the active
   pointer together. A competing publication raises the existing PublicationConflict.
   Published batches cannot be written again, re-published or discarded.
-- `discard_unpublished` first removes the catalog manifest/completion rows, then
-  removes its files. Interrupted cleanup leaves unreachable staging files rather
-  than a publishable manifest with missing records. Repeating cleanup is safe;
-  real filesystem errors propagate. Old published batches remain immutable.
+- `discard_unpublished` atomically records a durable `discarded_batches` tombstone
+  and removes the unpublished manifest/completion rows, then removes its files.
+  It also tombstones unknown batch IDs, preventing staging from racing their
+  cleanup. Retaining the marker permanently prevents ID reuse while file deletion
+  is pending or retried. Interrupted cleanup leaves unreachable staging files
+  rather than a publishable manifest with missing records. Repeating cleanup is
+  safe; real filesystem errors propagate. Old published batches remain immutable.
+
+Existing catalogs gain the tombstone table on construction without changing
+published records. Restart all workers with the updated adapter; older versions
+do not check tombstones and must not share the catalog during cleanup.
 
 Records and the catalog do not share one transaction. Files are completed before
 the atomic catalog publication; readers must use published metadata only. A crash
@@ -358,7 +371,9 @@ refresh cannot redirect the pinned read to a different batch.
 
 The reader consumes at most min(limit, manifest.row_count) JSON Lines; it does not
 parse record 501 or scan the full collection. A header-only CSV collection returns
-an empty list. Malformed JSON/non-object lines, missing files or truncation before
+an empty list. Non-finite numbers (NaN, Infinity, -Infinity and exponent overflow
+such as 1e999) are rejected when decoding sampled records. Malformed JSON/non-object
+lines, missing files or truncation before
 the expected sampled count fail explicitly instead of producing empty/partial
 success. Corruption beyond the sample is not inspected. The manifest's row_count
 is the full parsed batch count; len(records) is only the sampled count.
@@ -450,7 +465,8 @@ The implemented slice follows this sequence:
 - [x] Keep parser/import orchestration unchanged and preserve the validation-only HTTP/UI boundary.
 - [x] Document publication, scope, cleanup, retry/reconciliation and filesystem limits in this guide and the maintained story plan.
 
-Recorded manual inspection used a disposable local root with synthetic data:
+Historical manual inspection for the original local-intake delivery used a
+disposable local root with synthetic data:
 
 - Nested JSON, leading-zero strings, booleans, null and metadata round-tripped;
   a separate Python process read both old and refreshed published batches.
@@ -474,12 +490,25 @@ Recorded manual inspection used a disposable local root with synthetic data:
   was restored. A complete but unpublished batch did not move the active pointer.
 
 Compilation, diff/whitespace, existing local documentation links and request-scope
-review passed. No automated tests were added/run for this delivery, and the old
+review passed. No automated tests were added/run for that delivery, and the old
 80-test result above was not rerun. No HTTP/browser/auth integration, Windows,
 network filesystem, forced process-kill, power-loss, disk-full or broader stress
 verification was performed. Only disposable data was used; no team database,
 credentials or existing local storage was accessed. Temporary inspection data
 was removed after review.
+
+### Local intake review-fix record
+
+The follow-up fixes normalize Windows storage roots to extended-length paths,
+retain durable discarded-batch tombstones to prevent reuse during cleanup, and
+strictly reject non-finite sampled JSON numbers. Eight regression cases failed
+before the fixes. All 91 backend tests now pass on Windows, including 11 tests in
+`tests/test_local_store.py`. These cover long-path imports/reopening, a deterministic
+cleanup/re-stage interleaving, interrupted cleanup/retry, unknown-ID tombstones,
+existing-catalog upgrade, non-finite nested values and pinned finite data.
+`git diff --check` passes. Earlier manual observations and test counts above
+describe their respective deliveries, not these fixes.
+Windows directory-flush and power-loss behavior remain unverified.
 
 
 Publication uses [SQLite transactions](https://www.sqlite.org/lang_transaction.html)

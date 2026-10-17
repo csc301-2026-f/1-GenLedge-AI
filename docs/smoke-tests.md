@@ -65,7 +65,15 @@ procedures, not a claim that all failure modes have been exercised.
   Expected: Explicit immutability/scope rejection, with existing data unchanged.
 - Action: Discard an unpublished batch twice.
   Expected: Both calls finish; its catalog metadata is absent and its files are
-  removed. Storage errors other than an already absent staging path propagate.
+  removed. A durable discarded-batch marker remains; staging the same ID again
+  is rejected, including after reopening the store. Storage errors other than an
+  already absent staging path propagate.
+- Action: Discard an unknown batch ID, then attempt to stage that ID.
+  Expected: Cleanup succeeds and staging is rejected by its retained tombstone.
+- Action: On Windows, import and sample synthetic records using a disposable
+  absolute root long enough that the resulting record path exceeds 260 characters.
+  Expected: Import, catalog reopen and sampling work through the extended-length
+  root. This checks path handling, not Windows power-loss recovery.
 
 The web UI continues to return persisted:false. No database credentials, team
 storage, HTTP import or source connector is needed for this internal adapter.
@@ -91,6 +99,10 @@ read_sample(source_id, batch_id, collection_id, limit=500).
 - Action: Truncate or corrupt a sampled JSON line in disposable storage.
   Expected: A clear decode/row-count error, never a successful partial sample.
   Restore the data; do not perform this check on real storage.
+- Action: Replace a sampled value in disposable storage with NaN, Infinity,
+  -Infinity or 1e999, including a value nested in an object or array.
+  Expected: Sampling rejects the non-finite value. Restore the synthetic data
+  after each check; corruption beyond the requested sample is still not read.
 - Action: Publish two staged batches against the same expected active version
   from separate processes, including a source that has no previous import.
   Expected: One wins; the other raises PublicationConflict and cannot clobber it.

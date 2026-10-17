@@ -4,6 +4,20 @@ Implementation details, decisions, test commands and the completed-work record
 live in [the US2 guide](../doc/us2-import-data.md). Keep this file as the working
 checklist for the whole story rather than duplicating the guide.
 
+## Local intake review fixes (completed)
+
+- [x] Reproduce Windows long-path import failure, discarded-batch reuse during
+  cleanup, and non-finite sampled JSON numbers with regression tests.
+- [x] Normalize Windows storage roots to extended-length absolute paths.
+- [x] Retain durable discarded-batch tombstones and reject reuse before staging,
+  including IDs first seen through cleanup.
+- [x] Reject NaN, Infinity and overflowing numeric exponents in sampled records.
+- [x] Run focused and backend tests, review the diff, and record results in the
+  US2 guide. Windows power-loss behavior remains outside this verification.
+
+Verification: eight regression cases failed before the fixes. All 91 backend
+tests now pass on Windows, including 11 local-store tests. Diff whitespace checks pass.
+
 ## Completed implementation
 
 - [x] Parse and validate CSV, TSV, XLSX, XLS, JSON and NDJSON.
@@ -51,7 +65,7 @@ Implement the existing writer contract and a batch-pinned sample reader without 
 - Bind each adapter to a trusted organization/environment; isolate catalogs and hashed filesystem paths by scope.
 - Stage new batches without exposing them; flush and sync each collection before recording completion. Preserve parsed values/nesting and reject incomplete/duplicate writes.
 - Publish only complete batches using one SQLite compare-and-swap transaction against the expected active batch. Retain old published batches and their publication history.
-- Discard only unpublished batches, removing their catalog visibility before deleting files so cleanup interruption cannot make an incomplete batch publishable.
+- Discard only unpublished batches, retaining durable tombstones and removing catalog visibility before deleting files so cleanup interruption cannot make an incomplete batch publishable or permit batch-ID reuse.
 - Read only a published source/batch/collection in the adapter's scope. Sample at most 500 records from that pinned batch without consulting a moving active pointer again.
 - Keep the web path validation-only. Real identity authorization and HTTP import remain separate integration work.
 
@@ -66,7 +80,7 @@ Implement the existing writer contract and a batch-pinned sample reader without 
 SQLite BEGIN IMMEDIATE serializes publication decisions for a scope; local writes also hold that lock through file completion. This trades write concurrency for a small, explicit publication boundary. Use a single host and local disk, not network/shared filesystems. Directory fsync is performed on POSIX; Windows directory/power-loss behavior is not claimed verified. No distributed transaction, reconciliation daemon or old published-batch deletion is added.
 
 
-### Recorded local verification
+### Historical local-delivery verification
 
 Manual synthetic inspection covered old/new pinned reads in a fresh process,
 empty collections, limits and the unparsed 501st record, organization/environment
