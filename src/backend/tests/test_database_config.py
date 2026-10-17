@@ -93,8 +93,10 @@ def test_migration_creates_expected_auth_schema(tmp_path):
     engine = create_engine('sqlite:///' + str(tmp_path / 'fresh.sqlite3'))
     upgrade_database(engine)
     tables = set(inspect(engine).get_table_names())
-    assert {'auth_organizations', 'auth_users', 'auth_sessions', 'alembic_version'} <= tables
+    assert {'auth_organizations', 'auth_users', 'auth_sessions', 'alembic_version',
+            'intake_sources', 'intake_batches', 'intake_collections', 'intake_records',
+            'intake_fields', 'source_mappings', 'intake_pins'} <= tables
     upgrade_database(engine)
     with engine.connect() as connection:
-        assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0001_auth_tables'
+        assert connection.scalar(text('SELECT version_num FROM alembic_version')) == '0003_mapping_retention'
     engine.dispose()

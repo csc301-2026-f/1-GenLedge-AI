@@ -94,7 +94,7 @@ export default function App() {
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <Sidebar current={screen} onNav={navigateWorkflow} completedThrough={completedThrough} />
         <main style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-          {screen === 'sources'  && <SourcesScreen  onNav={navigateWorkflow} onAdvance={() => advance('sources', 'discover')} onInvalidate={() => invalidateAfter('sources')} />}
+          {screen === 'sources'  && <SourcesScreen />}
           {screen === 'discover' && <DiscoverScreen onNav={navigateWorkflow} onAdvance={() => advance('discover', 'route')} onInvalidate={() => invalidateAfter('discover')} />}
           {screen === 'route'    && <RouteScreen    onNav={navigateWorkflow} onAdvance={() => advance('route', 'mapping')} onInvalidate={() => invalidateAfter('route')} />}
           {screen === 'mapping'  && <MappingScreen  onNav={navigateWorkflow} onAdvance={() => advance('mapping', 'run')} onInvalidate={() => invalidateAfter('mapping')} />}

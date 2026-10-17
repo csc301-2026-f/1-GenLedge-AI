@@ -1,5 +1,40 @@
 # Smoke Tests
 
+## Import workflow contract (fake writer only)
+
+- Action: From `src/backend`, run `.\.venv\Scripts\python.exe -m pytest tests/test_import_workflow.py -q -p no:cacheprovider`.
+  Expected: Workflow tests pass without any database. They cover stable metadata,
+  nested records, failed staging/writes, concurrent publication and uncertain
+  publication outcomes. The fake is test-only; database intake is covered by the import API tests.
+- Contract and database adapter handoff: [US2 import guide](../doc/us2-import-data.md).
+
+## File parsing and upload validation (US2)
+
+- Action: Install backend development requirements and run `.\.venv\Scripts\python.exe -m pytest tests -q -p no:cacheprovider`
+  from `src/backend`.
+  Expected: Parser tests pass without storage; API tests use disposable SQLite auth
+  and database intake, with real password/session checks.
+- Action: From `src/backend`, run `.\.venv\Scripts\python.exe -m app.sources.connectors.files <file>`.
+  Expected: A valid file prints collection summaries with `persisted: false`;
+  an invalid file exits nonzero with a validation message. No database is needed.
+- Action: Sign into the connected frontend, click Upload File, select a CSV, then
+  Import File. Repeat with a multi-sheet XLSX and nested JSON/NDJSON.
+  Expected: Counts and corrections appear after publication and the saved source
+  list refreshes. Discovery does not start automatically.
+- Action: Try an empty file, unsupported extension, file larger than 25 MB,
+  malformed table row, or a sheet with more than 50,000 data rows.
+  Expected: An actionable error appears; no success summary remains. A corrected
+  file can be selected and validated without closing the modal.
+- Action: Stop Flask, try importing, restart Flask and sign in again if needed.
+  Expected: Failure is shown, and retry is possible.
+- Action: Sign out and call `/api/sources` or submit an upload.
+  Expected: 401. After signing in, an upload missing a valid `X-CSRF-Token` returns
+  403. A token from before logout cannot be reused after signing in again.
+- Action: With Playwright available, run `node tests/upload-validation-smoke.cjs`
+  from `src/frontend` (optional `CHROME_BIN` specifies an installed browser).
+  Expected: UI smoke passes against mocked API responses. Backend API behavior
+  is covered independently by pytest.
+
 ## Development launchers
 
 - Action: Run `./src/start-demo.sh` or `src\start-demo.bat` and open `http://127.0.0.1:5174`.
@@ -8,7 +43,7 @@
   Expected: A redacted database status summary appears first and the launcher pauses for confirmation. After confirmation, pending Alembic migrations apply; then the connected frontend loads, Flask is available at port 5000, and `/api/auth` requests reach Flask through Vite. If the connection check or migration fails, neither service starts.
 - Action: Initialize the auth database, provision a user, then sign in with an incorrect password and the correct password at port 5173.
   Expected: The incorrect password is rejected; the correct password opens Sources.
-- Action: Copy `src/backend/.env.example` to `src/backend/.env`, fill in `HOST`, `PORT`, `DATABASE`, `USER`, and `PASSWORD`, then run `auth-db-check`.
+- Action: Configure `src/backend/.env` with `HOST`, `PORT`, `DATABASE`, `USER`, and `PASSWORD` as described in the auth guide, then run `auth-db-check`.
   Expected: Flask reports the expected PostgreSQL role and database without printing the password; TLS reports the configured connection state.
 - Action: Run `auth-init-db` against a fresh developer database.
   Expected: The initial Alembic migration creates the auth tables and records the migration revision.
@@ -18,3 +53,63 @@
   Expected: Flask returns 403.
 - Action: Stop each launcher with `Ctrl+C` on Unix or by closing its service window on Windows.
   Expected: The processes started by that launcher stop and the ports are released.
+
+
+## Authenticated file import (current web flow)
+
+Use this flow for the integrated UI. Keep parser and import endpoint checks for API regressions.
+Configure your authorized PostgreSQL connection, run auth-init-db to apply intake
+migrations, use a provisioned account, and start backend/frontend. Use disposable synthetic files only.
+
+- Upload a valid CSV through Import File. Expect saved confirmation and a source row.
+- Reload and restart the backend with the same database/environment configuration. Expect the row to remain.
+- Upload changed data under the same filename. Expect one row with updated counts.
+- Upload malformed data under that filename. Expect an error and unchanged saved data.
+- Sign in as a user from another organization. Expect no access to the first organization's sources.
+- With the published source/batch/collection IDs, call PostgresIntakeStore.read_sample;
+  expect at most 500 records and stable reads of the old batch after refresh.
+- Simulate unavailable storage or lost publication acknowledgement using disposable tests.
+  Expect an explicit failure/uncertain outcome, no false success and no automatic retry.
+
+Database connection and discovery buttons stay disabled until connected to their
+real services. The automated browser smoke mocks HTTP; backend tests exercise actual auth/storage.
+Live browser-to-PostgreSQL deployment verification remains a separate acceptance step.
+
+
+## PostgreSQL intake migration
+
+- Run auth-init-db twice against your developer database; expect the migration to
+  be repeatable and existing accounts/sources to remain intact.
+- Import synthetic nested JSON and inspect intake_records.payload. Expect records
+  in PostgreSQL, no local JSON Lines writes, and an active batch in intake_sources.
+- Configure no PostgreSQL connection; expect import/list 503 rather than local-file fallback.
+- Run the opt-in disposable-schema tests described in the US2 guide. PostgreSQL
+  concurrency and JSON edge-case checks are not covered by SQLite test results.
+
+
+## Mapping preservation and snapshot retention
+
+Apply 0003_mapping_retention in a disposable development environment. Use the
+US2 guide's API examples with a real login/session and CSRF token.
+
+- Upload orders.csv with id/name headings; GET its fields and save a mapping of
+  name with a target/transform/note. GET mappings confirms status=valid.
+- Reupload the same filename with reordered headings and different values. Expect
+  stable field IDs, unchanged definition and a new validBatchId.
+- Remove or rename the mapped heading, or change a nested JSON field's type.
+  Expect needs_review, unchanged definition and the old validBatchId retained.
+- Map one of two duplicate headings. Reupload: expect review rather than silently
+  transferring the mapping to another generated column key.
+- Submit malformed data and attempt a stale mapping PUT/DELETE. Expect no lost
+  mappings; stale expectedBatchId returns 409. Missing CSRF returns 403. A second
+  organization's session cannot read or change the first source's mappings.
+- In disposable storage only, set GENLEDGE_INTAKE_KEEP_PREVIOUS=0 and
+  GENLEDGE_INTAKE_GRACE_DAYS=0, restart and refresh a source. Unreferenced old
+  payloads disappear; the new active batch remains readable. Restore defaults.
+- A needs_review mapping protects its last-valid batch. Explicitly re-save against
+  new fields or delete the mapping, then run intake-sweep for that org/source.
+- Pin an old batch with the adapter before sweeping. It stays readable until the
+  pin is released. After sweeping, its manifest remains and reading its payload
+  raises SnapshotExpiredError rather than returning a different batch.
+- Run tests/test_mapping_retention.py; select `postgresql and not sqlite` when
+  running the disposable real-PostgreSQL variants. Row-lock races require PG.
