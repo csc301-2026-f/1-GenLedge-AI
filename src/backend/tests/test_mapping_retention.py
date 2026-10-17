@@ -11,7 +11,7 @@ from app.sources.postgres_store import PostgresIntakeStore, SnapshotExpiredError
 from app.sources.mapping_store import fields
 from app.sources.service import import_file, ImportStorageError
 from app.sources.writer import PublicationConflict
-from app.sources.local_store import IntakeNotFoundError
+from app.sources.writer import IntakeNotFoundError
 from test_postgres_intake import engine, store
 from test_upload_validation import client, login, token
 

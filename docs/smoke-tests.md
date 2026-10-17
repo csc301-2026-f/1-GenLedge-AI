@@ -8,7 +8,7 @@
   publication outcomes. The fake is test-only; database intake is covered by the import API tests.
 - Contract and database adapter handoff: [US2 import guide](../doc/us2-import-data.md).
 
-## File validation (US2, no intake database)
+## File parsing and upload validation (US2)
 
 - Action: Install backend development requirements and run `.\.venv\Scripts\python.exe -m pytest tests -q -p no:cacheprovider`
   from `src/backend`.
@@ -25,9 +25,9 @@
   malformed table row, or a sheet with more than 50,000 data rows.
   Expected: An actionable error appears; no success summary remains. A corrected
   file can be selected and validated without closing the modal.
-- Action: Stop Flask, try validation, restart Flask and sign in again if needed.
+- Action: Stop Flask, try importing, restart Flask and sign in again if needed.
   Expected: Failure is shown, and retry is possible.
-- Action: Sign out and call `/api/sources/uploads/csrf` or submit an upload.
+- Action: Sign out and call `/api/sources` or submit an upload.
   Expected: 401. After signing in, an upload missing a valid `X-CSRF-Token` returns
   403. A token from before logout cannot be reused after signing in again.
 - Action: With Playwright available, run `node tests/upload-validation-smoke.cjs`
@@ -43,7 +43,7 @@
   Expected: A redacted database status summary appears first and the launcher pauses for confirmation. After confirmation, pending Alembic migrations apply; then the connected frontend loads, Flask is available at port 5000, and `/api/auth` requests reach Flask through Vite. If the connection check or migration fails, neither service starts.
 - Action: Initialize the auth database, provision a user, then sign in with an incorrect password and the correct password at port 5173.
   Expected: The incorrect password is rejected; the correct password opens Sources.
-- Action: Copy `src/backend/.env.example` to `src/backend/.env`, fill in `HOST`, `PORT`, `DATABASE`, `USER`, and `PASSWORD`, then run `auth-db-check`.
+- Action: Configure `src/backend/.env` with `HOST`, `PORT`, `DATABASE`, `USER`, and `PASSWORD` as described in the auth guide, then run `auth-db-check`.
   Expected: Flask reports the expected PostgreSQL role and database without printing the password; TLS reports the configured connection state.
 - Action: Run `auth-init-db` against a fresh developer database.
   Expected: The initial Alembic migration creates the auth tables and records the migration revision.
@@ -55,79 +55,9 @@
   Expected: The processes started by that launcher stop and the ports are released.
 
 
-## Persistent local intake writer
-
-Use a disposable absolute directory outside Git. Instantiate LocalIntakeStore with
-trusted organization/environment and call the existing import_file with a
-synthetic CSV or JSON stream, as shown in the US2 guide. These are manual
-procedures, not a claim that all failure modes have been exercised.
-
-- Action: Import nested JSON, reopen the store, and inspect active_snapshot.
-  Expected: The complete metadata/IDs round-trip, raw records exist as JSON Lines,
-  and strings/numbers/booleans/null/nesting retain their parsed values.
-- Action: Import changed content under the same organization/environment/filename.
-  Expected: Source and collection IDs remain stable, a new batch becomes active,
-  and previous published files remain intact.
-- Action: Stage an incomplete batch or use a stale expected batch during publish.
-  Expected: Incomplete publication fails; stale publication raises
-  PublicationConflict and does not replace the winner.
-- Action: Write or discard a published batch; stage another scope's manifest.
-  Expected: Explicit immutability/scope rejection, with existing data unchanged.
-- Action: Discard an unpublished batch twice.
-  Expected: Both calls finish; its catalog metadata is absent and its files are
-  removed. A durable discarded-batch marker remains; staging the same ID again
-  is rejected, including after reopening the store. Storage errors other than an
-  already absent staging path propagate.
-- Action: Discard an unknown batch ID, then attempt to stage that ID.
-  Expected: Cleanup succeeds and staging is rejected by its retained tombstone.
-- Action: On Windows, import and sample synthetic records using a disposable
-  absolute root long enough that the resulting record path exceeds 260 characters.
-  Expected: Import, catalog reopen and sampling work through the extended-length
-  root. This checks path handling, not Windows power-loss recovery.
-
-The internal adapter needs no external database credentials. The current web UI
-uses authenticated HTTP imports; see the current flow at the end of this document.
-
-
-## Pinned intake samples for US3
-
-Use the disposable LocalIntakeStore and returned SnapshotMetadata from the writer
-steps above. Read published_snapshot(source_id, batch_id), then
-read_sample(source_id, batch_id, collection_id, limit=500).
-
-- Action: Reopen the store in a fresh Python process after an import/refresh.
-  Expected: Metadata and old/new pinned samples remain readable. Reading an old
-  published batch returns its own records even when a newer batch is active.
-- Action: Import 501 synthetic JSON objects and request 500, then a smaller limit.
-  Expected: The returned lists contain 500 and the requested smaller count. An
-  invalid 501st line in a disposable copy is not parsed. Restore any modified data.
-- Action: Import a header-only CSV.
-  Expected: Its published collection returns an empty list, not invented fields.
-- Action: Read with another organization/environment, wrong source, unknown
-  collection or unpublished batch; request limits 0 or 501.
-  Expected: IntakeNotFoundError for inaccessible artifacts or ValueError for limits.
-- Action: Truncate or corrupt a sampled JSON line in disposable storage.
-  Expected: A clear decode/row-count error, never a successful partial sample.
-  Restore the data; do not perform this check on real storage.
-- Action: Replace a sampled value in disposable storage with NaN, Infinity,
-  -Infinity or 1e999, including a value nested in an object or array.
-  Expected: Sampling rejects the non-finite value. Restore the synthetic data
-  after each check; corruption beyond the requested sample is still not read.
-- Action: Publish two staged batches against the same expected active version
-  from separate processes, including a source that has no previous import.
-  Expected: One wins; the other raises PublicationConflict and cannot clobber it.
-- Action: Simulate a lost acknowledgement after publication, then refresh again.
-  Expected: The old acknowledged-or-not published batch remains readable by its
-  pinned ID. Checking only the latest pointer is not sufficient reconciliation.
-
-These are documented manual checks. Recorded local observations and unverified
-platform/crash/auth scenarios are listed in the guide. No real US3 discovery or
-HTTP import is enabled by this storage adapter alone.
-
-
 ## Authenticated file import (current web flow)
 
-Use this flow for the integrated UI. Keep parser/validation endpoint checks for API regressions.
+Use this flow for the integrated UI. Keep parser and import endpoint checks for API regressions.
 Configure your authorized PostgreSQL connection, run auth-init-db to apply intake
 migrations, use a provisioned account, and start backend/frontend. Use disposable synthetic files only.
 
@@ -143,8 +73,7 @@ migrations, use a provisioned account, and start backend/frontend. Use disposabl
 
 Database connection and discovery buttons stay disabled until connected to their
 real services. The automated browser smoke mocks HTTP; backend tests exercise actual auth/storage.
-A separate disposable browser-to-Flask run also verified real login, import, reload,
-same-filename refresh and invalid-upload preservation with SQLite auth/local intake.
+Live browser-to-PostgreSQL deployment verification remains a separate acceptance step.
 
 
 ## PostgreSQL intake migration
@@ -153,7 +82,6 @@ same-filename refresh and invalid-upload preservation with SQLite auth/local int
   be repeatable and existing accounts/sources to remain intact.
 - Import synthetic nested JSON and inspect intake_records.payload. Expect records
   in PostgreSQL, no local JSON Lines writes, and an active batch in intake_sources.
-- Change only GENLEDGE_INTAKE_ROOT; expect no effect on PostgreSQL intake.
 - Configure no PostgreSQL connection; expect import/list 503 rather than local-file fallback.
 - Run the opt-in disposable-schema tests described in the US2 guide. PostgreSQL
   concurrency and JSON edge-case checks are not covered by SQLite test results.

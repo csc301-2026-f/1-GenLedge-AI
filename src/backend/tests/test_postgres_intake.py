@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.migrations import upgrade_database
 from app.sources.postgres_store import PostgresIntakeStore
-from app.sources.local_store import IntakeNotFoundError
+from app.sources.writer import IntakeNotFoundError
 from app.sources.service import import_file, ImportStorageError
 from app.sources.writer import PublicationConflict
 

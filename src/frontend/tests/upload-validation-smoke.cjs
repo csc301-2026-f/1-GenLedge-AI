@@ -19,7 +19,7 @@ const { pathToFileURL } = require('node:url');
         user: { id: 'demo-user', username: 'test@example.com', email: 'test@example.com', role: 'Administrator', organizationId: 'test-org' },
       }),
     }));
-    await page.route('**/api/sources/uploads/csrf', route => route.fulfill({
+    await page.route('**/api/auth/csrf', route => route.fulfill({
       contentType: 'application/json', body: JSON.stringify({ csrfToken: 'test-token' }),
     }));
     let mode = 'success', requests = 0, saved = [];

@@ -4,6 +4,10 @@ from typing import Mapping, Protocol, Sequence
 from .metadata import SnapshotMetadata
 
 
+class IntakeNotFoundError(LookupError):
+    """No accessible intake artifact exists in this store's scope."""
+
+
 class PublicationConflict(RuntimeError):
     """The source changed since the import read its active batch; retry explicitly."""
 

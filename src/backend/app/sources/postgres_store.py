@@ -12,9 +12,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from .metadata import SnapshotMetadata, stable_id
-from .local_store import IntakeNotFoundError, _decode
-from .writer import PublicationConflict
+from .metadata import SnapshotMetadata, stable_id, decode_snapshot
+from .writer import IntakeNotFoundError, PublicationConflict
 from .fields import field_metadata
 from .mapping_store import fields, mappings, reconcile, public_mapping
 
@@ -70,14 +69,14 @@ class PostgresIntakeStore:
                 sa.and_(sources.c.scope_id == batches.c.scope_id, sources.c.active_batch_id == batches.c.batch_id)))
                 .where(sources.c.scope_id == self.scope_id, sources.c.source_id == source_id,
                        batches.c.status == 'published')).scalar_one_or_none()
-        return _decode(value) if value is not None else None
+        return decode_snapshot(value) if value is not None else None
 
     def list_sources(self):
         with self.engine.connect() as connection:
             values = connection.execute(sa.select(batches.c.manifest).select_from(sources.join(batches,
                 sa.and_(sources.c.scope_id == batches.c.scope_id, sources.c.active_batch_id == batches.c.batch_id)))
                 .where(sources.c.scope_id == self.scope_id, batches.c.status == 'published')).scalars().all()
-        return sorted((_decode(value) for value in values), key=lambda item: item.uploaded_at, reverse=True)
+        return sorted((decode_snapshot(value) for value in values), key=lambda item: item.uploaded_at, reverse=True)
 
     def stage(self, snapshot: SnapshotMetadata):
         if (snapshot.source.organization_id, snapshot.source.environment) != (self.organization_id, self.environment):
@@ -112,7 +111,7 @@ class PostgresIntakeStore:
                     chunk.append(dict(scope_id=self.scope_id, batch_id=batch_id, collection_id=collection_id,
                                       ordinal=ordinal, payload=record))
                 connection.execute(rows.insert(), chunk)
-            metadata = next(c for c in _decode(batch['manifest']).collections if c.collection_id == collection_id)
+            metadata = next(c for c in decode_snapshot(batch['manifest']).collections if c.collection_id == collection_id)
             self._write_fields(connection, batch_id, metadata, records)
             connection.execute(collections.update().where(where).values(complete=True))
 
@@ -126,7 +125,7 @@ class PostgresIntakeStore:
         # Lazily profile pre-migration batches while holding a batch/source lock.
         if batch['purged']:
             raise SnapshotExpiredError('Snapshot records have expired.')
-        for collection in _decode(batch['manifest']).collections:
+        for collection in decode_snapshot(batch['manifest']).collections:
             where = sa.and_(self._where(fields, batch['batch_id']), fields.c.collection_id == collection.collection_id)
             if connection.execute(sa.select(fields.c.field_id).where(where).limit(1)).first():
                 continue
@@ -170,7 +169,7 @@ class PostgresIntakeStore:
                 batches.c.source_id == source_id, batches.c.status == 'published')).scalar_one_or_none()
         if value is None:
             raise IntakeNotFoundError('Published batch not found.')
-        return _decode(value)
+        return decode_snapshot(value)
 
     def read_sample(self, source_id, batch_id, collection_id, *, limit=500):
         if type(limit) is not int or not 1 <= limit <= 500:
@@ -182,7 +181,7 @@ class PostgresIntakeStore:
                 raise IntakeNotFoundError('Published batch not found.')
             if batch['purged']:
                 raise SnapshotExpiredError('Snapshot records have expired. Read the active batch or acquire a pin before a longer workflow.')
-            snapshot = _decode(batch['manifest'])
+            snapshot = decode_snapshot(batch['manifest'])
             collection = next((item for item in snapshot.collections if item.collection_id == collection_id), None)
             if collection is None:
                 raise IntakeNotFoundError('Collection not found.')

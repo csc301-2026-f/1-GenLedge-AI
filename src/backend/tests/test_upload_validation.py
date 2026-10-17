@@ -29,7 +29,7 @@ def client(tmp_path):
 
 
 def token(client):
-    return {"X-CSRF-Token": client.get("/api/sources/uploads/csrf").json["csrfToken"]}
+    return {"X-CSRF-Token": client.get("/api/auth/csrf").json["csrfToken"]}
 
 
 def login(client):
@@ -37,16 +37,17 @@ def login(client):
     assert client.post("/api/auth/login", json={"email": "test@example.com", "password": "password"}, headers={"X-CSRF-Token": csrf}).status_code == 200
 
 
-def upload(client, content=b"id\n1", filename="a.csv", headers=None):
-    return client.post("/api/sources/uploads/validate", data={"file": (io.BytesIO(content), filename)}, headers=headers if headers is not None else token(client))
+def save(client, content=b"id\n1", filename="a.csv", headers=None, extra=None):
+    return client.post("/api/sources/uploads",
+                       data={"file": (io.BytesIO(content), filename), **(extra or {})},
+                       headers=headers if headers is not None else token(client))
 
 
 def test_requires_auth_and_csrf(client):
-    assert client.get("/api/sources/uploads/csrf").status_code == 401
-    assert upload(client, headers={}).status_code == 401
+    assert save(client, headers={}).status_code == 401
     login(client)
-    assert upload(client, headers={}).status_code == 403
-    assert upload(client, headers={"X-CSRF-Token": "invalid-é"}).status_code == 403
+    assert save(client, headers={}).status_code == 403
+    assert save(client, headers={"X-CSRF-Token": "invalid-é"}).status_code == 403
 
 
 def test_upload_token_is_session_scoped_and_cleared_on_logout(client):
@@ -54,44 +55,38 @@ def test_upload_token_is_session_scoped_and_cleared_on_logout(client):
     previous = token(client)
     assert token(client) == previous
     assert previous["X-CSRF-Token"] == client.get("/api/auth/csrf").json["csrfToken"]
-    assert upload(client, headers=previous).status_code == 200
+    assert save(client, headers=previous).status_code == 201
     assert client.post("/api/auth/logout", headers=previous).status_code == 204
-    assert upload(client, headers=previous).status_code == 401
-    assert client.get("/api/sources/uploads/csrf").status_code == 401
+    assert save(client, headers=previous).status_code == 401
     login(client)
-    assert upload(client, headers=previous).status_code == 403
+    assert save(client, headers=previous).status_code == 403
     assert token(client) != previous
-    assert upload(client).status_code == 200
+    assert save(client).status_code == 201
 
 
-def test_success_summary_no_records_or_persistence(client):
+def test_success_summary_without_records(client):
     login(client)
-    result = upload(client)
-    assert result.status_code == 200
-    assert result.json["persisted"] is False
-    assert result.json["collections"][0]["rowCount"] == 1
-    assert "records" not in result.json["collections"][0]
+    result = save(client)
+    assert result.status_code == 201
+    assert result.json["persisted"] is True
+    assert result.json["source"]["collections"][0]["rowCount"] == 1
+    assert "records" not in result.json["source"]["collections"][0]
     assert result.headers["Cache-Control"] == "no-store"
 
 
 def test_upload_contract_and_errors(client):
     login(client)
-    assert client.post("/api/sources/uploads/validate", headers=token(client)).status_code == 400
-    assert upload(client, b"id\n1,2").status_code == 422
-    assert upload(client, filename="a.exe").status_code == 415
-    response = client.post("/api/sources/uploads/validate", data={"file": [(io.BytesIO(b"id"), "a.csv"), (io.BytesIO(b"id"), "b.csv")]}, headers=token(client))
+    assert client.post("/api/sources/uploads", headers=token(client)).status_code == 400
+    assert save(client, b"id\n1,2").status_code == 422
+    assert save(client, filename="a.exe").status_code == 415
+    response = client.post("/api/sources/uploads", data={"file": [(io.BytesIO(b"id"), "a.csv"), (io.BytesIO(b"id"), "b.csv")]}, headers=token(client))
     assert response.status_code == 400
 
 
 def test_upload_size_enforced(client):
     login(client)
-    assert upload(client, b"x" * 25_000_001).status_code == 413
-    assert upload(client, b"x" * 26_000_001).status_code == 413
-
-
-def save(client, content=b'id\n1', filename='a.csv', extra=None):
-    return client.post('/api/sources/uploads', headers=token(client),
-                       data={'file': (io.BytesIO(content), filename), **(extra or {})})
+    assert save(client, b"x" * 25_000_001).status_code == 413
+    assert save(client, b"x" * 26_000_001).status_code == 413
 
 
 def test_import_list_refresh_and_pinned_sample(client):
@@ -159,7 +154,6 @@ def test_import_validation_and_disabled_storage(client):
     client.application.config['INTAKE_ENVIRONMENT'] = ''
     assert save(client).status_code == 503
     assert client.get('/api/sources').status_code == 503
-    assert upload(client).status_code == 200
 
 
 def test_import_storage_failure_preserves_old_source(client, monkeypatch):

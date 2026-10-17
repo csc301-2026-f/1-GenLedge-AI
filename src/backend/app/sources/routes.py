@@ -6,12 +6,11 @@ from flask import Blueprint, current_app, g, request, session
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
-from .connectors.files import MAX_FILE_BYTES, FileValidationError, parse_file
+from .connectors.files import MAX_FILE_BYTES, FileValidationError
 from ..auth.service import login_required
 from .postgres_store import PostgresIntakeStore
 from .service import import_file, ImportStorageError
-from .writer import PublicationConflict
-from .local_store import IntakeNotFoundError
+from .writer import IntakeNotFoundError, PublicationConflict
 
 bp = Blueprint("sources", __name__, url_prefix="/api/sources")
 
@@ -50,19 +49,6 @@ def request_too_large(error):
 @bp.errorhandler(BadRequest)
 def invalid_request(error):
     return {"error": "Invalid multipart upload request."}, 400
-
-
-@bp.get("/uploads/csrf")
-def upload_csrf():
-    if "csrf_token" not in session:
-        session["csrf_token"] = secrets.token_urlsafe(32)
-    return {"csrfToken": session["csrf_token"]}
-
-
-@bp.post("/uploads/validate")
-def validate_upload():
-    upload = uploaded_file()
-    return parse_file(upload.filename, upload.stream).summary()
 
 
 def uploaded_file():

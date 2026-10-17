@@ -5,7 +5,7 @@ from flask.cli import with_appcontext
 from sqlalchemy.exc import SQLAlchemyError
 
 from .postgres_store import PostgresIntakeStore
-from .local_store import IntakeNotFoundError
+from .writer import IntakeNotFoundError
 
 
 @click.command('intake-sweep')

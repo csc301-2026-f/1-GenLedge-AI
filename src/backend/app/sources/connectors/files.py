@@ -1,7 +1,7 @@
 """Parse uploads without database access or side effects.
 
-The returned records are the future intake writer's input. HTTP callers should
-return summary() rather than echoing all uploaded data to the browser.
+The import service passes validated records to the intake writer. The CLI emits
+summary() without saving records or echoing their contents.
 """
 import csv
 import hashlib

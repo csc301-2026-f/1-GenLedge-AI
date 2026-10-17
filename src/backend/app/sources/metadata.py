@@ -55,3 +55,15 @@ class SnapshotMetadata:
     @property
     def source_id(self) -> str:
         return self.source.source_id
+
+
+def decode_snapshot(payload: str) -> SnapshotMetadata:
+    data = json.loads(payload)
+    source = SourceIdentity(**data.pop("source"))
+    collections = []
+    for item in data.pop("collections"):
+        headers = tuple(HeaderMetadata(**header) for header in item.pop("headers"))
+        warnings = tuple(item.pop("warnings"))
+        collections.append(CollectionMetadata(headers=headers, warnings=warnings, **item))
+    return SnapshotMetadata(source=source, collections=tuple(collections),
+                            uploaded_at=datetime.fromisoformat(data.pop("uploaded_at")), **data)
